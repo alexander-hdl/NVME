@@ -1,0 +1,17 @@
+# Vivado / xsim
+*.jou
+*.log
+*.pb
+*.wdb
+*.str
+.Xil/
+xsim.dir/
+vivado*.backup.*
+fpga/build/
+fpga/ip/**/*.dcp
+fpga/ip/**/synth/
+fpga/ip/**/sim/
+sim/work/
+*.vcd
+*.fst
+__pycache__/
