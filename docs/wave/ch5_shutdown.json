@@ -1,0 +1,23 @@
+{
+  "signal": [
+    {"name": "ctrl_stop",       "wave": "01.|....|.........|..."},
+    {"name": "host_sequencer",  "wave": "=.3|..4.|.5.......|.6.",
+     "data": ["RUN", "DRAIN", "FLUSH", "SHUTDOWN", "DONE"]},
+    {"name": "we_enable",       "wave": "1..|..0.|.........|..."},
+    {"name": "all_slots_free",  "wave": "0..|.1..|.........|...", "node": ".....a"},
+    {"name": "flush_req",       "wave": "0..|..1.|.0.......|...", "node": "......b"},
+    {"name": "flush_done",      "wave": "0..|....|10.......|..."},
+    {"name": "shutdown_start",  "wave": "0..|....|.10......|..."},
+    {},
+    {"name": "TX FPGA->SSD",    "wave": "x..|...3|x.4x.4x56|6x.", "node": "................c",
+     "data": ["DB", "DB", "DB", "CC", "Rd", "Rd"]},
+    {"name": "RX SSD->FPGA",    "wave": "x..|....|7x.7x.7x.|...", "data": ["FF", "5", "6"]},
+    {"name": "CSTS.SHST",       "wave": "=..|....|........=|=..", "node": "...................d", "data": ["00", "01", "10"]},
+    {},
+    {"name": "status_done",     "wave": "0..|....|.........|.1."}
+  ],
+  "head": {"text": "Останов: ctrl_stop -> DRAIN -> Flush -> Delete SQ/CQ -> CC.SHN -> SHST = 10b"},
+  "foot": {"text": "DB - doorbell (SQ1TDBL для Flush, SQ0TDBL для Delete), CC - MWr CC <- 0x0046_4001, Rd - MRd CSTS. Числа на RX - CID в CQE."},
+  "config": {"cell_width": 40},
+  "edge": ["a~>b DRAIN_STABLE = 16 тактов", "c~>d опрос раз в 1 мс, <= 10 с"]
+}

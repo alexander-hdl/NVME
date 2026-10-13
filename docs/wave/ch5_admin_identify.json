@@ -1,0 +1,18 @@
+{
+  "signal": [
+    {"name": "nvme_admin",  "wave": "=3...4.5.|.|..|...|..4.6..=",
+     "data": ["START", "AC_WR: SQE -> asq_ram[0]", "MM", "опрос acq_ram[0]: DW3[16] == phase?", "MM", "разбор Identify", "FIN"]},
+    {"name": "asq_wr_en",   "wave": "01...0...|.|..|...|........"},
+    {},
+    {"name": "TX FPGA->SSD", "wave": "x.....3x.|.|4.|x..|...3x...", "node": "......a",
+     "data": ["SQDB", "CplD 64 B", "CQDB"]},
+    {"name": "RX SSD->FPGA", "wave": "x........|5|x.|6..|7x......", "node": "..........b........c",
+     "data": ["MRd SQE", "16 x MWr 256 B", "CQE"]},
+    {},
+    {"name": "CQE найден",   "wave": "0........|.|..|...|.10.....", "node": "....................d"}
+  ],
+  "head": {"text": "Admin-команда Identify Controller (CID 0): nvme_admin и линк"},
+  "foot": {"text": "SQDB: SQ0TDBL = MWr 0xC000_1000 <- 1; CQE: MWr 16 B -> 0x1000_1000; CQ0HDBL = MWr 0xC000_1004 <- 1."},
+  "config": {"cell_width": 38},
+  "edge": ["a~>b SSD выбирает SQE", "c~>d <= 3 такта"]
+}

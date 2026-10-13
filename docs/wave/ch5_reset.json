@@ -1,0 +1,22 @@
+{
+  "signal": [
+    {"name": "board_rst_n",     "wave": "01.|..........|......."},
+    {"name": "link_bringup",    "wave": "x2.|.34...5...|..67...",
+     "data": ["HOLD", "REL", "WAIT_LNK", "WAIT_POST", "W_GEN2", "READY"]},
+    {},
+    {"name": "sys_rst_n",       "wave": "00.|.1........|......."},
+    {"name": "perst_n",         "wave": "00.|..1.......|.......", "node": ".a....b"},
+    {},
+    {"name": "pl_ltssm_state",  "wave": "=..|..345.676.|.......",
+     "data": ["00 Detect.Quiet", "Det", "Pol", "Cfg", "16", "Rcv", "16 = L0"]},
+    {"name": "user_lnk_up",     "wave": "0..|......1...|.......", "node": "..........c"},
+    {"name": "pl_sel_lnk_rate", "wave": "0..|........1.|......."},
+    {"name": "link_ready",      "wave": "0..|..........|...1...", "node": "..................d"},
+    {},
+    {"name": "host_sequencer",  "wave": "x2.|..........|....3..", "data": ["LINK (ждём link_ready)", "ENUM"]}
+  ],
+  "head": {"text": "Сброс и обучение линка: link_bringup (масштаб условный)"},
+  "foot": {"text": "Разрывы «|» скрывают десятки миллисекунд. С SIM_FAST = 1 каждая «мс» становится «мкс»."},
+  "config": {"cell_width": 40},
+  "edge": ["a~>b PERST_HOLD_MS = 100 мс", "b~>c обучение < 20 мс", "c~>d POST_PERST_MS = 100 мс (+ ожидание Gen2)"]
+}

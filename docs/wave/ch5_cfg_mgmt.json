@@ -1,0 +1,21 @@
+{
+  "signal": [
+    {"name": "user_clk",            "wave": "p.............."},
+    {"name": "start",               "wave": "10............."},
+    {"name": "state",               "wave": "=3.=3.=5.=6.=7.",
+     "data": ["IDLE", "WR_CMD", "GAP", "WR_BUS", "GAP", "RD_DEV", "GAP", "WR_DEV", "GAP", "DONE"]},
+    {},
+    {"name": "cfg_mgmt_wr_en",      "wave": "01.01.0..01.0.."},
+    {"name": "cfg_mgmt_rd_en",      "wave": "0......1.0....."},
+    {"name": "cfg_mgmt_dwaddr",     "wave": "x3.x4.x5.x5.x..", "data": ["001", "006", "01A", "01A"]},
+    {"name": "cfg_mgmt_di",         "wave": "x3.x4.x...6.x..", "data": ["0000_0006", "0001_0100", "0000_2930"]},
+    {"name": "cfg_mgmt_byte_en",    "wave": "x3.x4.x5.x6.x..", "data": ["0001", "0111", "1111", "0011"]},
+    {"name": "cfg_mgmt_rd_wr_done", "wave": "0.10.10.10.10.."},
+    {"name": "cfg_mgmt_do",         "wave": "x.......5x.....", "data": ["2810"]},
+    {},
+    {"name": "done",                "wave": "0............1."}
+  ],
+  "head": {"text": "rp_cfg_init: собственный config space Root Port через cfg_mgmt"},
+  "foot": {"text": "rd_wr_done приходит через такт, как в модели ядра; в pcie_7x задержка может быть больше - FSM держит запрос до rd_wr_done."},
+  "config": {"cell_width": 52}
+}

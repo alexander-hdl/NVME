@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Глава 8. Лабораторные задания</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="layout">
+<!-- NAV:BEGIN -->
+<nav class="side">
+  <h2>NVMe-хост на Kintex-7</h2>
+  <ul>
+    <li><a href="index.html">Введение и цели</a></li>
+    <li><a href="01_pcie_basics.html">1. PCIe с нуля</a></li>
+    <li><a href="02_nvme_basics.html">2. NVMe с нуля</a></li>
+    <li><a href="03_architecture.html">3. Архитектура хоста</a></li>
+    <li><a href="04_modules.html">4. Модули и интерфейсы</a></li>
+    <li><a href="05_bringup.html">5. Запуск: от PERST# до первой записи</a></li>
+    <li><a href="06_performance.html">6. Пропускная способность</a></li>
+    <li><a href="07_verification.html">7. Верификация и симуляция</a></li>
+    <li><a href="08_lab.html" class="cur">8. Лабораторные задания</a></li>
+    <li><a href="glossary.html">Глоссарий</a></li>
+  </ul>
+</nav>
+<!-- NAV:END -->
+<main>
+<h1>Глава 8. Лабораторные задания</h1>
+<p class="lead">Семь лабораторных работ ведут от «запустить готовую симуляцию и найти в ней первый TLP» до «записать сотни гигабайт на настоящий SSD и увидеть, где кончается его кэш». Каждая работа опирается на конкретные файлы, параметры и сигналы проекта; результат проверяется числом, осциллограммой или сообщением теста.</p>
+
+<p><b>Содержание главы.</b>
+<a href="#s1">8.1 Структура курса</a> ·
+<a href="#s2">8.2 Подготовка рабочего места</a> ·
+<a href="#l1">8.3 Л1 Симуляция и осциллограммы</a> ·
+<a href="#l2">8.4 Л2 TLP вручную</a> ·
+<a href="#l3">8.5 Л3 Completer</a> ·
+<a href="#l4">8.6 Л4 Очереди NVMe</a> ·
+<a href="#l5">8.7 Л5 Поток данных</a> ·
+<a href="#l6">8.8 Л6 Железо</a> ·
+<a href="#l7">8.9 Л7* Расширения</a> ·
+<a href="#s9">8.10 Оценивание</a> ·
+<a href="#s10">8.11 Типичные ошибки студентов</a></p>
+
+<!-- ============================================================ -->
+<h2 id="s1">8.1. Структура курса</h2>
+
+<p>Курс рассчитан на 8 занятий по 4 академических часа плюс самостоятельную работу. Работы Л1–Л5 выполняются только в симуляторе xsim (Vivado 2022.2) и не требуют платы. Л6 требует KC705 (или другую плату Kintex-7 с FMC HPC), FMC-адаптер M.2 и SSD, который не жалко перезаписать. Л7* — проект на выбор для тех, кто претендует на высшую оценку.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 210" width="760" role="img" aria-label="Зависимости лабораторных работ" font-size="12">
+<defs><marker id="m81" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+<g fill="var(--code-bg)" stroke="var(--fg)">
+<rect x="10" y="70" width="100" height="56" rx="6"/><rect x="140" y="20" width="100" height="56" rx="6"/><rect x="140" y="120" width="100" height="56" rx="6"/><rect x="270" y="70" width="100" height="56" rx="6"/><rect x="400" y="70" width="100" height="56" rx="6"/><rect x="530" y="70" width="100" height="56" rx="6"/>
+</g>
+<rect x="655" y="70" width="95" height="56" rx="6" fill="var(--warn-bg)" stroke="var(--accent2)" stroke-dasharray="5,3"/>
+<g text-anchor="middle" font-weight="700" fill="var(--fg)">
+<text x="60" y="94">Л1</text><text x="190" y="44">Л2</text><text x="190" y="144">Л3</text><text x="320" y="94">Л4</text><text x="450" y="94">Л5</text><text x="580" y="94">Л6</text><text x="702" y="94">Л7*</text>
+</g>
+<g text-anchor="middle" font-size="11" fill="var(--muted)">
+<text x="60" y="112">симуляция</text><text x="190" y="62">TLP вручную</text><text x="190" y="162">completer</text><text x="320" y="112">очереди</text><text x="450" y="112">поток данных</text><text x="580" y="112">железо</text><text x="702" y="112">расширения</text>
+</g>
+<g stroke="var(--accent)" stroke-width="1.6" fill="none">
+<path d="M110,90 L138,52" marker-end="url(#m81)"/><path d="M110,106 L138,144" marker-end="url(#m81)"/>
+<path d="M240,52 L268,90" marker-end="url(#m81)"/><path d="M240,144 L268,106" marker-end="url(#m81)"/>
+<line x1="370" y1="98" x2="398" y2="98" marker-end="url(#m81)"/><line x1="500" y1="98" x2="528" y2="98" marker-end="url(#m81)"/><line x1="630" y1="98" x2="653" y2="98" marker-end="url(#m81)"/>
+</g>
+<g font-size="11" fill="var(--fg)" text-anchor="middle">
+<text x="60" y="196">занятие 1</text><text x="190" y="196">занятия 2–3</text><text x="320" y="196">занятие 4</text><text x="450" y="196">занятие 5</text><text x="580" y="196">занятия 6–7</text><text x="702" y="196">занятие 8</text>
+</g>
+</svg>
+<figcaption>Рис. 8.1. Зависимости лабораторных работ. Л2 и Л3 можно делать в любом порядке после Л1; Л4 требует обеих. Л7* — по выбору, защищается на последнем занятии.</figcaption>
+</figure>
+
+<table>
+<caption>Табл. 8.1. План занятий</caption>
+<tr><th>Занятие</th><th>Работа</th><th>Главы</th><th>Результат занятия</th></tr>
+<tr><td>1</td><td>Л1. Запуск симуляции и чтение осциллограмм</td><td>1, 4, 7</td><td>прошедший <code>tb_top</code>, найденный и измеренный первый CfgRd</td></tr>
+<tr><td>2</td><td>Л2. TLP вручную</td><td>1, 4, 5.4</td><td>собственный тест <code>tb_lab2</code>, разобранные hex-дампы</td></tr>
+<tr><td>3</td><td>Л3. Completer</td><td>1.4, 4, 6</td><td>измерения при MPS 256/512 и MRRS 512/4096</td></tr>
+<tr><td>4</td><td>Л4. Очереди NVMe</td><td>2.3–2.4, 5.6–5.7</td><td>переполнение SQ, смена фазы, обработка ошибочного CQE</td></tr>
+<tr><td>5</td><td>Л5. Поток данных</td><td>2.8, 6</td><td>график «простои источника — латентность SSD» для 2…16 слотов</td></tr>
+<tr><td>6–7</td><td>Л6. Железо</td><td>5 целиком</td><td>первая запись на реальный SSD, скорость, «обрыв» SLC-кэша</td></tr>
+<tr><td>8</td><td>Л7*. Расширения; защита</td><td>все</td><td>работающее расширение с тестом</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s2">8.2. Подготовка рабочего места</h2>
+<ul>
+<li>Vivado 2022.2 (для симуляции хватает бесплатной редакции; для Л6 нужна поддержка XC7K325T, то есть лицензия или ваучер к KC705).</li>
+<li>Git Bash или PowerShell. Скрипты запуска тестов: <code>sim/scripts/run_xsim.sh</code> и <code>sim/scripts/run_xsim.ps1</code>. Путь к Vivado задаётся переменной <code>VIVADO_BIN</code> (по умолчанию <code>/c/Xilinx/Vivado/2022.2/bin</code>).</li>
+<li>Python 3 с matplotlib — для графиков в Л5 и Л6.</li>
+<li>Каждый эксперимент делайте в отдельной ветке git. Изменения параметров в <code>rtl/nvme_host_pkg.sv</code> влияют на все тесты; верните их перед следующей работой.</li>
+</ul>
+
+<p>Как устроен запуск. Для теста <code>tb_&lt;имя&gt;</code> скрипт берёт <code>rtl/nvme_host_pkg.sv</code>, затем файлы из списка <code>sim/tb/tb_&lt;имя&gt;.f</code>, затем сам тестбенч. Он компилирует их (<code>xvlog -sv</code>), собирает снимок (<code>xelab -debug typical</code>) и запускает (<code>xsim -R</code>). Всё складывается в <code>sim/work/&lt;имя&gt;/</code>, журнал — <code>run.log</code>. Тест считается пройденным, если в журнале есть строка <code>TEST PASSED</code> и нет ошибок. Без аргументов скрипт прогоняет все <code>sim/tb/tb_*.sv</code>.</p>
+
+<!-- ============================================================ -->
+<h2 id="l1">8.3. Л1. Запуск симуляции и чтение осциллограмм</h2>
+
+<p><b>Цель.</b> Научиться запускать тесты проекта, открывать осциллограммы xsim и находить в них конкретные транзакции. Связать то, что описано в главах 1 и 5, с сигналами RTL.</p>
+<p><b>Предварительные знания.</b> Глава 1 (TLP, CfgRd, CRS), глава 4 (формат <code>tlp_axis</code>, командный порт <code>rp_requester</code>), раздел 5.4.</p>
+
+<h3>Что сделать</h3>
+<ol>
+<li>Прогнать все тесты: <code>sim/scripts/run_xsim.sh</code>. Записать в отчёт список тестов и время прогона.</li>
+<li>Прогнать полный тест отдельно: <code>sim/scripts/run_xsim.sh top</code>. Найти в <code>sim/work/top/run.log</code> строки с метрикой: окно установившегося режима, <code>TX-bus valid-beat ratio</code>, <code>payload ~… MB/s</code>, итоговую сводку по числу MRd, CplD, MWr и CQE.</li>
+<li>Получить осциллограммы. Снимок собран с <code>-debug typical</code>, но при прогоне с <code>-R</code> сигналы не записываются. Создайте в <code>sim/work/top/</code> файл <code>wave.tcl</code>:
+<pre><code>log_wave /tb_top/dut/u_requester/*
+log_wave /tb_top/dut/u_enum/*
+log_wave /tb_top/dut/u_sequencer/*
+log_wave -r /tb_top/u_core/*
+run all
+quit</code></pre>
+и выполните в этой папке <code>xsim tb_top_sim -tclbatch wave.tcl -wdb top.wdb</code>. Не пишите <code>log_wave -r /*</code>: полный дамп 700 мкс модельного времени займёт гигабайты.</li>
+<li>Открыть <code>top.wdb</code>: <code>xsim top.wdb -gui</code> или в Vivado командой <code>open_wave_database top.wdb</code>. Добавить на экран сигналы <code>r_req_valid</code>, <code>r_req_op</code>, <code>r_req_addr</code>, <code>r_rsp_valid</code>, <code>r_rsp_status</code>, <code>r_rsp_rdata</code> (в <code>dut</code>), <code>m_req_tdata</code> и <code>s_cpl_tdata</code> (в <code>u_requester</code>), <code>s_axis_tx_*</code> и <code>m_axis_rx_*</code>.</li>
+<li>Найти первый CfgRd0. Записать в отчёт заголовок H0–H2 в hex, момент времени и тег. Найти ответ на него. Модель SSD по умолчанию отвечает CRS на первые два конфигурационных запроса (<code>crs_count = 2</code>); найти оба CRS и успешный CplD.</li>
+<li>Измерить в тактах <code>user_clk</code> (8 нс): (а) от принятия команды (<code>r_req_valid && r_req_ready</code>) до выхода заголовка на <code>s_axis_tx</code>; (б) от последнего такта CfgRd на <code>s_axis_tx</code> до первого такта ответа на <code>m_axis_rx</code>; (в) от ответа CRS до повтора запроса.</li>
+<li>По <code>status_seq_state</code> (в тестбенче — шина <code>status_seq_state</code>) построить таблицу: состояние секвенсора → время входа.</li>
+</ol>
+
+<h3>Критерий приёмки</h3>
+<ul>
+<li>Все тесты проходят; в отчёте приведена метрика <code>tb_top</code>. Ожидаемые значения на исходном коде: valid-beat ratio около 0,91, около 1600 МБ/с, 64 команды Write, 1 Flush, 3914 MRd, 7686 CplD.</li>
+<li>Скриншот с первым CfgRd и тремя ответами (CRS, CRS, CplD), заголовки расшифрованы по полям.</li>
+<li>Три измеренные задержки с объяснением, из чего каждая складывается (подсказка: в модели ядра <code>tx_latency_cycles</code> = 16, в модели SSD <code>mmio_lat_cycles</code> = 8, пауза CRS при <code>SIM_FAST</code> = 125 тактов).</li>
+</ul>
+
+<h3>Подсказки</h3>
+<ul>
+<li>На шине <code>s_axis_tx_tdata</code> 3DW-заголовок занимает DW0–DW2 первого такта, а единственный DW данных CfgWr — DW3 того же такта, переставленный по байтам. На <code>m_req_tdata</code> (внутренний формат) данные идут отдельным тактом в порядке памяти.</li>
+<li>Время входа в состояния удобнее найти по <code>u_sequencer.cur</code> с отображением в виде перечисления (Radix → Enum или Unsigned).</li>
+<li>В Tcl-консоли xsim есть <code>get_value</code> и <code>current_time</code>: их удобно использовать, чтобы не мерить такты курсором.</li>
+</ul>
+
+<h3>Вопросы для отчёта</h3>
+<ol>
+<li>Почему тест запускается с <code>SIM_FAST = 1</code>? Какие таймеры он сокращает и что при этом не проверяется?</li>
+<li>Почему в <code>tb_top</code> отсутствует <code>link_bringup</code>, и чем тестбенч его заменяет?</li>
+<li>Сколько всего конфигурационных TLP послал хост? Сравните с табл. 5.7.</li>
+<li>Почему valid-beat ratio меньше 1, хотя completer способен выдавать такт за тактом? (Подсказка: частота источника данных в <code>tb_top</code>.)</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="l2">8.4. Л2. TLP вручную</h2>
+
+<p><b>Цель.</b> Собрать минимальное окружение из <code>rp_requester</code>, адаптеров и моделей и вручную, без <code>pcie_enum</code>, прочитать идентификатор SSD, определить размер BAR0, назначить его и прочитать регистр NVMe. Научиться читать TLP в шестнадцатеричном виде на обоих интерфейсах: внутреннем и интерфейсе ядра.</p>
+<p><b>Предварительные знания.</b> Глава 1 (разделы 1.4, 1.5), глава 4 (<code>rp_requester</code>, <code>pcie7x_tx_adapt</code>, <code>pcie7x_rx_adapt</code>, <code>tlp_rx_demux</code>), раздел 5.4, Л1.</p>
+
+<h3>Что сделать</h3>
+<ol>
+<li>Создать <code>sim/tb/tb_lab2.sv</code> и список <code>sim/tb/tb_lab2.f</code>. В список войдут: <code>rtl/common/*.sv</code> (нужные из них), <code>rtl/pcie/pcie7x_rx_adapt.sv</code>, <code>pcie7x_tx_adapt.sv</code>, <code>tlp_rx_demux.sv</code>, <code>rp_requester.sv</code> и три файла из <code>sim/models/</code>. Образец — <code>sim/tb/tb_top.f</code>.</li>
+<li>Соединить цепочку: <code>rp_requester.m_req</code> → <code>pcie7x_tx_adapt</code> → <code>pcie7x_core_model</code> ↔ <code>nvme_ssd_model</code>; обратно <code>pcie7x_core_model.m_axis_rx</code> → <code>pcie7x_rx_adapt</code> → <code>tlp_rx_demux</code> → <code>m_cpl</code> → <code>rp_requester.s_cpl</code>. Выходы <code>m_mrd</code> и <code>m_mwr</code> демультиплексора подтянуть <code>tready = 1</code>: в этой работе SSD не будет сам обращаться к памяти. Экземпляры моделей скопировать из <code>tb_top.sv</code>.</li>
+<li>Написать задачу-обёртку над командным портом, которая сама повторяет запрос при CRS:
+<pre><code>task automatic do_req(input logic [1:0] op, input logic [31:0] addr,
+                      input logic [31:0] wdata, input logic [3:0] be,
+                      output logic [2:0] st, output logic [31:0] rd);
+  do begin
+    @(posedge clk); req_valid &lt;= 1; req_op &lt;= op; req_addr &lt;= addr;
+    req_wdata &lt;= wdata; req_be &lt;= be;
+    do @(posedge clk); while (!req_ready);   // handshake
+    req_valid &lt;= 0;
+    do @(posedge clk); while (!rsp_valid);
+    st = rsp_status; rd = rsp_rdata;
+    if (st == 3'd2) repeat (50) @(posedge clk);  // CRS: пауза и повтор
+  end while (st == 3'd2);
+endtask</code></pre>
+Уточните момент снятия <code>req_valid</code> по протоколу из главы 4: запрос принимается в такте, где <code>req_valid && req_ready</code>.</li>
+<li>Выполнить последовательность и напечатать результаты <code>$display</code> в hex:
+<ul>
+<li>CfgRd0 VID/DID: <code>addr = 32'h0100_0000</code>;</li>
+<li>CfgWr0 BAR0 = <code>0xFFFF_FFFF</code>, CfgRd0 BAR0, вычислить размер окна;</li>
+<li>CfgWr0 BAR0 = <code>0xC000_0000</code>, BAR1 = 0;</li>
+<li>CfgWr0 Command = <code>0x0002</code> (только MSE), BE = 0011;</li>
+<li>MRd32 по <code>0xC000_0000</code> и <code>0xC000_0004</code> (CAP), MRd32 по <code>0xC000_0008</code> (VS).</li>
+</ul></li>
+<li>Добавить монитор, который при каждом <code>s_axis_tx_tvalid && s_axis_tx_tready</code> и <code>m_axis_rx_tvalid && m_axis_rx_tready</code> печатает такт шины в hex вместе с <code>tkeep</code> и <code>tuser</code>. Разобрать по полям один CfgWr0 и один CplD на шине ядра и те же пакеты на внутренней шине.</li>
+<li>Повторить запуск с <code>u_core.straddle_pct = 50; u_core.sof_dw2_pct = 25;</code> и найти в дампе RX хотя бы один такт со straddle.</li>
+</ol>
+
+<h3>Критерий приёмки</h3>
+<ul>
+<li>Тест печатает <code>VID/DID = a808144d</code>, <code>BAR0 mask = ffffc004 (16 KiB)</code>, <code>CAP = 00000020_010103ff</code>, <code>VS = 00010400</code> и строку <code>TEST PASSED</code>; счётчики ошибок моделей (<code>u_core.err_count</code>, <code>u_ssd.err_count</code>) равны 0.</li>
+<li>В отчёте разобраны четыре пакета (CfgWr0 и CplD на двух интерфейсах), показан переставленный порядок байтов DW данных.</li>
+<li>Найден и объяснён такт со straddle.</li>
+</ul>
+
+<h3>Подсказки</h3>
+<ul>
+<li>Модель SSD откликается на BAR только при Command.MSE = 1 и проверяет это (ошибка B-1). Без шага с Command MRd к CAP получит ответ UR.</li>
+<li>Для CfgWr0 к Command с BE = 0011 SSD захватывает номер шины (первый CfgWr0) — с этого момента Completer ID в ответах станет <code>0x0100</code>.</li>
+<li>Тайм-аут <code>rp_requester</code> задаётся входом <code>timeout_cycles</code>; для симуляции хватит 20 000.</li>
+</ul>
+
+<h3>Вопросы для отчёта</h3>
+<ol>
+<li>Что вернёт <code>rp_requester</code>, если на CfgRd0 придёт CplD длиной 2 DW? Найдите это место в коде.</li>
+<li>Почему для CfgWr0 нужен ответ, а для MWr32 нет? Как это видно в автомате <code>rp_requester</code> (состояния <code>S_DATA</code>, <code>S_WAIT_CPL</code>)?</li>
+<li>Как изменится H2 запроса, если обратиться к регистру с номером больше 0xFF (расширенное пространство)? Поддерживает ли это <code>hdr_cfg0()</code>?</li>
+<li>Зачем внутренний формат <code>tlp_axis</code> выносит данные в отдельный такт, если на шине ядра они помещаются в DW3 первого такта?</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="l3">8.5. Л3. Completer: MPS, MRRS и такты на такт</h2>
+
+<p><b>Цель.</b> Понять, как размер пакета влияет на эффективность шины, и проверить, что <code>hostmem_completer</code> правильно делит ответы при других MPS и MRRS. Научиться измерять пропускную способность в тактах шины на такт (beats/cycle).</p>
+<p><b>Предварительные знания.</b> Глава 1 (разделы 1.4, 1.7: разбиение ответа, Byte Count, Lower Address, RCB), глава 4 (<code>hostmem_completer</code>, <code>dw_shift</code>), глава 6, раздел 5.4.5. Л1.</p>
+
+<h3>Что сделать</h3>
+<ol>
+<li><b>Базовая точка.</b> В <code>sim/tb/tb_top.sv</code> поднять частоту источника данных до 125 МГц (<code>forever #4 data_clk = ~data_clk;</code>), чтобы источник перестал ограничивать скорость. Прогнать <code>run_xsim.sh top</code> и записать valid-beat ratio, МБ/с, число CplD.</li>
+<li><b>MPS = 512.</b> В <code>rtl/nvme_host_pkg.sv</code> установить <code>MPS_CAP_CODE = 3'd2</code>. Модель SSD объявляет MPSS = 2, поэтому <code>pcie_enum</code> выберет 512 B, а <code>rp_cfg_init</code> запишет тот же код в DevCtl Root Port; модель ядра начнёт пропускать пакеты до 512 B (проверки TX-6, RX-1). Прогнать <code>tb_top</code> и <code>tb_completer</code>. Сравнить число CplD и ratio.</li>
+<li>Найти в осциллограмме ответ на один MRd 512 B: убедиться, что при выровненном адресе это один CplD на 128 DW, а при адресе вида <code>…_x040</code> — два CplD (первый до границы 512 B).</li>
+<li><b>MRRS = 4096.</b> Вернуть MPS = 256 и установить <code>MRRS_CODE = 3'd5</code>. Модель SSD будет выдавать MRd случайного размера до 4096 B (<code>mrd_size_min</code>…MRRS). Completer по контракту поддерживает запросы до 4096 B (Length = 0 означает 1024 DW, BC = 4096 кодируется нулём); <code>tb_completer</code> уже проверяет такие запросы. Прогнать <code>tb_top</code>; убедиться в отсутствии ошибок D-5…D-9 в модели SSD. Если они есть — найти и исправить причину.</li>
+<li>Добавить в <code>tb_top</code> счётчик тактов, когда <code>rx_np_ok = 0</code> (completer просит ядро придержать неотправленные запросы), и напечатать его. Сравнить для MRRS 512 и 4096.</li>
+<li>Свести результаты в таблицу: MPS × MRRS → число CplD, beats/cycle, МБ/с, такты с <code>rx_np_ok = 0</code>.</li>
+</ol>
+
+<h3>Критерий приёмки</h3>
+<ul>
+<li><code>tb_top</code> и <code>tb_completer</code> проходят во всех трёх конфигурациях.</li>
+<li>Измеренная доля данных в тактах шины совпадает с теорией: для CplD на 256 B полезных 16 тактов из 17 (0,941), для 512 B — 32 из 33 (0,970). Расхождение больше 2 % объяснено.</li>
+<li>В отчёте — осциллограмма ответа из двух CplD с расшифровкой Length, BC и LA обоих.</li>
+</ul>
+
+<h3>Подсказки</h3>
+<ul>
+<li>Не забудьте: в реальном железе MPS 512 потребует перегенерировать IP (<code>Max_Payload_Size</code> = 512_bytes), а параметр в пакете и настройка IP должны совпадать.</li>
+<li>Глубина очереди запросов completer — 16 записей. <code>np_backpressure</code> поднимается, когда свободных меньше двух; модель ядра реагирует на <code>rx_np_ok</code> с задержкой <code>np_ok_lag</code> = 2 такта.</li>
+<li>Для BC и LA используйте рабочий пример в заголовке <code>hostmem_completer.sv</code>: MRd 512 B по адресу <code>…040</code> при MPS 256 даёт три CplD: 48 DW (BC = 512, LA = 0x40), 64 DW (BC = 320), 16 DW (BC = 64).</li>
+</ul>
+
+<h3>Вопросы для отчёта</h3>
+<ol>
+<li>Почему больший MPS почти не увеличивает скорость на Gen2 x4, но заметно влияет на Gen3 x8? (Глава 6: накладные расходы на линке и на шине ядра.)</li>
+<li>Почему MRRS — параметр SSD, а не Root Port? Что ограничивает MRRS сверху со стороны completer?</li>
+<li>Чем опасен большой MRRS при неглубокой очереди запросов completer? Что произойдёт с кредитами NP?</li>
+<li>Почему completer отвечает на запросы строго по порядку и почему это допустимо по правилам PCIe?</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="l4">8.6. Л4. Очереди NVMe: переполнение SQ, фаза и ошибочные CQE</h2>
+
+<p><b>Цель.</b> Увидеть на осциллограмме механизмы кольцевых очередей: заполнение SQ, переход указателей через конец, смену фазового бита. Проверить, как движок записи обрабатывает CQE с ошибкой и CQE, которых он не ждал.</p>
+<p><b>Предварительные знания.</b> Глава 2 (разделы 2.3, 2.4), разделы 5.6–5.7, глава 4 (<code>nvme_write_engine</code>). Л1, Л2.</p>
+
+<h3>Что сделать</h3>
+<ol>
+<li><b>Маленькая очередь.</b> В <code>nvme_host_pkg.sv</code> установить <code>IO_QSIZE = 16</code>. В <code>tb_top.sv</code>: <code>N_SLOTS = 16</code>, <code>SLOT_BYTES = 16384</code> (64 команды на 1 MiB, то есть 4 круга по очереди из 16). Модели SSD задать долгую обработку: <code>u_ssd.cmd_latency_min = 3000; u_ssd.cmd_latency_max = 6000; u_ssd.concurrent_cmds = 16;</code> (в начале <code>initial</code>, как это делает <code>apply_plusargs()</code>).</li>
+<li>Прогнать тест. Убедиться, что <code>nvme_admin</code> создал очереди с CDW10 = <code>0x000F_0001</code> (журнал модели при <code>+verbose</code>).</li>
+<li>Найти на осциллограмме момент переполнения SQ: <code>u_write_engine.outstanding</code> = 15 (<code>IO_QSIZE − 1</code>), <code>sq_full_stall</code> = 1, при этом есть заполненный слот. Напечатать <code>stat_sq_full_stall_cycles</code> в конце теста.</li>
+<li>Найти четыре смены <code>u_write_engine.cq_phase</code>. Показать, что каждая происходит при переходе <code>cq_head</code> с 15 на 0, и что CQE второго круга приходят с DW3[16] = 0.</li>
+<li><b>Ошибка в CQE.</b> Прогнать <code>tb_top +inject_err</code>: модель ставит статус <code>0x4280</code> (DNR, SCT 2, SC 80h — Write Fault) команде №10. Проверить <code>stat_cmd_errors = 1</code>, <code>stat_last_status = 0x4280</code>, и что слот всё равно освобождён.</li>
+<li>Заменить статус на CID Conflict: <code>u_ssd.inject_status_value = 15'h0003;</code>. Объяснить, почему движок <i>не может</i> получить такой статус при правильной работе.</li>
+<li><b>Чужой CQE.</b> В тестбенче <code>sim/tb/tb_write_engine.sv</code> (модуль <code>we_harness</code>, своя модель SSD) добавить сценарий: после очередного настоящего CQE записать ещё один CQE с CID слота, который сейчас не занят, и с правильной фазой. Ожидаемое поведение: <code>cmd_errors</code> увеличился, <code>slot_free</code> не выдан, <code>cq_head</code> продвинулся, CQ doorbell отправлен.</li>
+</ol>
+
+<h3>Критерий приёмки</h3>
+<ul>
+<li>В режиме <code>IO_QSIZE = 16</code> тест <code>tb_top</code> проходит (данные совпадают, ошибок в моделях нет), <code>stat_sq_full_stall_cycles</code> &gt; 0.</li>
+<li>Осциллограмма смены фазы с подписанными <code>cq_head</code>, <code>cq_phase</code>, DW3 CQE.</li>
+<li>Новый сценарий в <code>tb_write_engine</code> проходит и проверяет все четыре ожидаемых эффекта.</li>
+</ul>
+
+<h3>Подсказки</h3>
+<ul>
+<li>SQ на 16 записей вмещает только 15 команд: при tail = head очередь пуста, поэтому заполнять её до конца нельзя. В RTL это константа <code>MAX_OUTSTANDING = IO_QSIZE − 1</code>.</li>
+<li>Модель SSD проверяет doorbell'ы (ошибки N-7, N-8). Если движок неправильно считает места в SQ, тест упадёт именно на них.</li>
+<li>CQE модели в <code>we_harness</code> пишется двумя половинами, фаза — во второй. Пишите поддельный CQE так же.</li>
+</ul>
+
+<h3>Вопросы для отчёта</h3>
+<ol>
+<li>Зачем нужен фазовый бит, если хост знает, сколько команд подал? Что было бы без него?</li>
+<li>Почему <code>nvme_write_engine</code> читает <code>iocq_ram</code> каждый такт и зачем нужен <code>skip_r</code>? Что сломается, если его убрать?</li>
+<li>Почему CQ doorbell отправляется только когда сборщик «затих»? Оцените, сколько MWr экономит это правило при пачке из 8 CQE.</li>
+<li>Как изменится поведение при <code>IO_QSIZE = 4</code> и <code>N_SLOTS = 8</code>? Что станет узким местом?</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="l5">8.7. Л5. Поток данных: сколько слотов нужно</h2>
+
+<p><b>Цель.</b> Экспериментально найти, сколько слотов кольца нужно, чтобы источник данных не останавливался при заданной латентности SSD. Сравнить измерения с законом Литтла.</p>
+<p><b>Предварительные знания.</b> Глава 1 (раздел 1.7, закон Литтла), глава 2 (раздел 2.8), глава 6. Л1, Л4.</p>
+
+<h3>Что сделать</h3>
+<ol>
+<li>В <code>tb_top</code> добавить печать <code>stat_stall_cycles</code> (такты, когда <code>data_ring</code> держал <code>s_data_tready = 0</code>), <code>stat_max_latency</code> и длительности прогона в тактах. Вынести <code>N_SLOTS</code> в параметр модуля <code>tb_top</code>, чтобы задавать его из командной строки <code>xelab</code> (<code>-generic_top N_SLOTS=…</code>), или собрать несколько копий теста.</li>
+<li>Оставить <code>SLOT_BYTES = 16384</code>, источник 125 МГц. Задать латентность обработки команды моделью SSD: <code>u_ssd.cmd_latency_min = u_ssd.cmd_latency_max = L</code> и <code>u_ssd.concurrent_cmds = N_SLOTS</code>.</li>
+<li>Провести серию: <code>N_SLOTS</code> ∈ {2, 4, 8, 16}, <code>L</code> ∈ {0, 500, 1000, 2000, 4000, 8000, 16000} тактов. Для каждой точки записать долю простоя источника <code>stat_stall_cycles / длительность</code> и среднюю скорость.</li>
+<li>Построить график: по оси X — <code>L</code> в микросекундах, по оси Y — доля простоя; по линии на каждое <code>N_SLOTS</code>. Скрипт на Python с matplotlib; данные — CSV, собранный из журналов.</li>
+<li>Наложить на график теоретическую оценку. Слот заполняется источником за T<sub>fill</sub> = 16 KiB / 2 ГБ/с ≈ 8,2 мкс. Слот занят примерно T<sub>fill</sub> + T<sub>fetch</sub> + T<sub>xfer</sub> + L (заполнение, выборка SQE и PRP, передача данных, обработка). Простоев нет, пока N<sub>SLOTS</sub> · T<sub>fill</sub> ≥ T<sub>занят</sub>.</li>
+<li>Пересчитать результат на реальный SSD: латентность записи 128 KiB в кэш ≈ 100–200 мкс, пики при сборке мусора — до 10 мс. Сколько слотов по 128 KiB нужно в каждом случае при 1,7 ГБ/с? Сколько это BRAM?</li>
+</ol>
+
+<h3>Критерий приёмки</h3>
+<ul>
+<li>График с четырьмя кривыми и теоретическими «коленями»; точки перехода к простоям совпадают с оценкой в пределах 30 %, расхождения объяснены.</li>
+<li>Все прогоны проходят проверки T-1…T-9 (данные на SSD совпадают с источником при любом числе слотов).</li>
+<li>Ответ на п. 6 с расчётом и выводом: хватает ли BRAM XC7K325T, когда нужна DDR3.</li>
+</ul>
+
+<h3>Подсказки</h3>
+<ul>
+<li>При <code>N_SLOTS = 16</code> и маленьком <code>concurrent_cmds</code> узким местом станет модель, а не кольцо: SSD обрабатывает не больше <code>concurrent_cmds</code> команд одновременно. Именно поэтому в п. 2 их приравнивают.</li>
+<li>Простой при <code>L = 0</code> и <code>N_SLOTS = 2</code> не равен нулю: один слот передаётся, второй заполняется, и любая задержка выборки уже останавливает источник.</li>
+<li>Глобальный тайм-аут <code>tb_top</code> — 20 мс модельного времени. При больших <code>L</code> и малом <code>N_SLOTS</code> его может не хватить: увеличьте.</li>
+</ul>
+
+<h3>Вопросы для отчёта</h3>
+<ol>
+<li>Запишите закон Литтла для этой системы: что здесь «число заявок в системе», «интенсивность» и «время пребывания»?</li>
+<li>Почему увеличение <code>SLOT_BYTES</code> при той же общей памяти кольца почти не меняет допустимую латентность, а увеличение памяти — меняет?</li>
+<li>Что выгоднее при фиксированной памяти 1 MiB: 8 × 128 KiB или 32 × 32 KiB? Учтите накладные расходы на команду и MDTS.</li>
+<li>Как изменится картина, если источник выдаёт 2,0 ГБ/с, а линк — только 1,7 ГБ/с полезных?</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="l6">8.8. Л6. Железо: первая запись и «обрыв» SLC-кэша</h2>
+
+<p><b>Цель.</b> Собрать проект для KC705, пройти запуск на реальном SSD, измерить скорость записи и увидеть, как она падает после заполнения SLC-кэша накопителя.</p>
+<p><b>Предварительные знания.</b> Глава 5 целиком, глава 2 (раздел 2.9: что внутри SSD), глава 6. Л1–Л5.</p>
+
+<div class="box warn"><span class="t">Безопасность данных и железа</span>
+Хост пишет с LBA <code>START_LBA</code> = 0 подряд и уничтожает таблицу разделов и все данные на накопителе. Используйте отдельный SSD. Не подключайте и не отключайте M.2 при включённом питании. Поставьте на SSD радиатор: при длительной записи без него контроллер уйдёт в тепловое дросселирование, и результаты Л6 будут бессмысленны.</div>
+
+<h3>Что сделать</h3>
+<ol>
+<li><b>Проект.</b> Выполнить шаги раздела 5.1.4: <code>create_project.tcl</code>, проверка IP, сверка портов <code>pcie7x_wrapper.sv</code> с <code>pcie_7x_0_stub.v</code>, XDC (контакты, LOC GTX, полярность PERST# для вашего адаптера, группы тактов).</li>
+<li><b>Обёртка платы</b> <code>board_top.sv</code>:
+<ul>
+<li>инвертор кнопки CPU_RESET в <code>board_rst_n</code>;</li>
+<li>источник данных: <code>data_clk = user_clk_out</code> (125 МГц × 16 B = 2 ГБ/с, больше скорости линка), данные — 128-битный LFSR или счётчик с перемешиванием; источник уважает <code>s_data_tready</code> и считает свои простои;</li>
+<li>VIO: выходы <code>ctrl_start</code>, <code>ctrl_stop</code>, «стоп источника»; входы <code>status_*</code>, <code>stat_bytes_done</code>, <code>stat_cmds_done</code>, <code>stat_cmd_errors</code>, <code>stat_max_latency</code>, свободный счётчик тактов <code>user_clk</code>;</li>
+<li>ILA по табл. 5.14 (точки P1–P4) и светодиоды по совету из раздела 5.8.</li>
+</ul></li>
+<li><b>Первый запуск.</b> Подать <code>ctrl_start</code>, проследить <code>status_seq_state</code> до 5 (RUN). Записать <code>status_gen2</code>, <code>status_link_width</code>, <code>stat_mdts</code>, <code>stat_nsze</code>, <code>stat_lbads</code>. Захватить в ILA первый CfgRd с ответом и первую команду Write (MWr SQ1TDBL, MRd SQE, первые CplD, CQE).</li>
+<li><b>Останов.</b> Остановить источник, подать <code>ctrl_stop</code>, дождаться <code>status_done</code>. Проверить <code>status_shutdown_timeout = 0</code>.</li>
+<li><b>Скорость.</b> Перезапустить (через сброс платы!) и записать 8 GiB. Скорость = Δ<code>stat_bytes_done</code> / Δt, где Δt — разность показаний счётчика тактов, умноженная на 8 нс.</li>
+<li><b>«Обрыв» кэша.</b> Узнать из обзоров объём SLC-кэша вашего SSD в текущем состоянии (у накопителей с динамическим кэшем он зависит от заполненности). Перед опытом очистить накопитель на ПК (<code>nvme format</code> или <code>blkdiscard</code>), чтобы начальное состояние было воспроизводимым. Записать не меньше двух объёмов кэша, снимая <code>stat_bytes_done</code> раз в секунду Tcl-циклом в Vivado Hardware Manager:
+<pre><code>set vio [get_hw_vios hw_vio_1]
+set f [open speed.csv w]
+for {set i 0} {$i &lt; 600} {incr i} {
+  refresh_hw_vio $vio
+  puts $f "[clock milliseconds],[get_property INPUT_VALUE [get_hw_probes stat_bytes_done -of_objects $vio]]"
+  after 1000
+}
+close $f</code></pre>
+Построить график скорости во времени.</li>
+</ol>
+
+<h3>Критерий приёмки</h3>
+<ul>
+<li>Запуск доходит до RUN и DONE без ошибок; линк Gen2 x4. Если нет — в отчёте есть диагностика по табл. 5.15 с осциллограммами ILA, доказывающими причину.</li>
+<li>Скорость на чистом накопителе в пределах кэша — не меньше 1,5 ГБ/с (ориентир — около 1,6 ГБ/с, как в симуляции).</li>
+<li>График «скорость — время» с отмеченным моментом исчерпания кэша и установившейся скоростью после него; <code>stat_max_latency</code> до и после «обрыва».</li>
+<li>Записанные данные проверены на ПК: прочитать несколько областей (например, <code>dd</code> с нужным смещением) и сравнить с моделью LFSR.</li>
+</ul>
+
+<h3>Подсказки</h3>
+<ul>
+<li>Сначала проверьте линк без NVMe: достаточно, чтобы <code>status_seq_state</code> дошёл до 2 и выше. Первая запись — только после того, как <code>status_enum_done</code> = 1 стабильно.</li>
+<li>После исчерпания кэша растут не только паузы, но и <code>stat_max_latency</code> (единицы–десятки мс). Источник в обёртке должен уметь ждать: проверьте его счётчик простоев.</li>
+<li>Если скорость ниже 1,5 ГБ/с уже в начале, проверьте <code>status_gen2</code> и ширину линка, затем загрузку <code>s_axis_tx_tready</code> в ILA (глава 6).</li>
+</ul>
+
+<h3>Вопросы для отчёта</h3>
+<ol>
+<li>Сравните скорость на железе и в симуляции. Какие эффекты реального линка не моделируются?</li>
+<li>Почему после «обрыва» скорость не падает до нуля и почему она «пилообразная»?</li>
+<li>Какой буфер нужен, чтобы источник 1,6 ГБ/с пережил паузу SSD в 20 мс без потерь? Помещается ли он в BRAM?</li>
+<li>Что изменится, если перед записью не очищать накопитель?</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="l7">8.9. Л7*. Расширения (одно на выбор)</h2>
+
+<p><b>Цель.</b> Самостоятельно спроектировать, реализовать и проверить новую функцию хоста. Работа оценивается как мини-проект: спецификация, RTL, тест, отчёт.</p>
+<p><b>Общие требования.</b> Короткая спецификация (интерфейсы, автомат, влияние на остальные модули) до начала кодирования. Новый или расширенный тест в <code>sim/tb/</code>, который проходит через <code>run_xsim.sh</code>. Все существующие тесты продолжают проходить. Для расширений, которые трогают модель SSD, — доработка модели.</p>
+
+<table>
+<caption>Табл. 8.2. Варианты расширений</caption>
+<tr><th>Вариант</th><th>Что сделать</th><th>Ключевые трудности</th><th>Критерий приёмки</th></tr>
+<tr><td><b>А. Движок чтения</b> (NVM opcode 02h)</td><td>Модуль <code>nvme_read_engine</code>: подаёт Read на диапазон LBA в отдельную I/O-пару очередей или ту же SQ; SSD пишет данные MWr в новый регион памяти хоста; модуль сравнивает их с ожидаемым LFSR</td><td>новая область в <code>hostmem_writer</code>, PRP для приёмного буфера, разделение CID чтения и записи, порядок MWr внутри команды</td><td>чтение 1 MiB, записанного в том же тесте, без расхождений; счётчик ошибок сравнения = 0</td></tr>
+<tr><td><b>Б. MSI вместо опроса</b></td><td>При перечислении запрограммировать MSI capability SSD (Message Address, Data, Enable); Create I/O CQ с IEN = 1, IV = 0; <code>hostmem_writer</code> распознаёт MWr по адресу MSI и выдаёт событие; сборщик проверяет CQ только по событию</td><td>поиск MSI capability (ID 05h), формат MSI 64-bit, гонка «MSI пришёл раньше CQE» (порядок posted-записей)</td><td>тест с моделью, в которую добавлена отправка MSI; ни один CQE не потерян; число чтений <code>iocq_ram</code> уменьшилось</td></tr>
+<tr><td><b>В. Кольцо в DDR3</b></td><td>Кольцо данных в DDR3 через MIG (KC705 — SODIMM 1 GB): запись потока через AXI, чтение completer'ом с предвыборкой</td><td>латентность чтения DDR (сотни нс) против требования «такт за тактом»; FIFO ответов; арбитраж записи и чтения; полоса DDR3-1600 x64</td><td>симуляция с моделью памяти MIG; доля valid-тактов TX ≥ 0,9; расчёт допустимой паузы SSD для кольца 512 MiB</td></tr>
+<tr><td><b>Г. SMART и температура</b></td><td>Admin-команда Get Log Page: opcode 02h, NSID = FFFFFFFFh, CDW10 = <code>0x007F_0002</code> (LID 02h, 512 B); вывести температуру (байты 1–2, Кельвины) и Percentage Used; опрашивать раз в секунду во время RUN</td><td>admin-команда во время работы I/O: разделение порта 0 <code>req_mux</code>, размещение буфера (можно повторно использовать <code>ident_ram</code>)</td><td>в модели — фиксированное значение температуры; на железе — график температуры вместе с графиком скорости из Л6</td></tr>
+<tr><td><b>Д. Второй namespace</b></td><td>Identify с CNS = 02h (список активных NSID); выбор NSID параметром; Identify Namespace для него; запись в выбранный namespace</td><td>доработка модели SSD (два namespace с разными NSZE и форматами LBA), проверка границы для каждого</td><td>запись в NSID 2 не затрагивает NSID 1; ошибка Invalid Namespace для несуществующего NSID обрабатывается</td></tr>
+</table>
+
+<p>Другие темы по согласованию с преподавателем: Dataset Management (Trim) диапазона перед записью; FUA на последней команде вместо Flush; программирование Link Control (Common Clock Configuration и Retrain Link) с проверкой Link Status; несколько I/O-очередей с распределением слотов.</p>
+
+<!-- ============================================================ -->
+<h2 id="s9">8.10. Оценивание</h2>
+
+<table>
+<caption>Табл. 8.3. Баллы по работам</caption>
+<tr><th>Работа</th><th class="num">Баллы</th><th>Обязательна</th></tr>
+<tr><td>Л1</td><td class="num">8</td><td>да</td></tr>
+<tr><td>Л2</td><td class="num">12</td><td>да</td></tr>
+<tr><td>Л3</td><td class="num">12</td><td>да</td></tr>
+<tr><td>Л4</td><td class="num">14</td><td>да</td></tr>
+<tr><td>Л5</td><td class="num">14</td><td>да</td></tr>
+<tr><td>Л6</td><td class="num">20</td><td>да (при наличии оборудования; иначе заменяется Л7*)</td></tr>
+<tr><td>Л7*</td><td class="num">20</td><td>нет</td></tr>
+<tr><td><b>Итого</b></td><td class="num"><b>100</b></td><td>отлично ≥ 85, хорошо ≥ 70, удовлетворительно ≥ 55</td></tr>
+</table>
+
+<table>
+<caption>Табл. 8.4. Критерии внутри каждой работы (доля от баллов работы)</caption>
+<tr><th>Критерий</th><th class="num">Доля</th><th>Полный балл</th><th>Половина балла</th><th>Ноль</th></tr>
+<tr><td>Работоспособность</td><td class="num">40 %</td><td>все критерии приёмки выполнены, тесты проходят</td><td>основной результат есть, часть критериев не выполнена</td><td>тест не проходит или результат не воспроизводится</td></tr>
+<tr><td>Измерения и анализ</td><td class="num">25 %</td><td>числа сравнены с теорией, расхождения объяснены</td><td>числа приведены без анализа</td><td>измерений нет</td></tr>
+<tr><td>Ответы на вопросы</td><td class="num">20 %</td><td>со ссылками на конкретные строки RTL и осциллограммы</td><td>верно, но общими словами</td><td>неверно или нет</td></tr>
+<tr><td>Качество кода и отчёта</td><td class="num">15 %</td><td>изменения минимальны и прокомментированы, отчёт воспроизводим (команды, коммит)</td><td>код работает, но «грязный»</td><td>изменения не приложены</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s10">8.11. Типичные ошибки студентов</h2>
+
+<table>
+<caption>Табл. 8.5. Что чаще всего идёт не так</caption>
+<tr><th>Ошибка</th><th>Чем проявляется</th><th>Как избежать</th></tr>
+<tr><td>Изменили параметр в <code>nvme_host_pkg.sv</code> и забыли вернуть</td><td>«сломались» тесты в следующей работе</td><td>ветка git на каждую работу; <code>git diff rtl/</code> перед сдачей</td></tr>
+<tr><td>Изменили MPS только в пакете</td><td>на железе ядро отбрасывает пакеты, в модели — ошибки TX-6/RX-1</td><td>MPS в пакете, в IP и в обеих DevCtl должен совпадать</td></tr>
+<tr><td>Полный дамп сигналов (<code>log_wave -r /*</code>)</td><td>гигабайтный <code>.wdb</code>, симуляция в десятки раз медленнее</td><td>логировать только нужные области (Л1, п. 3)</td></tr>
+<tr><td>Путают порядок байтов на шине ядра и внутри проекта</td><td>«неверный» VID в ILA, ложные выводы об ошибке</td><td>помнить: адаптеры переставляют байты DW данных (раздел 5.4.1)</td></tr>
+<tr><td>Считают <code>req_valid</code> принятым без <code>req_ready</code></td><td>потерянные или задвоенные запросы в Л2</td><td>handshake — в такте, где оба сигнала равны 1</td></tr>
+<tr><td>Ждут ответа на MWr32</td><td>тест висит; лишние таймауты</td><td>MWr — posted, <code>rsp_valid</code> приходит сразу после отправки</td></tr>
+<tr><td>Заполняют SQ до конца (<code>IO_QSIZE</code> команд)</td><td>ошибка N-8 модели; SSD считает очередь пустой</td><td>в очереди всегда одна пустая ячейка</td></tr>
+<tr><td>Подают <code>ctrl_stop</code>, не остановив источник</td><td>последний слот не записан, данные в отчёте «не сходятся»</td><td>сначала источник, потом <code>ctrl_stop</code>; объём кратен <code>SLOT_BYTES</code></td></tr>
+<tr><td>Второй прогон на железе без сброса платы</td><td>CID Conflict, неверные doorbell'ы</td><td><code>board_rst_n</code> между прогонами (раздел 5.7)</td></tr>
+<tr><td>PERST# без учёта инверсии на адаптере</td><td>LTSSM стоит в Detect</td><td>проверить схему адаптера, мультиметр на разъёме M.2</td></tr>
+<tr><td>Измеряют скорость по времени симуляции с этапом запуска</td><td>занижение скорости в разы</td><td>мерить окно установившегося режима (как <code>tb_top</code>)</td></tr>
+<tr><td>Измеряют SSD на «нулевых» или повторяющихся данных и без очистки</td><td>завышенные или невоспроизводимые результаты</td><td>LFSR-данные, очистка накопителя, контроль температуры</td></tr>
+</table>
+
+<div class="pager"><a href="07_verification.html">← Глава 7. Верификация и симуляция</a><a href="glossary.html">Глоссарий →</a></div>
+<footer>Учебный проект «NVMe-хост на голой Kintex-7». Исходники: <a href="https://github.com/alexander-hdl/NVME">github.com/alexander-hdl/NVME</a>.</footer>
+</main>
+</div>
+</body>
+</html>
