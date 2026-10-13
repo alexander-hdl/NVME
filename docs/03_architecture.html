@@ -1,0 +1,896 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Глава 3. Архитектура хоста</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="layout">
+<!-- NAV:BEGIN -->
+<nav class="side">
+  <h2>NVMe-хост на Kintex-7</h2>
+  <ul>
+    <li><a href="index.html">Введение и цели</a></li>
+    <li><a href="01_pcie_basics.html">1. PCIe с нуля</a></li>
+    <li><a href="02_nvme_basics.html">2. NVMe с нуля</a></li>
+    <li><a href="03_architecture.html" class="cur">3. Архитектура хоста</a></li>
+    <li><a href="04_modules.html">4. Модули и интерфейсы</a></li>
+    <li><a href="05_bringup.html">5. Запуск: от PERST# до первой записи</a></li>
+    <li><a href="06_performance.html">6. Пропускная способность</a></li>
+    <li><a href="07_verification.html">7. Верификация и симуляция</a></li>
+    <li><a href="08_lab.html">8. Лабораторные задания</a></li>
+    <li><a href="glossary.html">Глоссарий</a></li>
+  </ul>
+</nav>
+<!-- NAV:END -->
+<main>
+<h1>Глава 3. Архитектура хоста</h1>
+<p class="lead">Главы 1 и 2 объяснили, что требуют PCIe и NVMe. Эта глава объясняет, как мы уложили эти требования в логику ПЛИС без процессора. Вы узнаете, какие пятнадцать решений определяют проект и чем каждое оплачено. Мы разберём, как устроены иерархия модулей, домены тактирования и карта памяти. В конце главы мы проследим одну команду записи сквозь все модули — от первого байта во входном потоке до освобождения слота кольца.</p>
+
+<div class="box"><span class="t">Что нужно знать заранее</span>
+Из главы 1: TLP MRd, MWr, CplD, поля Byte Count и Lower Address, MPS и MRRS, кредиты, интерфейс AXI-Stream блока <code>pcie_7x</code>. Из главы 2: SQ/CQ, doorbell, фазовый бит, PRP1/PRP2 и PRP-список, команда Write. Инженерная спецификация, по которой написана эта глава, — файл <code>ARCHITECTURE.md</code> в корне репозитория. Глава 3 — её учебное изложение, глава 4 — подробное описание интерфейсов каждого модуля.</div>
+
+<p><b>Содержание главы.</b>
+<a href="#s1">3.1 Постановка задачи</a> ·
+<a href="#s2">3.2 Существующие решения</a> ·
+<a href="#s3">3.3 Решения D1–D15</a> ·
+<a href="#s4">3.4 Общая структура</a> ·
+<a href="#s5">3.5 Карта памяти</a> ·
+<a href="#s6">3.6 Жизненный цикл команды</a> ·
+<a href="#s7">3.7 Параметры</a> ·
+<a href="#s8">3.8 Ресурсы и тайминг</a> ·
+<a href="#s9">3.9 Что упрощено</a> ·
+<a href="#s10">3.10 Самопроверка</a></p>
+
+<!-- ============================================================ -->
+<h2 id="s1">3.1. Постановка задачи и ограничения</h2>
+
+<p>Задача формулируется в одну строку: <b>принять непрерывный поток данных на входе ПЛИС и записать его на NVMe SSD последовательно, со скоростью, близкой к пределу линка, без процессора</b>. Каждое слово этой фразы — ограничение, которое влияет на архитектуру.</p>
+
+<h3>3.1.1. «Голая» ПЛИС</h3>
+<p>Целевая микросхема — Xilinx Kintex-7 XC7K325T-2 (эталонная плата KC705 с FMC-адаптером M.2). В ней один аппаратный блок PCI Express — <code>PCIE_2_1</code>. Vivado оборачивает его в IP-ядро <code>pcie_7x</code> v3.3. Больше ничего мы не предполагаем:</p>
+<ul>
+<li><b>нет процессора</b> — ни MicroBlaze, ни ARM, ни RISC-V. Перечисление шины (enumeration), инициализация NVMe, формирование команд и разбор ответов — конечные автоматы (FSM) в RTL;</li>
+<li><b>нет внешней памяти</b> в базовом варианте. «Память хоста», к которой обращается SSD, целиком лежит в блочной памяти ПЛИС (BRAM). DDR3 на плате есть, но подключение к ней — расширение (глава 8);</li>
+<li><b>нет операционной системы и драйвера</b>, а значит, и никаких «подсказок» от BIOS. ПЛИС сама управляет сигналом PERST#, сама обучает линк, сама назначает BAR.</li>
+</ul>
+
+<h3>3.1.2. Потолок Gen2 x4</h3>
+<p>Блок <code>pcie_7x</code> в Kintex-7 поддерживает только Gen1 и Gen2. M.2 SSD имеет четыре линии. Отсюда потолок: 4 × 5 GT/s, после кодирования 8b/10b — <b>2,0 ГБ/с</b> в каждую сторону. За вычетом заголовков TLP и служебных DLLP получается ≈ 1,82 ГБ/с полезных данных при MPS = 256 B (подробный расчёт — глава 6). Любой современный SSD (Gen3 и Gen4) быстрее этого линка, пока пишет в свой SLC-кэш. Следовательно, наша цель — <b>не потерять ни одного такта линка</b> на своей стороне.</p>
+
+<h3>3.1.3. Потоковая последовательная запись</h3>
+<p>Мы проектируем регистратор (recorder): данные приходят непрерывно и пишутся по возрастанию LBA. Этот частный случай сильно упрощает хост:</p>
+<ul>
+<li>нужна только одна команда ввода-вывода — Write (плюс Flush в конце). Чтения с диска нет;</li>
+<li>все команды одинакового размера (128 KiB) и идут подряд по LBA;</li>
+<li>адреса данных известны заранее: команда номер k берёт данные из слота k кольцевого буфера. Это позволяет не хранить PRP-списки, а вычислять их (см. <a href="#s5">раздел 3.5</a>).</li>
+</ul>
+
+<h3>3.1.4. Учебные цели</h3>
+<p>Проект — учебный. Поэтому в спорных местах мы выбираем вариант, который <b>яснее показывает механизм</b>, если это не стоит скорости. Пример: очереди SQ и CQ лежат в настоящей RAM, как в драйвере Linux, хотя SQE можно было бы синтезировать на лету. Другой пример: все особенности ядра Xilinx (straddle, смещение 3DW, порядок байт) изолированы в двух адаптерах. Остальная логика видит «чистый» TLP-поток, совпадающий с картинками из главы 1.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.1. Требования и ограничения проекта</caption>
+<tr><th>Требование</th><th>Значение</th><th>Следствие для архитектуры</th></tr>
+<tr><td>Линк</td><td>PCIe Gen2 x4, Root Port</td><td>пропускная способность ≈ 1,82 ГБ/с; шина пользователя 128 бит @ 125 МГц</td></tr>
+<tr><td>Процессор</td><td>нет</td><td>enumeration, admin-команды и I/O — конечные автоматы</td></tr>
+<tr><td>Внешняя память</td><td>нет (база)</td><td>память хоста = BRAM; буфер ≈ 1 МиБ ≈ 0,58 мс потока</td></tr>
+<tr><td>Нагрузка</td><td>последовательная запись</td><td>один тип I/O-команды, одна пара очередей, PRP вычисляются</td></tr>
+<tr><td>Скорость</td><td>1,6–1,8 ГБ/с устойчиво</td><td>completer отдаёт CplD без пузырей: 1 beat за такт</td></tr>
+<tr><td>Остановка</td><td>корректная</td><td>Flush → Delete SQ/CQ → CC.SHN → ожидание SHST</td></tr>
+<tr><td>Проверяемость</td><td>симуляция без GT</td><td>модели ядра и SSD на уровне AXI-Stream</td></tr>
+</table></div>
+
+<!-- ============================================================ -->
+<h2 id="s2">3.2. Обзор существующих решений</h2>
+
+<p>Прежде чем проектировать, полезно узнать, что уже сделано. Открытых NVMe-<em>хостов</em> на ПЛИС мало. Большинство проектов с «NVMe» в названии — это сторона накопителя: Cosmos+ OpenSSD, NVMeCHA, OpenExpress. Нас интересуют хосты без процессора, особенно на 7-series. Полный обзор — в <code>research/01_open_source_survey.md</code>; ниже — выжимка.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.2. NVMe-хосты на ПЛИС: открытые и коммерческие</caption>
+<tr><th>Проект</th><th>Лицензия, язык</th><th>Платформа и PCIe</th><th>CPU</th><th>Память хоста</th><th>Скорость (заявлено)</th></tr>
+<tr><td><b>LiteNVMe</b> (enjoy-digital)</td><td>BSD-2, Migen → Verilog</td><td>KU3P, Gen3 x4; 7-series через LitePCIe RootPort (Gen2 x4, только функционально)</td><td>нет при RTL-инициализации</td><td>BRAM-окно 256–512 KiB, QD 32</td><td>Gen3: ≈ 2,7 ГБ/с; Gen2: ≈ 1,5 ГБ/с запись</td></tr>
+<tr><td><b>DUNE pl-nvme</b> (Beam Ltd)</td><td>GPL-3, VHDL</td><td>KCU105, UltraScale Gen3 RP, 128 бит @ 250 МГц</td><td>нет (ROM с TLP)</td><td>SQ в BRAM, 8 × 4 KiB буферов</td><td>4,5 ГБ/с на 2 SSD</td></tr>
+<tr><td><b>mcrl/NVMe</b> (SNU)</td><td>BSD-подобная, SV</td><td>ZU19EG, AXI-мост RP, Gen3 x4</td><td>нет</td><td>SQE и PRP синтезируются на лету</td><td>≈ 2,4 ГБ/с запись</td></tr>
+<tr><td>SNAP / Eideticom</td><td>Apache-2, SV</td><td>US+, AXI-мост</td><td>admin — ПО хоста</td><td>BRAM</td><td>н/д</td></tr>
+<tr><td>openPCIE</td><td>BSD-3</td><td>Artix-7 PCIE_2_1, RC Gen2</td><td>RISC-V</td><td>—</td><td>только PIO, NVMe нет</td></tr>
+<tr><td><b>Design Gateway NVMe-IP</b></td><td>коммерческое, шифр.</td><td><b>Kintex-7 pcie_7x Gen2 x4, 128 бит @ 125 МГц</b></td><td>нет</td><td>256 KB BRAM</td><td><b>1,6–1,7 ГБ/с</b> (Gen2, ZC706)</td></tr>
+<tr><td>IntelliProp NV164-HI</td><td>коммерческое</td><td>KC705 Gen2</td><td>опционально</td><td>BRAM или DDR</td><td>0,75 ГБ/с запись</td></tr>
+<tr><td>MLE NVMe Streamer</td><td>коммерческое</td><td>ZU+, Versal</td><td>MicroBlaze для admin</td><td>PL RAM, DDR</td><td>≈ 3,1 GiB/s (Gen3)</td></tr>
+</table></div>
+
+<p>Обратите внимание на разброс на одинаковом железе. Design Gateway получает 1,6–1,7 ГБ/с на Gen2, а IntelliProp на KC705 Gen2 — 0,75 ГБ/с. Линк один и тот же. Разница — в качестве completer'а и в выборе SSD. Это главный урок обзора: <b>в NVMe-хосте скорость определяется тем, как быстро он отвечает на чтения SSD</b>.</p>
+
+<h3>3.2.1. Что мы взяли у других</h3>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.3. Заимствованные идеи и их источник</caption>
+<tr><th>Идея</th><th>Откуда</th><th>Где у нас</th></tr>
+<tr><td>Перечисление как последовательность CfgRd/CfgWr из «ROM» шагов, повышение скорости Gen1 → Gen2 после обучения, своя таблица шагов вместо драйвера</td><td>пример Configurator (<code>cgator*.v</code>) из PG054 для Root Port; ROM-инициализация pl-nvme</td><td><code>pcie_enum</code>, <code>rp_cfg_init</code>, <code>nvme_admin</code></td></tr>
+<tr><td>«Перевёрнутая очередь» (inverted queue): структуры, которые SSD читает, не хранятся, а вычисляются в момент чтения</td><td>mcrl/NVMe</td><td><code>prp_synth</code>: PRP-список — чистая функция адреса</td></tr>
+<tr><td>Несколько больших команд в полёте, выключенные прерывания, опрос CQ, регистр пиковой латентности</td><td>pl-nvme</td><td><code>nvme_write_engine</code>, <code>stat_max_latency</code></td></tr>
+<tr><td>Своё MPS у Root Port выставляется через <code>cfg_mgmt</code>, иначе тихие таймауты</td><td>ошибка LiteNVMe</td><td><code>rp_cfg_init</code> (D9, D13)</td></tr>
+<tr><td>В CplD на 7-series Byte Count и Lower Address заполняет пользовательская логика; BC = 0 значит 4096</td><td>ошибка LiteNVMe на 7-series (тихое зависание admin-команды)</td><td><code>hostmem_completer</code>, проверка в <code>tb_completer</code></td></tr>
+<tr><td>CQE по 16 B ложатся в середину слова шины или приходят частями; запись с байтовыми масками и сдвигом</td><td>LiteNVMe, Design Gateway rev. 3.01</td><td><code>hostmem_writer</code> + <code>dw_shift</code></td></tr>
+<tr><td>CID не переиспользуется, пока не пришёл его CQE (ворота по слоту, а не счётчик)</td><td>LiteNVMe: SC = 03h ровно на первом обороте SQ</td><td>CID = номер слота, флаг <code>busy[k]</code></td></tr>
+<tr><td>Счётчики занятости и простоя для поиска узкого места</td><td>LiteNVMe (duty/stall counters)</td><td><code>stat_*</code>, глава 6</td></tr>
+<tr><td>PRP-список SSD читает произвольными кусками</td><td>ошибка mcrl (генератор повторно отдавал запись 0)</td><td>генератор зависит только от адреса, не от истории</td></tr>
+</table></div>
+
+<h3>3.2.2. Почему не взяли готовое</h3>
+<p>Естественный вопрос: почему бы не взять LiteNVMe или готовый мост? Причин четыре.</p>
+<ul>
+<li><b>LitePCIe RootPort на 7-series свежий и мало проверен.</b> Режим <code>S7PCIEPHY(mode="RootPort")</code> добавлен в январе 2026 года, порт <code>cfg_mgmt</code> — в июле 2026. Единственное подтверждение работы с NVMe — один PR с функциональным тестом (Identify, запись, чтение) без цифр скорости. Кроме того, LiteX-код генерируется из Python; для учебника по RTL это лишний слой.</li>
+<li><b>verilog-pcie (Alex Forencich) не поддерживает <code>pcie_7x</code>.</b> Его «7-series» — это Gen3-блок Virtex-7 с интерфейсом UltraScale (RQ/RC/CQ/CC). Логики Root Port в нём тоже нет. Полезны только общие TLP-модули, а адаптер к <code>pcie_7x</code> всё равно пришлось бы писать.</li>
+<li><b>Мост <code>axi_pcie</code> (PG055) в режиме Root Port ограничивает скорость.</b> Его master-сторона принимает не более 4 MRd с ожидающими ответами, MPS ограничен 256 B, а каждый запрос проходит через AXI-пачки. Для потока записи, где SSD выдаёт десятки MRd подряд, это узкое горлышко. Аналогичный случай описан у MLE: мост PG194 с 2 NP-кредитами ограничил RAID из 12 SSD на ≈ 2,7 ГБ/с вместо ≈ 8,6 ГБ/с.</li>
+<li><b>Остальные проекты — не 7-series.</b> pl-nvme и mcrl работают на UltraScale/US+ с другим интерфейсом ядра; Design Gateway — закрытое шифрованное IP.</li>
+</ul>
+<p>Итог: мы пишем всё сами, но поверх <b>проверенного вендорского ядра</b> <code>pcie_7x</code> в режиме Root Port и с учётом чужих ошибок.</p>
+
+<!-- ============================================================ -->
+<h2 id="s3">3.3. Пятнадцать решений D1–D15</h2>
+
+<p>Архитектура — это набор решений, каждое из которых чем-то оплачено. В <code>ARCHITECTURE.md</code> они пронумерованы D1–D15. Ниже сначала сводная таблица, затем каждое решение по схеме «решение → почему → цена или альтернатива».</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.4. Сводка архитектурных решений</caption>
+<tr><th>№</th><th>Решение</th><th>Область</th></tr>
+<tr><td>D1</td><td>сырой TLP-интерфейс <code>pcie_7x</code>, не <code>axi_pcie</code></td><td>PCIe-ядро</td></tr>
+<tr><td>D2</td><td>Gen2 x4, шина 128 бит @ 125 МГц</td><td>PCIe-ядро</td></tr>
+<tr><td>D3</td><td>внутренний формат TLP-потока: заголовок отдельным beat'ом, данные в порядке памяти</td><td>внутренние интерфейсы</td></tr>
+<tr><td>D4</td><td>память хоста — BRAM, без DDR</td><td>память</td></tr>
+<tr><td>D5</td><td>кольцо 8 × 128 KiB = 1 МиБ</td><td>память, QD</td></tr>
+<tr><td>D6</td><td>PRP-списки вычисляются, а не хранятся</td><td>память</td></tr>
+<tr><td>D7</td><td>SQ и CQ — настоящие RAM</td><td>NVMe</td></tr>
+<tr><td>D8</td><td>одна пара I/O-очередей по 64 записи, admin — 32</td><td>NVMe</td></tr>
+<tr><td>D9</td><td>MPS = min(MPSS, 256 B), MRRS = 512 B, Extended Tags при ETFS</td><td>PCIe-настройки</td></tr>
+<tr><td>D10</td><td>опрос CQ, прерывания выключены</td><td>NVMe</td></tr>
+<tr><td>D11</td><td>все адреса хоста ниже 4 ГБ</td><td>карта памяти</td></tr>
+<tr><td>D12</td><td>PERST# управляет ПЛИС; выдержки 100 мс; повтор CRS до 1 с</td><td>запуск</td></tr>
+<tr><td>D13</td><td>BME и MPS самого Root Port — через <code>cfg_mgmt</code></td><td>запуск</td></tr>
+<tr><td>D14</td><td>корректная остановка: Flush → Delete → SHN → SHST</td><td>NVMe</td></tr>
+<tr><td>D15</td><td>верификация в xsim с моделью SSD на уровне AXI-Stream ядра</td><td>верификация</td></tr>
+</table></div>
+
+<h3>D1. Сырой TLP-интерфейс <code>pcie_7x</code></h3>
+<p><b>Решение.</b> Работаем с AXI-Stream-интерфейсом ядра напрямую: сами собираем и разбираем TLP. Готовый мост AXI ↔ PCIe не используем.</p>
+<p><b>Почему.</b> SSD при записи выдаёт поток MRd по 512 B, и в полёте их может быть десятки. Наш completer отвечает на них конвейерно, со скоростью шины. Мост <code>axi_pcie</code> держит не более 4 входящих MRd и превращает каждый в AXI-чтение, а его MPS ограничен 256 B (<code>research/03</code>, §12).</p>
+<p><b>Цена.</b> Нужно знать формат TLP до бита: Byte Count, Lower Address, разбиение по MPS. Нужно учитывать особенности 128-битного интерфейса 7-series. Это работа модулей <code>pcie7x_rx_adapt</code>, <code>pcie7x_tx_adapt</code> и <code>hostmem_completer</code>. Альтернатива <code>axi_pcie</code> проще. Её стоит выбрать, если в проекте всё равно есть процессор с драйвером, а скорость не критична.</p>
+
+<h3>D2. Gen2 x4, 128 бит @ 125 МГц</h3>
+<p><b>Решение.</b> Ядро настроено на Gen2 x4 с шириной AXI-Stream 128 бит и <code>user_clk</code> = 125 МГц.</p>
+<p><b>Почему.</b> M.2 SSD — устройства x4, а Gen2 — максимум для Kintex-7. Для x4 Gen2 ядро предлагает два варианта: 64 бит @ 250 МГц и 128 бит @ 125 МГц. Оба дают ровно 2,0 ГБ/с, то есть скорость линка, и одинаковую долю полезных beat'ов на CplD 256 B (16 из 17 для 128 бит, 32 из 34 для 64 бит). Но 125 МГц на -2 закрывается по таймингу с большим запасом. Это важно для учебного проекта, где студенты будут менять код.</p>
+<p><b>Цена.</b> 128-битный RX ядра 7-series умеет «склеивать» (straddle) два TLP в одном beat'е и начинать TLP с DW2. Эту сложность мы изолировали в одном модуле <code>pcie7x_rx_adapt</code>. Широкая шина также делает дороже выравнивающие сдвигатели (<code>dw_shift</code>).</p>
+
+<h3>D3. Чистый внутренний формат TLP</h3>
+<p><b>Решение.</b> Все модули между адаптерами обмениваются TLP в едином формате <code>tlp_axis</code>: один TLP на пакет; заголовок (H0–H3) всегда занимает отдельный beat 0; данные начинаются с DW0 beat'а 1; байты данных идут в порядке памяти (<code>tdata[7:0]</code> — байт с младшим адресом).</p>
+<p><b>Почему.</b> У ядра 7-series три неудобства. Данные в DW идут big-endian. При 3DW-заголовке данные начинаются с DW3 первого beat'а. На RX возможен straddle. Если каждое из этих правил учитывать в completer'е, writer'е и requester'е, ошибка гарантирована. Поэтому все три правила обрабатываются ровно в двух местах — в RX- и TX-адаптерах. Для остальной логики 128-битный beat данных — это просто 16 подряд идущих байт памяти хоста.</p>
+<p><b>Цена.</b> Отдельный beat под заголовок выглядит расточительно, но на CplD с данными, кратными 16 B, он ничего не стоит. 3 DW заголовка + 64 DW данных = 67 DW — это 17 beat'ов на шине ядра. У нас 1 + 16 = 17 тех же beat'ов (подробно — глава 6). TX-адаптер сдвигает данные на один DW и меняет порядок байт; это два-три такта латентности.</p>
+
+<h3>D4. Память хоста в BRAM</h3>
+<p><b>Решение.</b> Все области, к которым обращается SSD (очереди, буфер Identify, кольцо данных), реализованы во внутренней блочной памяти ПЛИС. DDR не используется.</p>
+<p><b>Почему.</b> Во-первых, общность: проект должен работать на любой плате с Kintex-7, даже без DDR. Во-вторых, латентность: BRAM отдаёт данные через 2 такта, и completer отвечает на MRd через 8 тактов. Ответ из DDR через контроллер MIG занимает сотни наносекунд и требует отдельного кэширования. В-третьих, простота: нет арбитража между записью входного потока и чтением SSD.</p>
+<p><b>Цена.</b> Буфер мал: 1 МиБ — это ≈ 0,58 мс потока при 1,8 ГБ/с. Пауза SSD на сборку мусора (GC) в 10 мс переполнит его. Для таких случаев нужна DDR (≈ 18 МБ на 10 мс). Это задокументированное расширение; расчёт — в главе 6.</p>
+
+<h3>D5. Кольцо из N_SLOTS слотов по SLOT_BYTES</h3>
+<p><b>Решение.</b> Входной поток пишется в кольцо из <code>N_SLOTS</code> = 8 слотов по <code>SLOT_BYTES</code> = 128 KiB. Один заполненный слот — одна команда Write.</p>
+<p><b>Почему.</b> 128 KiB укладывается в MDTS любого распространённого SSD (MDTS ≥ 5 при странице 4 KiB; Design Gateway требует того же). Восемь слотов дают до 8 команд в очереди. Этого хватает, чтобы закрыть ≈ 500 мкс латентности SSD при 1,8 ГБ/с (<code>research/02</code>, §8). Кроме того, команда фиксированного размера делает адреса предсказуемыми: данные команды k всегда в слоте k.</p>
+<p><b>Цена.</b> Запись идёт только целыми слотами. Неполный последний слот при остановке на диск не попадает; источник должен об этом знать. Пока слот ждёт CQE, писать в него нельзя, поэтому полезная глубина очереди при непрерывном потоке — 7, а не 8 (один слот всегда заполняется).</p>
+
+<h3>D6. Вычисляемые PRP-списки</h3>
+<p><b>Решение.</b> PRP-списки нигде не хранятся. Когда SSD читает адрес из окна <code>0x2000_0000…</code>, модуль <code>prp_synth</code> вычисляет запись по формуле <code>entry[i] = slot_base + (i+1)·4096</code>.</p>
+<p><b>Почему.</b> Для слота с фиксированным адресом PRP-список — чистая функция номера слота и номера записи. Хранить его — значит тратить RAM и логику на запись того, что и так известно. Идея взята у mcrl («inverted queue»). Это ещё и главный учебный момент проекта: SSD не знает, лежат ли данные в памяти или вычисляются; он видит только ответы на свои MRd.</p>
+<p><b>Цена.</b> Схема работает только для команд, данные которых лежат одним непрерывным куском в известном месте. Для произвольных буферов, как в драйвере ОС, список пришлось бы хранить.</p>
+
+<h3>D7. SQ и CQ — настоящая RAM</h3>
+<p><b>Решение.</b> Записи SQE пишутся логикой хоста в BRAM (<code>asq_ram</code>, <code>iosq_ram</code>), SSD читает их через completer. CQE пишет SSD (через <code>hostmem_writer</code>) в <code>acq_ram</code>, <code>iocq_ram</code>, а хост их опрашивает.</p>
+<p><b>Почему.</b> Так устроен программный драйвер, и студент видит ровно ту модель, что в главе 2. SQE синтезировать на лету можно (так делает mcrl), но выигрыша почти нет: одна запись SQE на 128 KiB данных — это 4 такта на ≈ 8000 тактов передачи.</p>
+<p><b>Цена.</b> Пять маленьких RAM (≈ 10 тайлов BRAM вместе с FIFO) и порты записи/чтения у FSM.</p>
+
+<h3>D8. Одна пара I/O-очередей</h3>
+<p><b>Решение.</b> Создаётся одна I/O SQ и одна I/O CQ (QID 1) по 64 записи. Admin-очереди — по 32 записи.</p>
+<p><b>Почему.</b> Несколько очередей нужны, чтобы разные ядра CPU не делили одну очередь. У нас один поток команд, и дополнительные очереди ничего не дают. 64 записи больше максимальной глубины 8, поэтому SQ никогда не переполняется.</p>
+<p><b>Цена.</b> Нет приоритетов и параллельных потоков — например, нельзя одновременно читать и писать через независимые очереди. Это одно из направлений развития (глава 8).</p>
+
+<h3>D9. MPS, MRRS и Extended Tags</h3>
+<p><b>Решение.</b> MPS = min(MPSS накопителя, <code>MPS_CAP_CODE</code>) = 256 B по умолчанию; MRRS накопителя = 512 B; Extended Tags включаются, если SSD их поддерживает (ETFS = 1).</p>
+<p><b>Почему.</b> 256 B поддерживают практически все M.2 SSD и сам <code>pcie_7x</code>. MRRS = 512 B — значение по умолчанию в спецификации. С ним completer разбивает каждый запрос не более чем на 2–3 CplD, а очередь NP-запросов короткая (<code>research/02</code>, §6). Extended Tags позволяют SSD держать до 256 чтений в полёте вместо 32; для Gen2 это не обязательно, но и не вредно.</p>
+<p><b>Цена.</b> MPS 512 дал бы ≈ +3,8 % (глава 6), но его поддерживают не все SSD, и он должен совпадать с настройкой IP-ядра в GUI. Это параметр, а не переделка.</p>
+
+<h3>D10. Опрос вместо прерываний</h3>
+<p><b>Решение.</b> В Command накопителя ставится INTx Disable, I/O CQ создаётся с IEN = 0. Хост постоянно читает <code>iocq_ram</code> и ждёт смены фазового бита.</p>
+<p><b>Почему.</b> Прерывание нужно, чтобы разбудить процессор. Процессора нет, а логика может опрашивать RAM каждый такт бесплатно. Если SSD всё же пришлёт MSI (это MWr на адрес вне наших окон), <code>hostmem_writer</code> его просто отбросит и посчитает.</p>
+<p><b>Цена.</b> Нулевая для нашего случая. При переносе на систему с процессором понадобится MSI (глава 8).</p>
+
+<h3>D11. Все адреса ниже 4 ГБ</h3>
+<p><b>Решение.</b> Все области памяти хоста и BAR0 SSD расположены в 32-битном адресном пространстве.</p>
+<p><b>Почему.</b> По правилам PCIe запрос к адресу ниже 4 ГБ <b>обязан</b> использовать 3DW-заголовок. Значит, все MRd и MWr от SSD приходят в одном формате, и адаптерам не нужно поддерживать два варианта выравнивания данных в рабочем режиме. 4DW-запросы всё равно обрабатываются корректно (ответ UR, если старшая половина адреса ненулевая), но это путь для ошибок, а не для данных.</p>
+<p><b>Цена.</b> Никакой: 32 бит адреса хватает с огромным запасом.</p>
+
+<h3>D12. PERST# и выдержки времени</h3>
+<p><b>Решение.</b> Сигнал PERST# накопителя формирует ПЛИС. Он держится низким ≥ 100 мс; первый конфигурационный запрос уходит не раньше чем через 100 мс после снятия PERST#. Ответы CRS повторяются до 1 с.</p>
+<p><b>Почему.</b> Так требует спецификация PCIe CEM. Опыт pl-nvme показывает, что некоторые SSD нельзя сбросить никаким другим способом. Без контроля над PERST# повторный запуск без отключения питания невозможен.</p>
+<p><b>Цена.</b> Запуск занимает сотни миллисекунд, а <code>link_bringup</code> работает в отдельном домене <code>link_clk</code>: <code>user_clk</code> ядра появляется только после выхода ядра из сброса.</p>
+
+<h3>D13. Настройка самого Root Port через <code>cfg_mgmt</code></h3>
+<p><b>Решение.</b> До обращения к SSD модуль <code>rp_cfg_init</code> записывает в конфигурационное пространство <em>нашего</em> Root Port: Command.BME/MSE, номера шин 0/1/1, DevCtl.MPS и Extended Tag.</p>
+<p><b>Почему.</b> Без BME ядро отвечает UR на каждый входящий MRd от SSD (PG054, табл. 3-25): SSD не прочитает ни одной команды, и admin-команда «молча» не завершится. А MPS Root Port'а по умолчанию 128 B. Если поднять MPS только у SSD, то пришедшие от него TLP с данными больше 128 B (например, MWr буфера Identify) ядро сочтёт ошибочными (malformed) и отбросит. Это ловушка LiteNVMe: чтения «молча» заканчивались таймаутом.</p>
+<p><b>Цена.</b> Нужно знать адреса регистров Root Port в пространстве <code>cfg_mgmt</code> (DW-адреса 0x001, 0x006, 0x01A).</p>
+
+<h3>D14. Корректная остановка</h3>
+<p><b>Решение.</b> По команде стоп хост дожидается всех CQE, подаёт Flush, удаляет I/O SQ, затем CQ, пишет CC.SHN = 01b и ждёт CSTS.SHST = 10b.</p>
+<p><b>Почему.</b> У бытовых SSD нет защиты от пропадания питания. Данные в DRAM-кэше и таблицы трансляции FTL без shutdown могут потеряться, а следующий запуск будет долгим.</p>
+<p><b>Цена.</b> Несколько состояний в <code>host_sequencer</code> и <code>nvme_admin</code> плюс таймаут ожидания SHST.</p>
+
+<h3>D15. Верификация без трансиверов</h3>
+<p><b>Решение.</b> Симуляция в xsim подключает поведенческую модель к <em>пользовательскому</em> AXI-Stream-интерфейсу ядра. Модель <code>pcie7x_core_model</code> воспроизводит straddle, смещение 3DW и порядок байт. За ней стоит <code>nvme_ssd_model</code>, которая выдаёт MRd случайного размера, проверяет BC/LA/порядок CplD и сверяет данные с эталоном.</p>
+<p><b>Почему.</b> Симуляция GT-трансиверов и аппаратного блока PCIe медленная и требует лицензий и вендорских моделей. Все наши ошибки находятся выше AXI-Stream, а модель на этом уровне работает в тысячи раз быстрее.</p>
+<p><b>Цена.</b> Модель — не настоящее ядро. Её соответствие PG054 — допущение. Ошибки обучения линка и электрические проблемы симуляция не ловит, для них нужна плата и ILA (главы 5–7).</p>
+
+<div class="box"><span class="t">Как читать решения</span> Обратите внимание, что почти каждое решение отвечает на один из трёх вопросов. <b>Скорость:</b> D1, D2, D4, D9. <b>Изоляция сложности:</b> D3, D11, D15. <b>Ловушки, на которых спотыкались другие:</b> D12, D13, D14. Когда в главе 8 вы будете расширять проект, задавайте себе те же три вопроса.</div>
+
+<!-- ============================================================ -->
+<h2 id="s4">3.4. Общая структура</h2>
+
+<h3>3.4.1. Иерархия модулей</h3>
+<p>Верхний модуль <code>nvme_host_top</code> содержит три экземпляра. <code>pcie7x_wrapper</code> оборачивает сгенерированное IP <code>pcie_7x_0</code>. <code>link_bringup</code> управляет PERST# и ждёт линк. <code>nvme_host_core</code> содержит всю остальную логику в одном домене <code>user_clk</code>. Внутри ядра 15 модулей, которые удобно разбить на четыре группы.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 385" style="width:100%;height:auto;max-width:780px" role="img" aria-label="Иерархия модулей NVMe-хоста" font-size="12">
+<g stroke="var(--fg)" fill="none" stroke-width="1.2">
+<path d="M390,44 V57 M130,57 H650 M130,57 V70 M390,57 V70 M650,57 V70 M650,114 V140"/>
+</g>
+<rect x="290" y="10" width="200" height="34" rx="6" fill="var(--code-bg)" stroke="var(--fg)" stroke-width="1.5"/>
+<text x="390" y="32" text-anchor="middle" font-weight="700" fill="var(--fg)" font-family="monospace">nvme_host_top</text>
+<rect x="30" y="70" width="200" height="44" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="130" y="88" text-anchor="middle" fill="var(--fg)" font-family="monospace" font-weight="700">pcie7x_wrapper</text>
+<text x="130" y="105" text-anchor="middle" fill="var(--muted)" font-size="11">IP pcie_7x_0: Root Port Gen2 x4</text>
+<rect x="290" y="70" width="200" height="44" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="390" y="88" text-anchor="middle" fill="var(--fg)" font-family="monospace" font-weight="700">link_bringup</text>
+<text x="390" y="105" text-anchor="middle" fill="var(--muted)" font-size="11">link_clk: PERST#, ожидание линка</text>
+<rect x="550" y="70" width="200" height="44" rx="6" fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.5"/>
+<text x="650" y="88" text-anchor="middle" fill="var(--fg)" font-family="monospace" font-weight="700">nvme_host_core</text>
+<text x="650" y="105" text-anchor="middle" fill="var(--muted)" font-size="11">user_clk 125 МГц</text>
+<rect x="10" y="140" width="760" height="205" rx="10" fill="none" stroke="var(--accent)" stroke-dasharray="6,4"/>
+<g font-weight="700" fill="var(--fg)" text-anchor="middle">
+<text x="105" y="162">Транспорт TLP</text><text x="295" y="162">Память хоста</text><text x="485" y="162">Запросы и запуск PCIe</text><text x="675" y="162">NVMe</text>
+</g>
+<g fill="var(--code-bg)" stroke="var(--fg)">
+<rect x="20" y="172" width="170" height="26" rx="4"/><rect x="20" y="204" width="170" height="26" rx="4"/><rect x="20" y="236" width="170" height="26" rx="4"/><rect x="20" y="268" width="170" height="26" rx="4"/>
+<rect x="210" y="204" width="170" height="26" rx="4"/><rect x="210" y="236" width="170" height="26" rx="4"/><rect x="226" y="268" width="154" height="26" rx="4"/>
+<rect x="400" y="172" width="170" height="26" rx="4"/><rect x="400" y="204" width="170" height="26" rx="4"/><rect x="400" y="236" width="170" height="26" rx="4"/><rect x="400" y="268" width="170" height="26" rx="4"/>
+<rect x="590" y="172" width="170" height="26" rx="4"/><rect x="590" y="204" width="170" height="26" rx="4"/><rect x="590" y="236" width="170" height="26" rx="4"/>
+</g>
+<g fill="var(--code-bg)" stroke="var(--accent2)" stroke-width="1.5">
+<rect x="210" y="172" width="170" height="26" rx="4"/><rect x="210" y="300" width="170" height="26" rx="4"/>
+</g>
+<g font-family="monospace" fill="var(--fg)" text-anchor="middle" font-size="11.5">
+<text x="105" y="190">pcie7x_rx_adapt</text><text x="105" y="222">pcie7x_tx_adapt</text><text x="105" y="254">tlp_rx_demux</text><text x="105" y="286">tlp_tx_arb</text>
+<text x="295" y="190">hostmem_completer</text><text x="295" y="222">hostmem_writer</text><text x="295" y="254">hostmem_rams</text><text x="303" y="286">↳ prp_synth</text><text x="295" y="318">data_ring</text>
+<text x="485" y="190">rp_requester</text><text x="485" y="222">req_mux</text><text x="485" y="254">rp_cfg_init</text><text x="485" y="286">pcie_enum</text>
+<text x="675" y="190">nvme_admin</text><text x="675" y="222">nvme_write_engine</text><text x="675" y="254">host_sequencer</text>
+</g>
+<text x="675" y="290" text-anchor="middle" font-size="11" fill="var(--muted)">+ timer_ms (тики 1 мс)</text>
+<text x="390" y="368" text-anchor="middle" font-size="11" fill="var(--muted)">Общие примитивы rtl/common: axis_skid, axis_fifo_sync, axis_fifo_async, sdp_ram, dw_shift, timer_ms</text>
+</svg>
+<figcaption>Рис. 3.1. Иерархия модулей. Оранжевой рамкой выделены модули пути данных записи: кольцо и completer. <code>prp_synth</code> находится внутри <code>hostmem_rams</code> и отвечает на чтения окна PRP так же, как обычная RAM.</figcaption>
+</figure>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.5. Группы модулей <code>nvme_host_core</code> и их ответственность</caption>
+<tr><th>Группа</th><th>Модули</th><th>Отвечает за</th></tr>
+<tr><td>Транспорт TLP</td><td><code>pcie7x_rx_adapt</code>, <code>pcie7x_tx_adapt</code>, <code>tlp_rx_demux</code>, <code>tlp_tx_arb</code></td><td>перевод между форматом ядра 7-series и внутренним <code>tlp_axis</code>; маршрутизация входящих TLP по типу; объединение исходящих</td></tr>
+<tr><td>Память хоста</td><td><code>hostmem_completer</code>, <code>hostmem_writer</code>, <code>hostmem_rams</code> (+ <code>prp_synth</code>), <code>data_ring</code></td><td>роль «оперативной памяти» для SSD: ответы CplD на MRd, приём MWr с CQE и Identify, хранение данных</td></tr>
+<tr><td>Запросы и запуск PCIe</td><td><code>rp_requester</code>, <code>req_mux</code>, <code>rp_cfg_init</code>, <code>pcie_enum</code></td><td>наши собственные запросы к SSD (CfgRd/CfgWr, MRd/MWr регистров BAR0, doorbell'ы); настройка Root Port и перечисление</td></tr>
+<tr><td>NVMe</td><td><code>nvme_admin</code>, <code>nvme_write_engine</code>, <code>host_sequencer</code></td><td>инициализация контроллера и admin-команды; поток Write; общий порядок работы и коды ошибок</td></tr>
+</table></div>
+
+<h3>3.4.2. Потоки данных</h3>
+<p>Структуру удобнее понимать не по иерархии, а по потокам. Их два, и они почти не пересекаются.</p>
+<ul>
+<li><b>Путь данных записи</b> (толстые оранжевые стрелки на рис. 3.2). Входной поток → <code>data_ring</code> → <code>hostmem_completer</code> → <code>tlp_tx_arb</code> → <code>pcie7x_tx_adapt</code> → ядро → SSD. По нему идут почти все байты, поэтому весь путь обязан пропускать <b>один beat за такт</b> без пузырей.</li>
+<li><b>Путь управления.</b> FSM (<code>nvme_admin</code>, <code>nvme_write_engine</code>, <code>pcie_enum</code>) формируют команды для <code>rp_requester</code>. Он отправляет TLP (CfgRd/CfgWr, MRd/MWr к BAR0, doorbell'ы) и принимает ответы. Трафик здесь крошечный: два MWr на 128 KiB данных.</li>
+</ul>
+<p>Входящие TLP от SSD распределяет <code>tlp_rx_demux</code> по полю Fmt/Type первого beat'а. MRd идут в completer, MWr — в writer, Cpl/CplD — в requester. Всё прочее (сообщения, неизвестные типы, «отравленные» MWr) отбрасывается и считается. Исходящие пакеты объединяет <code>tlp_tx_arb</code>. Он отдаёт приоритет completer'у, но после каждого его пакета пропускает один пакет requester'а, если тот ждёт. Так doorbell не может «застрять» за бесконечным потоком CplD.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 475" style="width:100%;height:auto;max-width:800px" role="img" aria-label="Блок-схема потоков данных в nvme_host_core" font-size="12">
+<defs>
+<marker id="f32b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+<marker id="f32o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+<marker id="f32g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+</defs>
+<!-- boxes -->
+<g fill="var(--code-bg)" stroke="var(--fg)">
+<rect x="40" y="118" width="165" height="30" rx="5"/>
+<rect x="40" y="160" width="165" height="85" rx="5"/>
+<rect x="40" y="268" width="165" height="40" rx="5"/>
+<rect x="40" y="322" width="165" height="40" rx="5"/>
+<rect x="40" y="392" width="165" height="40" rx="5"/>
+<rect x="270" y="290" width="140" height="40" rx="5"/>
+<rect x="270" y="380" width="140" height="40" rx="5"/>
+<rect x="450" y="285" width="110" height="50" rx="5"/>
+<rect x="450" y="380" width="110" height="50" rx="5"/>
+<rect x="590" y="380" width="100" height="50" rx="5"/>
+<rect x="715" y="40" width="75" height="395" rx="8" stroke-width="1.5"/>
+</g>
+<g fill="var(--code-bg)" stroke="var(--accent2)" stroke-width="1.8">
+<rect x="40" y="50" width="165" height="56" rx="5"/>
+<rect x="270" y="50" width="140" height="56" rx="5"/>
+<rect x="450" y="50" width="110" height="56" rx="5"/>
+<rect x="590" y="50" width="100" height="56" rx="5"/>
+</g>
+<path d="M222,52 L246,64 L246,234 L222,246 Z" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="234" y="160" text-anchor="middle" font-size="10" fill="var(--muted)" transform="rotate(-90 234 160)">мультиплексор rd_sel</text>
+<!-- box labels -->
+<g font-family="monospace" font-weight="700" fill="var(--fg)" text-anchor="middle">
+<text x="122" y="74">data_ring</text>
+<text x="122" y="138">prp_synth</text>
+<text x="122" y="180">hostmem_rams</text>
+<text x="122" y="285">nvme_write_engine</text>
+<text x="122" y="339">nvme_admin</text>
+<text x="122" y="409">host_sequencer</text>
+<text x="340" y="74">hostmem_</text><text x="340" y="88">completer</text>
+<text x="340" y="314">req_mux</text>
+<text x="340" y="397">hostmem_writer</text>
+<text x="505" y="74">tlp_tx_arb</text>
+<text x="505" y="306">rp_</text><text x="505" y="320">requester</text>
+<text x="505" y="402">tlp_rx_demux</text>
+<text x="640" y="74">pcie7x_</text><text x="640" y="88">tx_adapt</text>
+<text x="640" y="399">pcie7x_</text><text x="640" y="413">rx_adapt</text>
+<text x="752" y="200">pcie_7x</text>
+</g>
+<g font-size="10.5" fill="var(--muted)" text-anchor="middle">
+<text x="122" y="92">async FIFO + 8 слотов BRAM</text>
+<text x="122" y="198">asq · iosq (читает SSD)</text>
+<text x="122" y="214">acq · iocq · ident</text>
+<text x="122" y="230">(пишет SSD)</text>
+<text x="122" y="300">слот → SQE, CQE → слот</text>
+<text x="122" y="354">init, Identify, shutdown</text>
+<text x="122" y="424">управляет всеми FSM</text>
+<text x="340" y="100">MRd → CplD</text>
+<text x="340" y="412">→ acq · iocq · ident</text>
+<text x="505" y="100">приоритет CplD</text>
+<text x="752" y="218">Root Port</text>
+<text x="752" y="234">Gen2 x4</text>
+<text x="752" y="420">⇄ SSD</text>
+</g>
+<!-- data path (thick orange) -->
+<g stroke="var(--accent2)" stroke-width="3.5" fill="none">
+<path d="M2,72 H36" marker-end="url(#f32o)"/>
+<path d="M205,78 H218" marker-end="url(#f32o)"/>
+<path d="M246,78 H266" marker-end="url(#f32o)"/>
+<path d="M410,78 H446" marker-end="url(#f32o)"/>
+<path d="M560,78 H586" marker-end="url(#f32o)"/>
+<path d="M690,78 H711" marker-end="url(#f32o)"/>
+</g>
+<text x="4" y="62" font-size="10" fill="var(--fg)">s_data</text>
+<text x="428" y="70" text-anchor="middle" font-size="10.5" fill="var(--fg)">CplD</text>
+<!-- other reads into mux -->
+<g stroke="var(--accent)" stroke-width="1.5" fill="none">
+<path d="M205,133 H218" marker-end="url(#f32b)"/>
+<path d="M205,200 H218" marker-end="url(#f32b)"/>
+</g>
+<!-- TLP control paths (blue) -->
+<g stroke="var(--accent)" stroke-width="1.6" fill="none">
+<path d="M713,405 H694" marker-end="url(#f32b)"/>
+<path d="M590,405 H564" marker-end="url(#f32b)"/>
+<path d="M505,380 V339" marker-end="url(#f32b)"/>
+<path d="M505,285 V110" marker-end="url(#f32b)"/>
+<path d="M450,410 H414" marker-end="url(#f32b)"/>
+<path d="M450,390 H430 V120 H390 V110" marker-end="url(#f32b)"/>
+<path d="M410,310 H425 A5,5 0 0 1 435,310 H446" marker-end="url(#f32b)"/>
+<path d="M205,298 H266" marker-end="url(#f32b)"/>
+<path d="M205,342 H240 V320 H266" marker-end="url(#f32b)"/>
+</g>
+<g font-size="10.5" fill="var(--fg)">
+<text x="511" y="365">Cpl/CplD</text>
+<text x="511" y="200">запросы</text>
+<text x="443" y="250" transform="rotate(-90 443 250)">MRd</text>
+<text x="420" y="425">MWr</text>
+<text x="212" y="292">порт 1</text>
+<text x="212" y="336">порт 0</text>
+</g>
+<!-- control (dashed) -->
+<g stroke="var(--muted)" stroke-width="1.2" fill="none" stroke-dasharray="4,3">
+<path d="M40,288 H25 V95 H38" marker-end="url(#f32g)" marker-start="url(#f32g)"/>
+<path d="M120,266 V249" marker-end="url(#f32g)" marker-start="url(#f32g)"/>
+</g>
+<text x="20" y="190" font-size="10" fill="var(--muted)" text-anchor="middle" transform="rotate(-90 20 190)">slot_full / slot_free</text>
+<text x="126" y="261" font-size="10" fill="var(--muted)">iosq · iocq</text>
+<g font-size="10" fill="var(--muted)">
+<text x="208" y="127">2</text><text x="208" y="193">0,1</text><text x="208" y="72">3</text>
+</g>
+<text x="400" y="462" text-anchor="middle" font-size="11" fill="var(--muted)">толстые оранжевые — путь данных записи, 1 beat/такт; синие — TLP и запросы; штрих — сигналы управления; цифры у мультиплексора — rd_sel</text>
+</svg>
+<figcaption>Рис. 3.2. Потоки данных в <code>nvme_host_core</code>. Completer читает четыре источника через мультиплексор <code>rd_sel</code>: 0 — admin SQ, 1 — I/O SQ, 2 — генератор PRP, 3 — кольцо данных. Все источники отвечают ровно через 2 такта, поэтому completer не различает «настоящую» память и вычисляемую. Перемычка на линии <code>req_mux</code> → <code>rp_requester</code> обозначает пересечение без соединения.</figcaption>
+</figure>
+
+<h3>3.4.3. Домены тактирования</h3>
+<p>Тактовых доменов три, и граница между ними проведена так, чтобы через неё шло как можно меньше сигналов.</p>
+<ul>
+<li><b><code>user_clk</code></b>, 125 МГц, выход ядра <code>user_clk_out</code>. В нём работает весь <code>nvme_host_core</code>. Частота выбрана так, чтобы 128 бит × 125 МГц = 2,0 ГБ/с совпадали со скоростью линка.</li>
+<li><b><code>link_clk</code></b> — свободно бегущий такт от опорного генератора 100 МГц (выход ODIV2 буфера <code>IBUFDS_GTE2</code> через BUFG). В нём работает только <code>link_bringup</code>. Причина проста: <code>user_clk</code> появляется лишь после выхода ядра из сброса, а сброс ядра выдаёт как раз <code>link_bringup</code>. Логика, отсчитывающая 100 мс до снятия сброса, не может тактироваться тем, что появится после.</li>
+<li><b><code>data_clk</code></b> — такт источника данных, произвольной частоты. Переход в <code>user_clk</code> выполняет асинхронное FIFO на 512 beat'ов внутри <code>data_ring</code>. Чтобы источник не стал узким местом, он должен выдавать ≥ 1,82 ГБ/с: 16 B × f<sub>data</sub> ≥ 1,82 ГБ/с, то есть f<sub>data</sub> ≥ 114 МГц при непрерывном <code>tvalid</code>.</li>
+</ul>
+<p>Остальные пересечения — квазистатические уровни (<code>link_ready</code>, <code>link_gen2</code>, <code>link_width</code>, <code>ctrl_start</code>, <code>ctrl_stop</code>). Они проходят через двухтриггерные синхронизаторы в <code>nvme_host_top</code>.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 320" style="width:100%;height:auto;max-width:760px" role="img" aria-label="Домены тактирования и сброс" font-size="12">
+<defs>
+<marker id="f33" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+<marker id="f33o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+</defs>
+<g fill="none" stroke-dasharray="6,4" stroke-width="1.5">
+<rect x="10" y="20" width="220" height="270" rx="10" stroke="var(--muted)"/>
+<rect x="250" y="20" width="330" height="270" rx="10" stroke="var(--accent)"/>
+<rect x="600" y="20" width="150" height="270" rx="10" stroke="var(--accent2)"/>
+</g>
+<g font-weight="700" fill="var(--fg)" text-anchor="middle">
+<text x="120" y="40">link_clk (100 МГц)</text><text x="415" y="40">user_clk (125 МГц)</text><text x="675" y="40">data_clk (любая)</text>
+</g>
+<g fill="var(--code-bg)" stroke="var(--fg)">
+<rect x="25" y="55" width="190" height="34" rx="5"/>
+<rect x="25" y="120" width="190" height="58" rx="5"/>
+<rect x="265" y="55" width="300" height="46" rx="5"/>
+<rect x="265" y="150" width="300" height="60" rx="5"/>
+<rect x="615" y="150" width="120" height="40" rx="5"/>
+<rect x="225" y="178" width="30" height="24" rx="3"/>
+<rect x="225" y="236" width="30" height="24" rx="3"/>
+</g>
+<rect x="540" y="228" width="150" height="40" rx="5" fill="var(--code-bg)" stroke="var(--accent2)" stroke-width="1.5"/>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="120" y="77" font-size="11">IBUFDS_GTE2 → ODIV2 → BUFG</text>
+<text x="120" y="142" font-family="monospace" font-weight="700">link_bringup</text>
+<text x="120" y="158" font-size="10.5" fill="var(--muted)">HOLD ≥ 100 мс → RELEASE</text>
+<text x="120" y="172" font-size="10.5" fill="var(--muted)">→ WAIT_LNK → 100 мс → READY</text>
+<text x="415" y="75" font-family="monospace" font-weight="700">pcie_7x_0</text>
+<text x="415" y="92" font-size="10.5" fill="var(--muted)">user_clk_out, user_reset_out, user_lnk_up</text>
+<text x="415" y="175" font-family="monospace" font-weight="700">nvme_host_core</text>
+<text x="415" y="193" font-size="10.5" fill="var(--muted)">вся логика; синхронный сброс user_reset</text>
+<text x="675" y="168" font-size="11">источник</text><text x="675" y="182" font-size="11">s_data, 128 бит</text>
+<text x="615" y="245" font-size="11">async FIFO 512×128</text><text x="615" y="259" font-size="10.5" fill="var(--muted)">в data_ring</text>
+<text x="240" y="194" font-size="10">2FF</text><text x="240" y="252" font-size="10">2FF</text>
+</g>
+<g stroke="var(--fg)" stroke-width="1.3" fill="none">
+<path d="M120,89 V116" marker-end="url(#f33)"/>
+<path d="M215,135 H236 V78 H261" marker-end="url(#f33)"/>
+<path d="M415,101 V146" marker-end="url(#f33)"/>
+<path d="M215,165 H222 V188" />
+<path d="M255,190 H261" marker-end="url(#f33)"/>
+<path d="M198,248 H221" marker-end="url(#f33)"/>
+<path d="M255,248 H300 V214" marker-end="url(#f33)"/>
+<path d="M120,178 V296" marker-end="url(#f33)"/>
+</g>
+<path d="M675,190 V224" stroke="var(--accent2)" stroke-width="2.5" fill="none" marker-end="url(#f33o)"/>
+<path d="M540,248 H490 V214" stroke="var(--accent2)" stroke-width="2.5" fill="none" marker-end="url(#f33o)"/>
+<g font-size="10.5" fill="var(--fg)">
+<text x="160" y="113">sys_rst_n</text>
+<text x="420" y="128">user_reset</text>
+<text x="218" y="210" font-size="9.5" text-anchor="end">link_ready,</text><text x="218" y="221" font-size="9.5" text-anchor="end">gen2, width</text>
+<text x="130" y="244" font-size="10">ctrl_start/stop</text>
+<text x="126" y="285">PERST# → SSD</text>
+</g>
+<text x="380" y="310" text-anchor="middle" font-size="11" fill="var(--muted)">board_rst_n → link_clk: асинхронная установка, синхронное снятие; data_rst = board_rst | user_reset, синхронизирован к data_clk</text>
+</svg>
+<figcaption>Рис. 3.3. Домены тактирования и цепочка сброса. Сброс идёт «сверху вниз»: плата → <code>link_bringup</code> → <code>sys_rst_n</code> ядра → <code>user_reset</code> → вся логика ядра хоста. Данные пересекают границу доменов только через асинхронное FIFO; уровни состояния — через двухтриггерные синхронизаторы (2FF).</figcaption>
+</figure>
+
+<h3>3.4.4. Сброс</h3>
+<p>Все модули <code>nvme_host_core</code> используют один синхронный сброс с активным высоким уровнем — <code>user_reset</code> от ядра. Он держится, пока линк не обучен. Поэтому после каждого переобучения линка (например, если SSD «выпал» и <code>link_bringup</code> снова дёрнул PERST#) вся логика хоста начинает с чистого состояния: FSM в IDLE, счётчики в нуле.</p>
+<p>У <code>link_bringup</code> свой сброс от платы. Асинхронная установка и синхронное снятие (через два триггера в <code>link_clk</code>) гарантируют, что первый такт после сброса не нарушит setup/hold. Сброс домена <code>data_clk</code> — это объединение сброса платы и сброса ядра, синхронизированное к <code>data_clk</code>. Обе половины асинхронного FIFO должны стартовать вместе, иначе указатели Грея разойдутся.</p>
+
+<div class="box warn"><span class="t">Типичная ошибка</span> Тактировать таймеры PERST# от <code>user_clk</code>. Пока ядро в сбросе, этого такта нет, и FSM никогда не снимет сброс ядра — классический взаимный тупик. Второй вариант той же ошибки — сбрасывать логику хоста сигналом платы, а не <code>user_reset</code>. Тогда после переобучения линка FSM продолжат с середины, а SSD уже ничего не помнит.</div>
+
+<!-- ============================================================ -->
+<h2 id="s5">3.5. Карта памяти хоста</h2>
+
+<p>SSD видит хост как 32-битное адресное пространство. Мы сами решаем, что по каким адресам лежит, и сообщаем адреса накопителю: базы admin-очередей — через регистры ASQ/ACQ, I/O-очередей — в командах Create, буферов данных — в PRP. Табл. 3.6 повторяет карту из <code>ARCHITECTURE.md</code>, §2, и добавляет, чем каждая область реализована.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.6. Карта памяти: адреса, размер и реализация</caption>
+<tr><th>Область</th><th class="num">База</th><th>Размер</th><th>Реализация</th><th>Обращения SSD</th></tr>
+<tr><td>Admin SQ (ASQ)</td><td class="num">0x1000_0000</td><td>32 × 64 B = 2 KiB</td><td><code>asq_ram</code>, 128 × 128 бит</td><td>MRd → completer, <code>rd_sel</code> = 0</td></tr>
+<tr><td>Admin CQ (ACQ)</td><td class="num">0x1000_1000</td><td>32 × 16 B = 512 B</td><td><code>acq_ram</code>, 32 × 128 бит</td><td>MWr → writer</td></tr>
+<tr><td>Буфер Identify</td><td class="num">0x1000_2000</td><td>4 KiB</td><td><code>ident_ram</code>, 256 × 128 бит</td><td>MWr → writer</td></tr>
+<tr><td>I/O SQ (QID 1)</td><td class="num">0x1000_3000</td><td>64 × 64 B = 4 KiB</td><td><code>iosq_ram</code>, 256 × 128 бит</td><td>MRd → completer, <code>rd_sel</code> = 1</td></tr>
+<tr><td>I/O CQ (QID 1)</td><td class="num">0x1000_4000</td><td>64 × 16 B = 1 KiB</td><td><code>iocq_ram</code>, 64 × 128 бит</td><td>MWr → writer</td></tr>
+<tr><td>PRP-списки</td><td class="num">0x2000_0000 + k·0x1000</td><td>одна страница на слот</td><td><code>prp_synth</code>: логика, 0 BRAM</td><td>MRd → completer, <code>rd_sel</code> = 2</td></tr>
+<tr><td>Кольцо данных</td><td class="num">0x4000_0000 + k·SLOT_BYTES</td><td>8 × 128 KiB = 1 МиБ</td><td><code>data_ring</code>: 8 × <code>sdp_ram</code> 8192 × 128 бит</td><td>MRd → completer, <code>rd_sel</code> = 3</td></tr>
+<tr><td>BAR0 SSD</td><td class="num">0xC000_0000</td><td>≥ 16 KiB</td><td>регистры внутри SSD</td><td>— (к ним обращается наш <code>rp_requester</code>)</td></tr>
+<tr><td>Всё остальное</td><td colspan="2">—</td><td>—</td><td>MRd → Cpl с UR; MWr молча отбрасывается и считается</td></tr>
+</table></div>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" style="width:100%;height:auto;max-width:760px" role="img" aria-label="Карта памяти хоста и её реализация" font-size="12">
+<defs>
+<marker id="f34b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+<marker id="f34o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+<marker id="f34g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+</defs>
+<g font-weight="700" fill="var(--fg)"><text x="20" y="24">Адрес PCIe (как видит SSD)</text><text x="470" y="24">Чем реализовано в ПЛИС</text></g>
+<g fill="var(--code-bg)" stroke="var(--fg)">
+<rect x="20" y="36" width="250" height="30"/><rect x="20" y="74" width="250" height="30"/><rect x="20" y="112" width="250" height="30"/><rect x="20" y="150" width="250" height="30"/><rect x="20" y="188" width="250" height="30"/><rect x="20" y="236" width="250" height="30"/><rect x="20" y="284" width="250" height="30"/>
+<rect x="470" y="36" width="270" height="30"/><rect x="470" y="74" width="270" height="30"/><rect x="470" y="112" width="270" height="30"/><rect x="470" y="150" width="270" height="30"/><rect x="470" y="188" width="270" height="30"/>
+</g>
+<rect x="470" y="236" width="270" height="30" fill="none" stroke="var(--accent)" stroke-dasharray="5,3" stroke-width="1.5"/>
+<rect x="470" y="284" width="270" height="30" fill="var(--code-bg)" stroke="var(--accent2)" stroke-width="1.8"/>
+<rect x="20" y="332" width="250" height="30" fill="none" stroke="var(--muted)" stroke-dasharray="5,3"/>
+<rect x="470" y="332" width="270" height="30" fill="none" stroke="var(--muted)" stroke-dasharray="5,3"/>
+<rect x="20" y="372" width="250" height="30" fill="none" stroke="var(--muted)" stroke-dasharray="2,3"/>
+<g fill="var(--fg)">
+<text x="30" y="56"><tspan font-family="monospace">0x1000_0000</tspan>  Admin SQ</text>
+<text x="30" y="94"><tspan font-family="monospace">0x1000_1000</tspan>  Admin CQ</text>
+<text x="30" y="132"><tspan font-family="monospace">0x1000_2000</tspan>  Identify</text>
+<text x="30" y="170"><tspan font-family="monospace">0x1000_3000</tspan>  I/O SQ</text>
+<text x="30" y="208"><tspan font-family="monospace">0x1000_4000</tspan>  I/O CQ</text>
+<text x="30" y="256"><tspan font-family="monospace">0x2000_k000</tspan>  PRP-список слота k</text>
+<text x="30" y="304"><tspan font-family="monospace">0x4000_0000</tspan>  кольцо, 1 МиБ</text>
+<text x="30" y="352"><tspan font-family="monospace">0xC000_0000</tspan>  BAR0 SSD</text>
+<text x="30" y="392">остальные адреса</text>
+<g font-family="monospace" font-size="11.5">
+<text x="480" y="56">asq_ram    128×128 бит</text>
+<text x="480" y="94">acq_ram     32×128 бит</text>
+<text x="480" y="132">ident_ram  256×128 бит</text>
+<text x="480" y="170">iosq_ram   256×128 бит</text>
+<text x="480" y="208">iocq_ram    64×128 бит</text>
+<text x="480" y="256">prp_synth  (формула, 0 BRAM)</text>
+<text x="480" y="304">data_ring  8×(8192×128 бит)</text>
+</g>
+<text x="480" y="352">регистры NVMe внутри SSD</text>
+</g>
+<g stroke-width="1.6" fill="none">
+<path d="M466,51 H274" stroke="var(--accent)" marker-end="url(#f34b)"/>
+<path d="M274,89 H466" stroke="var(--accent2)" marker-end="url(#f34o)"/>
+<path d="M274,127 H466" stroke="var(--accent2)" marker-end="url(#f34o)"/>
+<path d="M466,165 H274" stroke="var(--accent)" marker-end="url(#f34b)"/>
+<path d="M274,203 H466" stroke="var(--accent2)" marker-end="url(#f34o)"/>
+<path d="M466,251 H274" stroke="var(--accent)" marker-end="url(#f34b)"/>
+<path d="M466,299 H274" stroke="var(--accent2)" stroke-width="3.5" marker-end="url(#f34o)"/>
+<path d="M274,347 H466" stroke="var(--muted)" stroke-dasharray="4,3" marker-end="url(#f34g)"/>
+</g>
+<g font-size="10.5" fill="var(--fg)" text-anchor="middle">
+<text x="370" y="46">MRd → CplD, rd_sel 0</text>
+<text x="370" y="84">MWr (CQE) → writer</text>
+<text x="370" y="122">MWr (4 KiB) → writer</text>
+<text x="370" y="160">MRd → CplD, rd_sel 1</text>
+<text x="370" y="198">MWr (CQE) → writer</text>
+<text x="370" y="246">MRd → CplD, rd_sel 2</text>
+<text x="370" y="292">MRd → CplD, rd_sel 3 (99,7 % байт)</text>
+<text x="370" y="342">наши MRd/MWr (rp_requester)</text>
+<text x="370" y="392" fill="var(--muted)">MRd → Cpl UR; MWr → отброшен</text>
+</g>
+<text x="380" y="415" text-anchor="middle" font-size="11" fill="var(--muted)">стрелка ← : SSD читает (данные идут из ПЛИС); стрелка → : SSD пишет в ПЛИС; штрих — область вне ПЛИС</text>
+</svg>
+<figcaption>Рис. 3.4. Карта памяти хоста и её реализация. Пять маленьких RAM по 128 бит, одна «виртуальная» область без памяти (<code>prp_synth</code>) и большое кольцо данных. Почти все байты, которые читает SSD, приходят из кольца.</figcaption>
+</figure>
+
+<h3>3.5.1. Почему адреса выбраны именно так</h3>
+<ul>
+<li><b>Ниже 4 ГБ</b> (D11) — все запросы SSD приходят с 3DW-заголовком.</li>
+<li><b>Области различаются старшими битами.</b> Окна начинаются с 0x1000_0000, 0x2000_0000, 0x4000_0000: декодер — несколько компараторов старших разрядов, без сумматоров.</li>
+<li><b>Кольцо выровнено на свой размер.</b> База 0x4000_0000 кратна 1 ГиБ, а <code>SLOT_BYTES</code> — степень двойки. Тогда адрес внутри слота k — это просто конкатенация <code>{k, смещение}</code>. Номер слота — биты над размером слота, и мультиплексор чтения <code>data_ring</code> управляется этими битами напрямую.</li>
+<li><b>Одна страница PRP на слот.</b> Слоту k соответствует страница <code>0x2000_0000 + k·0x1000</code>. Номер слота читается из битов адреса [31:12], номер записи — из битов [11:3].</li>
+<li><b>BAR0 SSD — вне всех окон хоста.</b> Root Port 7-series не фильтрует адреса по Base/Limit и передаёт в пользовательскую логику все входящие TLP. Значит, о непересечении заботимся мы сами.</li>
+</ul>
+
+<h3>3.5.2. Трюк синтеза PRP</h3>
+<p>Напомним (глава 2, §2.5): команда на 128 KiB с выровненным PRP1 занимает 32 страницы по 4 KiB. PRP1 указывает на первую страницу, PRP2 — на PRP-список из 31 записи по 8 байт (248 B). Запись i списка — адрес страницы i + 1. Для слота k с базой <code>slot_base = DATA_BASE + k·SLOT_BYTES</code>:</p>
+<pre><code>entry[i] = slot_base + (i + 1) · 4096,   i = 0 … SLOT_BYTES/4096 − 2</code></pre>
+<p>Здесь нет ни одного состояния: значение зависит только от k и i, а оба числа есть в адресе запроса. Когда SSD читает адрес A из окна PRP, <code>prp_synth</code> делает следующее:</p>
+<div class="bits"><span>31…12<small>k = A[31:12] − 0x20000</small></span><span>11…3<small>i = A[11:3]</small></span><span>2…0<small>байт в записи (0)</small></span></div>
+<pre><code>value = DATA_BASE + k·SLOT_BYTES + (i + 1)·4096    — 64 бита, little-endian, старший DW = 0
+i ≥ SLOT_BYTES/4096 − 1  →  0   (корректный SSD их не читает)</code></pre>
+<p>Completer читает память 16-байтными beat'ами, поэтому <code>prp_synth</code> выдаёт сразу две записи: <code>{entry(i+1), entry(i)}</code> для чётного i. Латентность — 2 такта, как у RAM. Для completer'а источник <code>rd_sel = 2</code> ничем не отличается от памяти.</p>
+
+<p><b>Пример для слота 3.</b> База слота: 0x4000_0000 + 3 · 0x2_0000 = <code>0x4006_0000</code>. SQE несёт PRP1 = <code>0x4006_0000</code> и PRP2 = <code>0x2000_3000</code>. Допустим, SSD читает список одним MRd на 248 B по адресу 0x2000_3000. Completer выдаёт 16 beat'ов (последний — наполовину), запрашивая у <code>prp_synth</code> адреса 0x000, 0x010, …, 0x0F0:</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.7. Синтез PRP-списка слота 3</caption>
+<tr><th class="num">Адрес чтения</th><th class="num">k</th><th class="num">i</th><th class="num">Значение записи</th><th>Страница слота</th></tr>
+<tr><td class="num">0x2000_3000</td><td class="num">3</td><td class="num">0</td><td class="num">0x0000_0000_4006_1000</td><td>1</td></tr>
+<tr><td class="num">0x2000_3008</td><td class="num">3</td><td class="num">1</td><td class="num">0x0000_0000_4006_2000</td><td>2</td></tr>
+<tr><td class="num">0x2000_3040</td><td class="num">3</td><td class="num">8</td><td class="num">0x0000_0000_4006_9000</td><td>9</td></tr>
+<tr><td class="num">0x2000_30F0</td><td class="num">3</td><td class="num">30</td><td class="num">0x0000_0000_4007_F000</td><td>31 (последняя)</td></tr>
+<tr><td class="num">0x2000_30F8</td><td class="num">3</td><td class="num">31</td><td class="num">0 (вне списка)</td><td>—</td></tr>
+</table></div>
+
+<p>Если SSD прочитает список по частям (так делают многие контроллеры, и на этом споткнулся mcrl), каждый кусок будет вычислен заново из своего адреса. Ошибиться в «текущей позиции» невозможно, потому что её нет.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" style="width:100%;height:auto;max-width:760px" role="img" aria-label="PRP-список слота 3 указывает на страницы слота" font-size="12">
+<defs><marker id="f35" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+<marker id="f35o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker></defs>
+<text x="150" y="22" text-anchor="middle" font-weight="700" fill="var(--fg)">PRP-список: 0x2000_3000 (вычисляется)</text>
+<text x="600" y="22" text-anchor="middle" font-weight="700" fill="var(--fg)">Слот 3: 0x4006_0000 … 0x4007_FFFF (BRAM)</text>
+<g fill="none" stroke="var(--accent)" stroke-dasharray="5,3">
+<rect x="20" y="36" width="260" height="30"/><rect x="20" y="70" width="260" height="30"/><rect x="20" y="104" width="260" height="30"/><rect x="20" y="152" width="260" height="30"/><rect x="20" y="186" width="260" height="30"/>
+</g>
+<g fill="var(--code-bg)" stroke="var(--fg)">
+<rect x="470" y="36" width="260" height="30"/><rect x="470" y="70" width="260" height="30"/><rect x="470" y="104" width="260" height="30"/><rect x="470" y="138" width="260" height="30"/><rect x="470" y="186" width="260" height="30"/>
+</g>
+<g fill="var(--fg)" font-family="monospace" font-size="11.5">
+<text x="28" y="56">+0x000 i=0  → 0x4006_1000</text>
+<text x="28" y="90">+0x008 i=1  → 0x4006_2000</text>
+<text x="28" y="124">+0x010 i=2  → 0x4006_3000</text>
+<text x="150" y="146" text-anchor="middle" font-family="sans-serif">…</text>
+<text x="28" y="172">+0x0F0 i=30 → 0x4007_F000</text>
+<text x="28" y="206">+0x0F8…0xFF8 → 0</text>
+<text x="478" y="56">стр. 0   0x4006_0000</text>
+<text x="478" y="90">стр. 1   0x4006_1000</text>
+<text x="478" y="124">стр. 2   0x4006_2000</text>
+<text x="478" y="158">стр. 3   0x4006_3000</text>
+<text x="600" y="180" text-anchor="middle" font-family="sans-serif">…</text>
+<text x="478" y="206">стр. 31  0x4007_F000</text>
+</g>
+<g stroke="var(--accent)" stroke-width="1.4" fill="none">
+<path d="M282,51 C380,51 380,85 466,85" marker-end="url(#f35)"/>
+<path d="M282,85 C380,85 380,119 466,119" marker-end="url(#f35)"/>
+<path d="M282,119 C380,119 380,153 466,153" marker-end="url(#f35)"/>
+<path d="M282,167 C380,167 380,201 466,201" marker-end="url(#f35)"/>
+</g>
+<path d="M420,240 H446 V51 H466" stroke="var(--accent2)" stroke-width="1.6" fill="none" marker-end="url(#f35o)"/>
+<text x="415" y="244" text-anchor="end" font-size="11.5" fill="var(--fg)">PRP1 = 0x4006_0000 (из SQE)</text>
+<rect x="20" y="258" width="710" height="32" rx="6" fill="var(--note-bg)" stroke="var(--border)"/>
+<text x="375" y="279" text-anchor="middle" fill="var(--fg)" font-family="monospace" font-size="12">entry(A) = 0x4000_0000 + (A[31:12] − 0x20000)·0x2_0000 + (A[11:3] + 1)·0x1000</text>
+</svg>
+<figcaption>Рис. 3.5. PRP-список слота 3. Записи списка (слева, пунктир — их нет в памяти) указывают на страницы 1…31 слота; страницу 0 задаёт PRP1 в самой команде. Внизу — формула, по которой <code>prp_synth</code> вычисляет запись по адресу чтения A при <code>SLOT_BYTES</code> = 128 KiB.</figcaption>
+</figure>
+
+<h3>3.5.3. Как «память хоста» распределена по BRAM</h3>
+<p>Каждая RAM — экземпляр примитива <code>sdp_ram</code>: простая двухпортовая память (один порт записи с байтовыми масками, один порт чтения), ширина 128 бит, латентность чтения 2 такта (выходной регистр BRAM + регистр конвейера). Кольцо данных — восемь отдельных <code>sdp_ram</code> по 8192 слова: по одному на слот. Номер слота — это старшие биты адреса, поэтому мультиплексор чтения кольца — обычный 8:1, управляемый задержанным на 2 такта номером слота.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.8. Распределение BRAM (OOC-синтез <code>nvme_host_core</code>, XC7K325T)</caption>
+<tr><th>Что</th><th>Объём</th><th class="num">Тайлов RAMB36</th><th>Примечание</th></tr>
+<tr><td>Кольцо данных</td><td>8 × 128 KiB = 1 МиБ</td><td class="num">256</td><td>1 RAMB36 = 32 Кбит данных = 4 KiB; 1 МиБ / 4 KiB = 256; по 32 тайла на слот</td></tr>
+<tr><td>Очереди, Identify, async FIFO и пр.</td><td>≈ 20 KiB</td><td class="num">10</td><td>5 RAM по 128 бит + FIFO 512 × 128 бит в <code>data_ring</code></td></tr>
+<tr><td>Малые FIFO (адаптеры, completer)</td><td>—</td><td class="num">0</td><td>в распределённой памяти LUT (622 LUT как RAM)</td></tr>
+<tr><td><b>Итого</b></td><td></td><td class="num"><b>266</b></td><td>из 445 (59,8 %); блок <code>pcie_7x</code> добавит свои буферы</td></tr>
+</table></div>
+
+<p>Обратите внимание на пропорцию: 96 % блочной памяти — это кольцо, то есть буфер для пауз SSD. Вся «логика NVMe» умещается в 10 тайлах.</p>
+
+<!-- ============================================================ -->
+<h2 id="s6">3.6. Жизненный цикл одной команды записи</h2>
+
+<p>Проследим слот 3 от заполнения до освобождения. Значения по умолчанию: <code>SLOT_BYTES</code> = 128 KiB, LBA по 512 B, MPS = 256 B, MRRS = 512 B, DSTRD = 0. Пусть хвост I/O SQ сейчас равен t, голова I/O CQ — h.</p>
+
+<ol>
+<li><b><code>data_ring</code>.</b> Писатель кольца выталкивает beat'ы из асинхронного FIFO и пишет их в слот 3 подряд. После последнего, 8192-го beat'а он выставляет <code>slot_full[3]</code> = 1 и переходит к слоту 4. Если слот 4 ещё занят, FIFO заполняется, и источник видит <code>s_data_tready</code> = 0.</li>
+<li><b><code>nvme_write_engine</code>, подача (SUB_IDLE).</b> Следующий по кругу слот — 3; условия выполнены: <code>slot_full[3]</code>, <code>!busy[3]</code>, SQ не полна, движок включён. Проверка диапазона: <code>next_lba + 256 ≤ NSZE</code>.</li>
+<li><b><code>nvme_write_engine</code> → <code>iosq_ram</code> (SUB_WR).</b> Четыре beat'а по 16 B — это SQE в ячейку t: DW0 = <code>0x0003_0001</code> (CID 3, opcode 01h), NSID = 1, PRP1 = <code>0x4006_0000</code>, PRP2 = <code>0x2000_3000</code>, SLBA = <code>next_lba</code>, NLB = 255, DW13 = 0x40 (подсказка «последовательная запись»).</li>
+<li><b><code>nvme_write_engine</code> (SUB_COMMIT).</b> tail = t + 1, <code>busy[3]</code> = 1, <code>next_lba</code> += 256, взводится флаг «нужен SQ doorbell». Если между подачей и отправкой MWr подана ещё одна команда, doorbell уйдёт один, с последним значением tail.</li>
+<li><b><code>req_mux</code> → <code>rp_requester</code>.</b> Порт 1 (doorbell'ы движка) запрашивает MWr32 по адресу SQ1TDBL = <code>0xC000_1008</code> со значением t + 1. Requester собирает 3DW-заголовок, <code>tlp_tx_arb</code> пропускает пакет между CplD, TX-адаптер отдаёт его ядру. Запомнен момент doorbell'а — для статистики латентности.</li>
+<li><b>SSD → <code>hostmem_completer</code>: выборка SQE.</b> Контроллер видит новый tail и читает команду: MRd 64 B по адресу <code>0x1000_3000 + 64·t</code>. <code>tlp_rx_demux</code> направляет MRd в completer. Тот определяет область (I/O SQ, <code>rd_sel</code> = 1), читает 4 beat'а из <code>iosq_ram</code> и выдаёт один CplD (BC = 64, LA = младшие 7 бит адреса). Первый beat ответа появляется через 8 тактов после заголовка запроса.</li>
+<li><b>SSD → completer: выборка PRP-списка.</b> SSD видит PRP2 и читает список: MRd до 248 B по <code>0x2000_3000</code> (возможно, частями). Completer направляет чтения в <code>prp_synth</code> (<code>rd_sel</code> = 2) и отдаёт вычисленные записи в CplD.</li>
+<li><b>SSD → completer: выборка данных.</b> Теперь SSD знает все 32 страницы и читает данные: 256 запросов MRd по 512 B, адреса от <code>0x4006_0000</code> до <code>0x4007_FE00</code>. Порядок и число одновременных запросов выбирает SSD; на совести хоста — отвечать без задержек.</li>
+<li><b><code>hostmem_completer</code> + <code>data_ring</code>.</b> Каждый MRd 512 B даёт 2 CplD по 256 B (BC = 512, затем 256; LA = 0x00). Данные читаются из слота 3 (<code>rd_sel</code> = 3) с упреждением, без пузырей между CplD и между запросами. Всего 512 CplD по 17 beat'ов — ≈ 8700 тактов ≈ 70 мкс шины.</li>
+<li><b><code>tlp_tx_arb</code> → <code>pcie7x_tx_adapt</code> → ядро.</b> Арбитр пропускает CplD, TX-адаптер сдвигает данные под 3DW-заголовок, переставляет байты и накапливает пакет целиком (store-and-forward), чтобы ядро не увидело провала <code>tvalid</code> внутри пакета.</li>
+<li><b>SSD.</b> Данные попадают во внутренний буфер, затем в SLC-кэш или NAND. По готовности (для кэшируемой записи — как только данные в DRAM/SLC) контроллер формирует CQE.</li>
+<li><b>SSD → <code>hostmem_writer</code>.</b> MWr 16 B по адресу <code>0x1000_4000 + 16·h</code>. Выровненный CQE занимает ровно один 128-битный beat <code>iocq_ram</code>. Но SSD вправе записать два CQE одним MWr или один CQE частями (например, 8 + 8 B, с битом P в последней части). Поэтому writer сдвигает данные на <code>addr[3:2]</code> и пишет с байтовыми масками.</li>
+<li><b><code>nvme_write_engine</code>, сбор (reap).</b> Движок читает <code>iocq_ram[h]</code> каждый такт. Когда бит P в DW3 совпал с ожидаемой фазой: CID = 3, статус = 0. Учитываются <code>cmds_done</code>, <code>bytes_done</code> и латентность; h увеличивается (при переходе 63 → 0 фаза инвертируется).</li>
+<li><b><code>nvme_write_engine</code> → <code>data_ring</code>.</b> Импульс <code>slot_free[3]</code>, <code>busy[3]</code> = 0. Кольцо сбрасывает <code>slot_full[3]</code>: писатель может снова заполнять слот 3.</li>
+<li><b><code>nvme_write_engine</code> → <code>rp_requester</code>.</b> MWr CQ1HDBL = <code>0xC000_100C</code> со значением h + 1. Doorbell отправляется, когда сборщик «затих», поэтому пачка CQE стоит один MWr. Без этого doorbell'а SSD через 63 команды посчитает CQ полной и остановится.</li>
+</ol>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 620" style="width:100%;height:auto;max-width:780px" role="img" aria-label="Диаграмма последовательности одной команды записи" font-size="11.5" id="seq36">
+<style>#seq36 text{paint-order:stroke;stroke:var(--bg);stroke-width:4px;stroke-linejoin:round}</style>
+<defs>
+<marker id="f36b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+<marker id="f36o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+<marker id="f36g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+</defs>
+<g fill="var(--code-bg)" stroke="var(--fg)">
+<rect x="20" y="14" width="100" height="34" rx="5"/><rect x="140" y="14" width="110" height="34" rx="5"/><rect x="265" y="14" width="110" height="34" rx="5"/><rect x="395" y="14" width="110" height="34" rx="5"/><rect x="515" y="14" width="110" height="34" rx="5"/>
+</g>
+<rect x="650" y="14" width="120" height="34" rx="5" fill="var(--note-bg)" stroke="var(--accent2)" stroke-width="1.5"/>
+<g font-family="monospace" fill="var(--fg)" text-anchor="middle" font-weight="700">
+<text x="70" y="36">data_ring</text><text x="195" y="36">write_engine</text><text x="320" y="36">rp_requester</text><text x="450" y="36">completer</text><text x="570" y="36">writer</text><text x="710" y="36" font-family="sans-serif">SSD</text>
+</g>
+<g stroke="var(--muted)" stroke-dasharray="3,4">
+<line x1="70" y1="48" x2="70" y2="605"/><line x1="195" y1="48" x2="195" y2="605"/><line x1="320" y1="48" x2="320" y2="605"/><line x1="450" y1="48" x2="450" y2="605"/><line x1="570" y1="48" x2="570" y2="605"/><line x1="710" y1="48" x2="710" y2="605"/>
+</g>
+<!-- 1 -->
+<path d="M70,80 H191" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#f36g)"/>
+<text x="132" y="74" text-anchor="middle" fill="var(--fg)">① slot_full[3] = 1</text>
+<!-- 2-4 -->
+<rect x="128" y="96" width="134" height="34" rx="4" fill="var(--note-bg)" stroke="var(--border)"/>
+<text x="195" y="110" text-anchor="middle" fill="var(--fg)">②③ SQE → iosq_ram[t]</text>
+<text x="195" y="124" text-anchor="middle" fill="var(--fg)">④ tail = t+1, busy[3]</text>
+<!-- 5 -->
+<path d="M195,154 H316" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="257" y="148" text-anchor="middle" fill="var(--fg)">⑤ MWr SQ1TDBL</text>
+<path d="M320,180 H706" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="515" y="174" text-anchor="middle" fill="var(--fg)">TLP MWr 0xC000_1008 ← t+1 (posted)</text>
+<!-- 6 -->
+<path d="M710,214 H454" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="580" y="208" text-anchor="middle" fill="var(--fg)">⑥ MRd 64 B @ 0x1000_3000+64·t</text>
+<path d="M450,240 H706" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="580" y="234" text-anchor="middle" fill="var(--fg)">CplD: SQE (iosq_ram)</text>
+<!-- 7 -->
+<path d="M710,276 H454" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="580" y="270" text-anchor="middle" fill="var(--fg)">⑦ MRd ≤ 248 B @ 0x2000_3000</text>
+<path d="M450,302 H706" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="580" y="296" text-anchor="middle" fill="var(--fg)">CplD: записи PRP (prp_synth)</text>
+<!-- 8-10 -->
+<path d="M710,338 H454" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="580" y="332" text-anchor="middle" fill="var(--fg)">⑧ MRd 512 B × 256 @ 0x4006_0000…</text>
+<path d="M70,370 H446" stroke="var(--accent2)" stroke-width="3" marker-end="url(#f36o)"/>
+<text x="258" y="364" text-anchor="middle" fill="var(--fg)">⑨ чтение слота 3 (rd_sel = 3)</text>
+<path d="M450,370 H706" stroke="var(--accent2)" stroke-width="3" marker-end="url(#f36o)"/>
+<text x="580" y="364" text-anchor="middle" fill="var(--fg)">⑩ CplD 256 B × 512</text>
+<!-- 11 -->
+<rect x="650" y="390" width="120" height="34" rx="4" fill="var(--note-bg)" stroke="var(--border)"/>
+<text x="710" y="404" text-anchor="middle" fill="var(--fg)">⑪ буфер → SLC/NAND</text>
+<text x="710" y="418" text-anchor="middle" fill="var(--fg)">готов CQE</text>
+<!-- 12 -->
+<path d="M710,450 H574" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="640" y="444" text-anchor="middle" fill="var(--fg)">⑫ MWr CQE 16 B</text>
+<text x="640" y="464" text-anchor="middle" fill="var(--muted)" font-size="10.5">@ 0x1000_4000+16·h</text>
+<path d="M570,488 H199" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#f36g)"/>
+<text x="385" y="482" text-anchor="middle" fill="var(--fg)">⑬ CQE в iocq_ram; опрос фазы: CID = 3, статус 0</text>
+<!-- 14 -->
+<path d="M195,520 H74" stroke="var(--fg)" stroke-width="1.3" marker-end="url(#f36g)"/>
+<text x="132" y="514" text-anchor="middle" fill="var(--fg)">⑭ slot_free[3]</text>
+<!-- 15 -->
+<path d="M195,552 H316" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="257" y="546" text-anchor="middle" fill="var(--fg)">⑮ MWr CQ1HDBL</text>
+<path d="M320,580 H706" stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f36b)"/>
+<text x="515" y="574" text-anchor="middle" fill="var(--fg)">TLP MWr 0xC000_100C ← h+1</text>
+<text x="390" y="614" text-anchor="middle" font-size="10.5" fill="var(--muted)">оранжевое — данные (99,7 % байт); синее — TLP; нейтральные — внутренние сигналы ПЛИС. Масштаб времени условный.</text>
+</svg>
+<figcaption>Рис. 3.6. Диаграмма последовательности одной команды Write для слота 3. Колонки — модули: <code>data_ring</code>, <code>nvme_write_engine</code>, <code>rp_requester</code> (с <code>req_mux</code>, арбитром и TX-адаптером), <code>hostmem_completer</code> (с <code>prp_synth</code> и <code>hostmem_rams</code>), <code>hostmem_writer</code> и SSD. Номера совпадают с шагами списка выше; шаги 2–4 объединены в одну заметку.</figcaption>
+</figure>
+
+<p>Та же история на уровне сигналов показана на рис. 3.7. Важно увидеть, какие события разделены во времени. Слот занят (<code>slot_full</code> = 1) от записи последнего beat'а до сбора CQE, а не до чтения последнего байта SSD. Поэтому даже после того, как SSD прочитал все данные слота, слот остаётся занятым ещё на время записи в NAND/кэш. Это время входит в латентность команды.</p>
+
+<figure class="wave">
+<!--WAVE:ch3_slot_lifecycle-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1425" height="319" viewBox="0 0 1425 319" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wvaf2ca9h" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wvaf2ca9a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker><mask id="wvaf2ca9m5" maskUnits="userSpaceOnUse" x="137" y="169" width="1280" height="30"><rect x="137" y="169" width="1280" height="30" fill="#fff"/><polygon points="1111,199 1117,199 1123,169 1117,169" fill="#000"/></mask><mask id="wvaf2ca9m7" maskUnits="userSpaceOnUse" x="137" y="214" width="1280" height="30"><rect x="137" y="214" width="1280" height="30" fill="#fff"/><polygon points="1111,244 1117,244 1123,214 1117,214" fill="#000"/></mask></defs><path d="M137,34 V289 M177,34 V289 M217,34 V289 M257,34 V289 M297,34 V289 M337,34 V289 M377,34 V289 M417,34 V289 M457,34 V289 M497,34 V289 M537,34 V289 M577,34 V289 M617,34 V289 M657,34 V289 M697,34 V289 M737,34 V289 M777,34 V289 M817,34 V289 M857,34 V289 M897,34 V289 M937,34 V289 M977,34 V289 M1017,34 V289 M1057,34 V289 M1097,34 V289 M1137,34 V289 M1177,34 V289 M1217,34 V289 M1257,34 V289 M1297,34 V289 M1337,34 V289 M1377,34 V289 M1417,34 V289" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="129" y="53.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_data → кольцо</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="137,58 137,40 334,40 337,49 334,58" fill="#ffd7a8"/><text x="237" y="52.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">слот 3: 8192 beats</text><polygon points="340,58 337,49 340,40 1417,40 1417,58" fill="#a8d4ff"/><text x="877" y="52.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">слот 4 …</text></g><text x="129" y="83.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">slot_full[3]</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M137,88 L337,88 M337,88 L340,70 L1297,70 M1297,70 L1300,88 L1417,88" fill="none"/></g><text x="129" y="113.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">iosq_ram wr</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M137,118 L377,118 M377,118 L380,100 L537,100 M537,100 L540,118 L1417,118" fill="none"/></g><text x="129" y="143.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">busy[3]</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M137,148 L537,148 M537,148 L540,130 L1257,130 M1257,130 L1260,148 L1417,148" fill="none"/></g><text x="129" y="188.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">TX FPGA→SSD</text><g mask="url(#wvaf2ca9m5)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="137,193 137,175 534,175 537,184 534,193" fill="url(#wvaf2ca9h)"/><polygon points="540,193 537,184 540,175 614,175 617,184 614,193" fill="#a8f0ee"/><text x="577" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MWr SQ1TDBL</text><polygon points="620,193 617,184 620,175 734,175 737,184 734,193" fill="url(#wvaf2ca9h)"/><polygon points="740,193 737,184 740,175 814,175 817,184 814,193" fill="#e3b8f5"/><text x="777" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">CplD SQE</text><polygon points="820,193 817,184 820,175 894,175 897,184 894,193" fill="url(#wvaf2ca9h)"/><polygon points="900,193 897,184 900,175 974,175 977,184 974,193" fill="#e3b8f5"/><text x="937" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">CplD PRP</text><polygon points="980,193 977,184 980,175 1014,175 1017,184 1014,193" fill="url(#wvaf2ca9h)"/><polygon points="1020,193 1017,184 1020,175 1174,175 1177,184 1174,193" fill="#e3b8f5"/><text x="1097" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">CplD ×512 (данные)</text><polygon points="1180,193 1177,184 1180,175 1334,175 1337,184 1334,193" fill="url(#wvaf2ca9h)"/><polygon points="1340,193 1337,184 1340,175 1417,175 1417,193" fill="#a8f0ee"/><text x="1377" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MWr CQ1HDBL</text></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M1111,196 L1117,172"/><path d="M1117,196 L1123,172"/></g><text x="129" y="233.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">RX SSD→FPGA</text><g mask="url(#wvaf2ca9m7)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="137,238 137,220 654,220 657,229 654,238" fill="url(#wvaf2ca9h)"/><polygon points="660,238 657,229 660,220 734,220 737,229 734,238" fill="#a8d4ff"/><text x="697" y="232.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MRd SQE</text><polygon points="740,238 737,229 740,220 814,220 817,229 814,238" fill="url(#wvaf2ca9h)"/><polygon points="820,238 817,229 820,220 894,220 897,229 894,238" fill="#a8d4ff"/><text x="857" y="232.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MRd PRP</text><polygon points="900,238 897,229 900,220 974,220 977,229 974,238" fill="url(#wvaf2ca9h)"/><polygon points="980,238 977,229 980,220 1134,220 1137,229 1134,238" fill="#a8d4ff"/><text x="1057" y="232.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MRd ×256 (данные)</text><polygon points="1140,238 1137,229 1140,220 1174,220 1177,229 1174,238" fill="url(#wvaf2ca9h)"/><polygon points="1180,238 1177,229 1180,220 1254,220 1257,229 1254,238" fill="#a8d4ff"/><text x="1217" y="232.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MWr CQE</text><polygon points="1260,238 1257,229 1260,220 1417,220 1417,238" fill="url(#wvaf2ca9h)"/></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M1111,241 L1117,217"/><path d="M1117,241 L1123,217"/></g><text x="129" y="278.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">slot_free[3]</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M137,283 L1257,283 M1257,283 L1260,265 L1297,265 M1297,265 L1300,283 L1417,283" fill="none"/></g><g stroke="var(--wave-edge, #2a6fb0)" stroke-width="1.2" fill="none"><path d="M538.5,184 C598.5,184 598.5,229 658.5,229" marker-end="url(#wvaf2ca9a)"/><rect x="548.3" y="193" width="100.4" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="598.5" y="203" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">SSD читает SQE</text><path d="M658.5,229 C698.5,229 698.5,184 738.5,184" marker-end="url(#wvaf2ca9a)"/><rect x="681.3" y="193" width="34.4" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="698.5" y="203" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">CplD</text><path d="M1178.5,229 C1218.5,229 1218.5,274 1258.5,274" marker-end="url(#wvaf2ca9a)"/><rect x="1201.3" y="238" width="34.4" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="1218.5" y="248" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">reap</text></g><text x="777" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">Слот 3: от заполнения до освобождения (масштаб условный, «|» — разрыв оси)</text><text x="777" y="305" font-size="12" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">CID = 3; данные слота: 0x4006_0000…0x4007_FFFF; PRP-список: 0x2000_3000</text></svg>
+<!--/WAVE:ch3_slot_lifecycle-->
+<figcaption>Рис. 3.7. Слот 3 на уровне сигналов (<code>docs/wave/ch3_slot_lifecycle.json</code>). Запись SQE в <code>iosq_ram</code> занимает 4 такта, затем doorbell. SSD читает SQE, PRP-список и 256 раз по 512 B данных; хост отвечает CplD. После CQE слот освобождается импульсом <code>slot_free[3]</code>, и движок отправляет CQ head doorbell. Разрывы оси «|» скрывают ≈ 70 мкс передачи и время работы SSD.</figcaption>
+</figure>
+
+<div class="box"><span class="t">Почему подаём только полный слот</span> Можно ли подать команду, пока слот ещё заполняется, чтобы сэкономить время? Нельзя. SSD может прочитать любую часть слота в любой момент после doorbell'а. Если данных там ещё нет, completer должен либо задержать CplD (и тогда сработает completion timeout у SSD — 50 мкс…50 мс), либо отдать мусор. Правило проекта: <b>команда подаётся только тогда, когда все её 128 KiB уже в кольце</b>. Completer никогда не ждёт источник.</div>
+
+<!-- ============================================================ -->
+<h2 id="s7">3.7. Параметры проекта</h2>
+
+<p>Все константы собраны в пакете <code>rtl/nvme_host_pkg.sv</code>. Параметры, которые имеет смысл менять, вынесены в параметры модулей <code>nvme_host_top</code> и <code>nvme_host_core</code>.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.9. Параметры проекта (пакет <code>nvme_host_pkg</code> и верхние модули)</caption>
+<tr><th>Имя</th><th>По умолчанию</th><th>Смысл</th></tr>
+<tr><td><code>N_SLOTS</code> (<code>N_SLOTS_DEF</code>)</td><td>8</td><td>число слотов кольца = максимальная глубина очереди</td></tr>
+<tr><td><code>SLOT_BYTES</code> (<code>SLOT_BYTES_DEF</code>)</td><td>131072</td><td>байт на команду; степень двойки, ≥ 4096, ≤ 2<sup>MDTS</sup>·4096</td></tr>
+<tr><td><code>MPS_CAP_CODE</code></td><td>1 (256 B)</td><td>наш максимум MPS; обязан совпадать с «Max Payload Size» в GUI <code>pcie_7x</code></td></tr>
+<tr><td><code>MRRS_CODE</code></td><td>2 (512 B)</td><td>MRRS, записываемый в DevCtl накопителя</td></tr>
+<tr><td><code>EXT_TAG_ALLOW</code></td><td>1</td><td>включать Extended Tags, если SSD поддерживает</td></tr>
+<tr><td><code>BAR0_ADDR</code></td><td>0xC000_0000</td><td>адрес, назначаемый BAR0 накопителя</td></tr>
+<tr><td><code>ASQ_BASE</code> … <code>DATA_BASE</code></td><td>см. табл. 3.6</td><td>карта памяти хоста</td></tr>
+<tr><td><code>ADMIN_QSIZE</code> / <code>IO_QSIZE</code></td><td>32 / 64</td><td>размеры очередей</td></tr>
+<tr><td><code>REQ_TIMEOUT_CYCLES</code></td><td>1 250 000</td><td>таймаут нашего non-posted запроса: 10 мс @ 125 МГц</td></tr>
+<tr><td><code>START_LBA</code></td><td>0</td><td>первый записываемый LBA</td></tr>
+<tr><td><code>SIM_FAST</code></td><td>0</td><td>в симуляции «миллисекунды» таймеров становятся микросекундами</td></tr>
+<tr><td><code>LINK_CLK_HZ</code></td><td>100 000 000</td><td>реальная частота <code>link_clk</code> (ODIV2) для таймеров <code>link_bringup</code></td></tr>
+</table></div>
+
+<h3>3.7.1. Как параметры масштабируются</h3>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.10. Что меняется при изменении основных параметров</caption>
+<tr><th>Изменение</th><th>Что получаем</th><th>Что проверить или переделать</th></tr>
+<tr><td><code>N_SLOTS</code> 8 → 12</td><td>QD до 12; буфер 1,5 МиБ ≈ 0,87 мс</td><td>BRAM растёт линейно: 32 тайла на слот (384 + 10 тайлов из 445); CID = номер слота должен быть &lt; 0xFF (CID Flush)</td></tr>
+<tr><td><code>N_SLOTS</code> 8 → 4</td><td>экономия 128 тайлов</td><td>QD ≤ 3 при непрерывном потоке; закрывает лишь ≈ 220 мкс латентности SSD</td></tr>
+<tr><td><code>SLOT_BYTES</code> 128 → 256 KiB</td><td>вдвое меньше SQE, doorbell'ов, CQE на байт данных</td><td>MDTS ≥ 6; NLB = 511; PRP-список 63 записи (504 B), по-прежнему одна страница; при той же памяти QD вдвое меньше</td></tr>
+<tr><td><code>SLOT_BYTES</code> &gt; 2 MiB</td><td>—</td><td>PRP-список длиннее 512 записей не помещается в одну страницу: нужна цепочка списков, а окно <code>prp_synth</code> «одна страница на слот» перестаёт работать</td></tr>
+<tr><td>MPS 256 → 512</td><td>≈ +3,8 % (1,82 → 1,89 ГБ/с)</td><td>MPSS накопителя ≥ 2; GUI <code>pcie_7x</code> 512; <code>MPS_CAP_CODE</code> = 2; FIFO TX-адаптера ≥ 33 beat'ов (по умолчанию 64)</td></tr>
+<tr><td>MPS 256 → 128</td><td>≈ −7 % (1,70 ГБ/с)</td><td>только если SSD не умеет 256</td></tr>
+<tr><td>MRRS 512 → 4096</td><td>≈ +1,5 % (меньше MRd и DLLP)</td><td>completer уже умеет делить запрос до 4096 B; длиннее очередь CplD на один тег</td></tr>
+</table></div>
+
+<div class="box task"><span class="t">Вопрос для самопроверки</span> Почему увеличение <code>SLOT_BYTES</code> при постоянном объёме кольца не улучшает устойчивость к паузам SSD, хотя команды становятся «эффективнее»?</div>
+
+<!-- ============================================================ -->
+<h2 id="s8">3.8. Ресурсы и тайминг</h2>
+
+<p>Ниже — результаты синтеза <code>nvme_host_core</code> вне контекста (out-of-context, OOC) в Vivado 2022.2 для XC7K325T-2 с параметрами по умолчанию. Ограничения: <code>user_clk</code> — период 8 нс (125 МГц), <code>data_clk</code> — 5 нс (200 МГц). IP-ядро <code>pcie_7x</code> и <code>link_bringup</code> в эту цифру не входят.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.11. Ресурсы и тайминг <code>nvme_host_core</code> (OOC-синтез)</caption>
+<tr><th>Ресурс</th><th class="num">Использовано</th><th class="num">Доступно</th><th class="num">Доля</th></tr>
+<tr><td>LUT (всего)</td><td class="num">≈ 7 900</td><td class="num">203 800</td><td class="num">3,9 %</td></tr>
+<tr><td>— из них как распределённая RAM</td><td class="num">622</td><td class="num">64 000</td><td class="num">1,0 %</td></tr>
+<tr><td>Триггеры (FF)</td><td class="num">≈ 5 600</td><td class="num">407 600</td><td class="num">1,4 %</td></tr>
+<tr><td>Тайлы BRAM (RAMB36)</td><td class="num">266</td><td class="num">445</td><td class="num">59,8 %</td></tr>
+<tr><td>WNS, <code>user_clk</code> (8 нс)</td><td class="num" colspan="3">+1,19 нс → запас по частоте до ≈ 147 МГц</td></tr>
+<tr><td>WNS, <code>data_clk</code> (5 нс)</td><td class="num" colspan="3">+2,97 нс</td></tr>
+</table></div>
+
+<p>Сравним с коммерческим решением. Design Gateway NVMe-IP на Kintex-7 занимает ≈ 3,2 тыс. LUT, 4,3 тыс. FF и 66 тайлов BRAM при буфере 256 KB. LiteNVMe на KU3P — 11,6 тыс. LUT, 14,4 тыс. FF и 133 BRAM (вместе с PCIe IP и процессором). Наш хост посередине по логике. По памяти он крупнее: мы сознательно отдали BRAM под буфер, а не под логику. Если уменьшить кольцо до 256 KB (2 слота по 128 KiB), останется ≈ 74 тайла — порядок Design Gateway.</p>
+
+<div class="box ok"><span class="t">Что означает запас +1,19 нс</span> Это результат синтеза, а не размещения: после place &amp; route запас обычно уменьшается. Но и 1,19 нс на 8 нс (15 %) — это комфортно для учебного проекта. Где именно проходит худший путь, покажет <code>report_timing -max_paths 10</code> после синтеза. Естественные кандидаты — декодер адреса и арифметика Byte Count в completer'е, а также мультиплексор чтения кольца N_SLOTS:1 шириной 128 бит. Мультиплексор растёт вместе с <code>N_SLOTS</code>, поэтому при увеличении кольца проверяйте тайминг заново.</div>
+
+<!-- ============================================================ -->
+<h2 id="s9">3.9. Что сознательно упрощено и куда расти</h2>
+
+<p>Наш хост — не универсальный драйвер. Мы выбросили всё, что не нужно для потоковой записи. Каждое упрощение — кандидат на лабораторную работу.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 3.12. Упрощения и направления развития</caption>
+<tr><th>Упрощение</th><th>Чем ограничивает</th><th>Как расширить (глава 8)</th></tr>
+<tr><td>Один namespace (NSID = 1)</td><td>диски с несколькими namespace используются частично</td><td>Identify Active NS List, выбор NSID параметром</td></tr>
+<tr><td>Одна пара I/O-очередей</td><td>нельзя развести запись и чтение по независимым потокам</td><td>вторая пара очередей, арбитраж между движками</td></tr>
+<tr><td>Без прерываний (MSI)</td><td>неприменимо в системе с CPU, которому нужны события</td><td>MSI-окно в <code>hostmem_writer</code>, IEN = 1 в Create CQ</td></tr>
+<tr><td>Без DDR</td><td>буфер 0,58 мс; пауза GC 10 мс приводит к остановке источника</td><td>кольцо в DDR3 через MIG, BRAM как кэш упреждающего чтения</td></tr>
+<tr><td>Только запись</td><td>данные нельзя прочитать обратно без ПК</td><td>движок Read: MWr от SSD в кольцо, CplD не нужны</td></tr>
+<tr><td>MRRS 512 B</td><td>больше MRd и DLLP, чем нужно</td><td>MRRS 4096: проверить деление и глубину FIFO completer'а</td></tr>
+<tr><td>Без Deallocate/Trim</td><td>SLC-кэш и GC в состоянии, оставленном прошлым сеансом</td><td>Dataset Management (09h) перед записью</td></tr>
+<tr><td>Без SMART и температуры</td><td>троттлинг виден только по падению скорости</td><td>Get Log Page LID 02h раз в секунду</td></tr>
+<tr><td>Только целые слоты</td><td>хвост меньше 128 KiB не записывается</td><td>последняя команда с укороченным NLB</td></tr>
+</table></div>
+
+<p>Порядок работ, задания и критерии приёмки — в <a href="08_lab.html">главе 8</a>. Начинать стоит с DDR-кольца: это единственное расширение, без которого регистратор не переживёт паузу SSD на сборку мусора (расчёт — в <a href="06_performance.html#s4">разделе 6.4</a>).</p>
+
+<!-- ============================================================ -->
+<h2 id="s10">3.10. Вопросы для самопроверки и задачи</h2>
+
+<div class="box task"><span class="t">Вопросы для самопроверки</span>
+<ol>
+<li>Назовите два количественных ограничения моста <code>axi_pcie</code>, из-за которых выбран сырой TLP-интерфейс (D1). Почему для потоковой записи важнее первое из них?</li>
+<li>Почему отдельный beat под заголовок во внутреннем формате <code>tlp_axis</code> не снижает пропускную способность для CplD на 256 B? Посчитайте beat'ы с обеих сторон TX-адаптера.</li>
+<li>Какие три особенности 128-битного интерфейса <code>pcie_7x</code> изолированы в адаптерах? Что сломалось бы, если бы completer работал с форматом ядра напрямую?</li>
+<li>Почему <code>link_bringup</code> не может работать от <code>user_clk</code>? Что тактирует его на самом деле?</li>
+<li>Зачем Root Port'у собственный BME? Что произойдёт, если <code>rp_cfg_init</code> его не установит, а у SSD BME установлен?</li>
+<li>По каким битам адреса <code>prp_synth</code> определяет номер слота и номер записи? Почему для него не важно, какими кусками SSD читает список?</li>
+<li>Слот занят от записи последнего beat'а до сбора CQE. Почему не до момента, когда SSD прочитал последний байт? Как это влияет на допустимую латентность SSD?</li>
+<li>Почему при <code>N_SLOTS</code> = 8 полезная глубина очереди при непрерывном потоке равна 7?</li>
+</ol>
+</div>
+
+<h3>Задачи с ответами</h3>
+
+<p><b>Задача 1.</b> SSD выдал MRd на 32 B (Length = 8 DW, BE = F/F) по адресу <code>0x2000_5070</code>. Какие записи и с какими значениями вернёт хост? Сколько beat'ов прочитает completer у <code>prp_synth</code> и по каким адресам?</p>
+<details><summary>Ответ</summary>
+<p>k = 0x20005 − 0x20000 = 5; база слота 5 = 0x4000_0000 + 5 · 0x2_0000 = <code>0x400A_0000</code>. Первая запись: i = 0x070 &gt;&gt; 3 = 14. Запрос охватывает записи 14, 15, 16, 17:</p>
+<ul>
+<li>entry[14] = 0x400A_0000 + 15 · 0x1000 = <code>0x400A_F000</code>;</li>
+<li>entry[15] = <code>0x400B_0000</code>;</li>
+<li>entry[16] = <code>0x400B_1000</code>;</li>
+<li>entry[17] = <code>0x400B_2000</code>.</li>
+</ul>
+<p>Каждая запись — 8 байт little-endian со старшим DW = 0. Адрес 0x070 выровнен на 16 B, поэтому completer читает два beat'а: смещения 0x070 (записи 14, 15) и 0x080 (записи 16, 17). Ответ — один CplD: Length = 8, BC = 32, LA = 0x70.</p>
+</details>
+
+<p><b>Задача 2.</b> Определите, что ответит хост на каждый MRd и почему: (а) 64 B по <code>0x1000_2000</code>; (б) 32 B по <code>0x1000_3FF0</code>; (в) 512 B по <code>0x4010_0000</code>; (г) 512 B по <code>0x4001_FF00</code>.</p>
+<details><summary>Ответ</summary>
+<ul>
+<li>(а) Буфер Identify SSD только <em>пишет</em>; для completer'а это не читаемая область. Ответ — Cpl со статусом UR. Если SSD действительно его читает, где-то ошибка в адресах команд.</li>
+<li>(б) Запрос начинается в I/O SQ (последние 16 байт) и заканчивается в I/O CQ (0x1000_4000…0x1000_400F). Completer обслуживает запрос, только если первый <em>и</em> последний байт лежат в одной читаемой области. Ответ — UR.</li>
+<li>(в) Кольцо занимает 0x4000_0000…0x400F_FFFF (1 МиБ). Адрес 0x4010_0000 — первый байт за его концом. Ответ — UR.</li>
+<li>(г) 0x4001_FF00 + 512 = 0x4002_0100: запрос пересекает границу слотов 0 и 1, но оба внутри кольца. Ответ — данные: CplD #1 — 256 B (до границы 0x4002_0000, выровненной на MPS), BC = 512, LA = 0x00; CplD #2 — 256 B, BC = 256. Корректный SSD такой запрос не выдаст (команда слота 0 кончается на 0x4001_FFFF), но хост ответил бы правильно.</li>
+</ul>
+</details>
+
+<p><b>Задача 3.</b> Перенастройте проект на <code>N_SLOTS</code> = 4, <code>SLOT_BYTES</code> = 256 KiB, накопитель с LBA 4096 B (LBADS = 12). Найдите: адрес слота 2, PRP1 и PRP2 его команды, NLB, длину PRP-списка, требование к MDTS, объём BRAM кольца. Какую латентность SSD выдержит такая очередь без остановки источника при 1,8 ГБ/с?</p>
+<details><summary>Ответ</summary>
+<ul>
+<li>Слот 2: 0x4000_0000 + 2 · 0x4_0000 = <code>0x4008_0000</code> = PRP1. PRP2 = <code>0x2000_2000</code> (страница списка слота 2).</li>
+<li>Блоков в команде: 256 KiB / 4 KiB = 64, NLB = 63 (0's based) — формула <code>(SLOT_BYTES &gt;&gt; lbads) − 1</code>.</li>
+<li>Страниц: 64; PRP-список — 63 записи = 504 B, в одной странице.</li>
+<li>MDTS: 256 KiB = 2<sup>6</sup> × 4 KiB, нужно MDTS ≥ 6 (или 0 — «без ограничения»).</li>
+<li>BRAM: 4 × 256 KiB = 1 МиБ — те же 256 тайлов.</li>
+<li>Команда передаётся за 256 KiB / 1,8 ГБ/с ≈ 146 мкс. При непрерывном потоке в полёте не больше 3 команд (четвёртый слот заполняется). Источник не остановится, если SSD завершает команду не дольше чем за ≈ 3 × 146 ≈ 440 мкс. Это примерно столько же, сколько с 8 слотами по 128 KiB (7 × 73 ≈ 510 мкс). Порядок величины определяет объём кольца, а не нарезка на слоты.</li>
+</ul>
+</details>
+
+<div class="pager"><a href="02_nvme_basics.html">← Глава 2. NVMe с нуля</a><a href="04_modules.html">Глава 4. Модули и интерфейсы →</a></div>
+<footer>Учебный проект «NVMe-хост на голой Kintex-7». Исходники: <a href="https://github.com/alexander-hdl/NVME">github.com/alexander-hdl/NVME</a>.</footer>
+</main>
+</div>
+</body>
+</html>

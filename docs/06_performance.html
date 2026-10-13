@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Глава 6. Пропускная способность</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="layout">
+<!-- NAV:BEGIN -->
+<nav class="side">
+  <h2>NVMe-хост на Kintex-7</h2>
+  <ul>
+    <li><a href="index.html">Введение и цели</a></li>
+    <li><a href="01_pcie_basics.html">1. PCIe с нуля</a></li>
+    <li><a href="02_nvme_basics.html">2. NVMe с нуля</a></li>
+    <li><a href="03_architecture.html">3. Архитектура хоста</a></li>
+    <li><a href="04_modules.html">4. Модули и интерфейсы</a></li>
+    <li><a href="05_bringup.html">5. Запуск: от PERST# до первой записи</a></li>
+    <li><a href="06_performance.html" class="cur">6. Пропускная способность</a></li>
+    <li><a href="07_verification.html">7. Верификация и симуляция</a></li>
+    <li><a href="08_lab.html">8. Лабораторные задания</a></li>
+    <li><a href="glossary.html">Глоссарий</a></li>
+  </ul>
+</nav>
+<!-- NAV:END -->
+<main>
+<h1>Глава 6. Пропускная способность</h1>
+<p class="lead">Куда деваются байты между 20 Гбит/с на проводах и гигабайтами в секунду на диске? В этой главе мы построим полный бюджет: линк, шина ПЛИС, латентность, глубина очереди, поведение SSD. Вы научитесь считать потолок для любой конфигурации. Вы также научитесь по счётчикам и ILA определять, во что именно упёрлась система: в линк, в SSD или в собственную логику.</p>
+
+<div class="box"><span class="t">Что нужно знать заранее</span>
+Глава 1, <a href="01_pcie_basics.html#s7">раздел 1.7</a>: кадрирование TLP, DLLP, SKP и закон Литтла. Глава 3: структура хоста и путь данных записи. Все расчёты ниже — для параметров по умолчанию (MPS = 256 B, MRRS = 512 B, 8 слотов по 128 KiB), если не оговорено иное. Числа с пометкой «оценка» не измерены на железе.</div>
+
+<p><b>Содержание главы.</b>
+<a href="#s1">6.1 Бюджет линка</a> ·
+<a href="#s2">6.2 Шина пользователя</a> ·
+<a href="#s3">6.3 Закон Литтла</a> ·
+<a href="#s4">6.4 Размер команды и QD</a> ·
+<a href="#s5">6.5 Сторона SSD</a> ·
+<a href="#s6">6.6 Методика измерений</a> ·
+<a href="#s7">6.7 Чек-лист</a> ·
+<a href="#s8">6.8 Самопроверка</a></p>
+
+<p>Начнём с итоговой картины (рис. 6.1). Каждая строка — один уровень, на котором теряется часть скорости. Остаток главы объясняет каждую строку.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" style="width:100%;height:auto;max-width:760px" role="img" aria-label="Лестница потерь пропускной способности от линка до SSD" font-size="12">
+<g stroke="var(--border)" stroke-dasharray="3,3">
+<line x1="330" y1="26" x2="330" y2="262"/><line x1="406" y1="26" x2="406" y2="262"/><line x1="482" y1="26" x2="482" y2="262"/><line x1="558" y1="26" x2="558" y2="262"/><line x1="634" y1="26" x2="634" y2="262"/><line x1="710" y1="26" x2="710" y2="262"/>
+</g>
+<line x1="330" y1="262" x2="740" y2="262" stroke="var(--muted)"/>
+<g fill="var(--muted)" text-anchor="middle" font-size="11">
+<text x="330" y="278">1,5</text><text x="406" y="278">1,6</text><text x="482" y="278">1,7</text><text x="558" y="278">1,8</text><text x="634" y="278">1,9</text><text x="710" y="278">2,0</text>
+</g>
+<text x="535" y="296" text-anchor="middle" font-size="11" fill="var(--muted)">ГБ/с полезных данных (ось начинается с 1,5 ГБ/с)</text>
+<g fill="var(--fg)" text-anchor="end">
+<text x="318" y="44">Линк: 4 × 5 GT/s, 8b/10b</text>
+<text x="318" y="78">Шина ПЛИС: CplD 256 B = 17 beat'ов</text>
+<text x="318" y="112">Линк: кадрирование TLP (20 B/CplD)</text>
+<text x="318" y="146">+ DLLP (Ack, UpdateFC) и SKP</text>
+<text x="318" y="180">+ SQE, PRP, doorbell'ы (≈ 0,3 %)</text>
+<text x="318" y="214">Реальные SSD (публикации, Gen2)</text>
+<text x="318" y="248">Наш tb_top с моделью SSD</text>
+</g>
+<g>
+<g><title>2,000 ГБ/с: 20 Гбит/с × 8/10 / 8</title><circle cx="710" cy="40" r="6" fill="var(--accent)"/></g>
+<g><title>1,882 ГБ/с: 16/17 × 2,0</title><circle cx="620.3" cy="74" r="6" fill="var(--accent)"/></g>
+<g><title>1,855 ГБ/с: 256/276 × 2,0</title><circle cx="599.8" cy="108" r="6" fill="var(--accent)"/></g>
+<g><title>≈1,82 ГБ/с: 512/560 × 2,0 × 0,997</title><circle cx="575.5" cy="142" r="6" fill="var(--accent)"/></g>
+<g><title>≈1,815 ГБ/с</title><circle cx="569.4" cy="176" r="6" fill="var(--accent)"/></g>
+<g><title>1,60–1,75 ГБ/с</title><line x1="406" y1="210" x2="520" y2="210" stroke="var(--accent)" stroke-width="8" stroke-linecap="round"/></g>
+<g><title>≈1,61 ГБ/с в окне 1 МиБ, включая разгон</title><circle cx="412.1" cy="244" r="6" fill="var(--bg)" stroke="var(--accent)" stroke-width="2"/></g>
+</g>
+<g fill="var(--fg)" font-size="11.5">
+<text x="722" y="44">2,000</text>
+<text x="632" y="78">1,882</text>
+<text x="611" y="112">1,855</text>
+<text x="587" y="146">≈ 1,82</text>
+<text x="581" y="180">≈ 1,815</text>
+<text x="532" y="214">1,60–1,75</text>
+<text x="424" y="248">≈ 1,61</text>
+</g>
+</svg>
+<figcaption>Рис. 6.1. Лестница потерь для MPS = 256 B. Шина ПЛИС (1,88) быстрее линка с кадрированием (1,82) всего на ≈ 3 %, поэтому она не узкое место — пока в ней нет пузырей. Нижние две строки определяет SSD; наш системный тест упирается в поведение модели SSD и включает разгон (раздел 6.6).</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="s1">6.1. Бюджет линка Gen2 x4</h2>
+
+<h3>6.1.1. Сырая скорость</h3>
+<p>Четыре линии по 5 GT/s дают 20 Гбит/с сырых символов. Кодирование 8b/10b превращает каждые 8 бит данных в 10-битный символ. Остаётся 16 Гбит/с = <b>2,0 ГБ/с в каждую сторону</b>. Направления независимы: данные записи идут от ПЛИС к SSD, а MRd от SSD — навстречу и нашу полосу не занимают.</p>
+
+<h3>6.1.2. Накладные расходы на TLP</h3>
+<p>Каждый TLP на линке обёрнут служебными байтами. Для CplD с 3DW-заголовком без ECRC получается ровно 20 байт.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.1. Накладные расходы одного CplD на линке Gen2</caption>
+<tr><th>Поле</th><th class="num">Байт</th><th>Уровень</th></tr>
+<tr><td>STP (начало TLP, K-символ)</td><td class="num">1</td><td>физический</td></tr>
+<tr><td>Sequence Number</td><td class="num">2</td><td>канальный</td></tr>
+<tr><td>Заголовок CplD (3 DW)</td><td class="num">12</td><td>транзакционный</td></tr>
+<tr><td>LCRC</td><td class="num">4</td><td>канальный</td></tr>
+<tr><td>END (K-символ)</td><td class="num">1</td><td>физический</td></tr>
+<tr><td><b>Итого</b></td><td class="num"><b>20</b></td><td>+4 B, если включён ECRC (у нас выключен)</td></tr>
+</table></div>
+
+<p>На x4 TLP раскладывается по линиям побайтно, и его длина всегда кратна 4 символам: потерь на выравнивание нет. Эффективность TLP:</p>
+<pre><code>η_TLP = MPS / (MPS + 20)          X_TLP = 2,0 ГБ/с · η_TLP</code></pre>
+
+<h3>6.1.3. DLLP и SKP</h3>
+<p>В том же направлении, что и наши CplD, ядро <code>pcie_7x</code> отправляет служебные пакеты канального уровня (DLLP, по 8 байт с кадрированием). Это <b>Ack</b> на TLP, полученные от SSD (MRd и CQE-MWr), и <b>UpdateFC</b>, возвращающие SSD кредиты на новые запросы. Их число пропорционально числу MRd. В среднем это ≈ 8 B на обслуженный MRd (оценка: Ack и UpdateFC частично объединяются). Кроме того, физический уровень каждые 1180–1538 символов вставляет SKP Ordered Set из 4 символов. Это ≈ 0,3 %.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.2. Потолок полезной скорости Gen2 x4 при разных MPS</caption>
+<tr><th class="num">MPS, B</th><th class="num">Байт на линке на CplD</th><th class="num">η<sub>TLP</sub></th><th class="num">Только TLP, ГБ/с</th><th class="num">+ DLLP и SKP, MRRS = 512, ГБ/с</th><th class="num">То же, MRRS = 4096, ГБ/с</th></tr>
+<tr><td class="num">128</td><td class="num">148</td><td class="num">86,5 %</td><td class="num">1,730</td><td class="num">≈ 1,70</td><td class="num">≈ 1,72</td></tr>
+<tr><td class="num">256</td><td class="num">276</td><td class="num">92,75 %</td><td class="num">1,855</td><td class="num"><b>≈ 1,82</b></td><td class="num">≈ 1,85</td></tr>
+<tr><td class="num">512</td><td class="num">532</td><td class="num">96,2 %</td><td class="num">1,925</td><td class="num">≈ 1,89</td><td class="num">≈ 1,92</td></tr>
+</table></div>
+
+<h3>6.1.4. Откуда ровно 1,82 ГБ/с при MPS = 256</h3>
+<p>Посчитаем одно «чтение» SSD целиком. MRd на 512 B обслуживается двумя CplD по 256 B. На линке это 2 × 276 = 552 B. Добавим ≈ 8 B DLLP на этот MRd — всего 560 B на 512 B данных:</p>
+<pre><code>X = 2,0 ГБ/с · 512/560 · (1 − 0,003)  =  2,0 · 0,9143 · 0,997  ≈  1,823 ГБ/с</code></pre>
+<p>Почему MRRS = 4096 даёт 1,85? Тогда один MRd обслуживается 16 CplD, а DLLP-накладные на него те же 8 B: 4096 / (16 · 276 + 8) = 92,6 %. Выигрыш — 1,5 %. Больший выигрыш даёт MPS: при 512 B — ещё +3,8 %. Но здесь решает накопитель: его MPSS (Max Payload Size Supported) чаще всего 256 B.</p>
+
+<p>Остаются выборки SQE (64 B) и PRP-списка (248 B) и два MWr doorbell'а на каждую команду 128 KiB. На линке это ≈ 84 + 268 + 2 · 24 ≈ 400 B на 141 312 B данных с кадрированием — ≈ 0,3 %. Итог: <b>≈ 1,81–1,82 ГБ/с — абсолютный потолок записи при MPS = 256</b>. Design Gateway на той же платформе публикует 1,6–1,7 ГБ/с. Разница с потолком — это SSD (раздел 6.5).</p>
+
+<div class="box warn"><span class="t">Типичная ошибка</span> Считать, что потолок — 2,0 ГБ/с, и искать в своей логике «потерянные» 10 %. Их нет. Девять процентов съедают заголовки и кадрирование TLP при MPS 256, ещё ≈ 2 % — DLLP и SKP. Это свойство линка, а не реализации.</div>
+
+<!-- ============================================================ -->
+<h2 id="s2">6.2. Шина пользователя: 128 бит @ 125 МГц</h2>
+
+<p>Ширина и частота интерфейса <code>pcie_7x</code> выбраны так, что сырая скорость шины в точности равна скорости линка: 16 B × 125 МГц = 2,0 ГБ/с. Это красиво, но означает, что запаса почти нет.</p>
+
+<h3>6.2.1. Beat'ы на один CplD</h3>
+<p>TX-интерфейс 7-series не склеивает TLP: каждый пакет начинается с DW0 нового beat'а. CplD с 3DW-заголовком и MPS байт данных занимает 3 + MPS/4 DW, округлённые вверх до четвёрок. Во внутреннем формате <code>tlp_axis</code> заголовок занимает отдельный beat, а данные начинаются со следующего. Число beat'ов совпадает.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.3. Эффективность шины 128 бит для CplD</caption>
+<tr><th class="num">MPS, B</th><th class="num">DW в CplD</th><th class="num">Beat'ов у ядра</th><th class="num">Beat'ов в <code>tlp_axis</code></th><th class="num">Доля данных</th><th class="num">Потолок шины, ГБ/с</th></tr>
+<tr><td class="num">64 (SQE)</td><td class="num">3 + 16 = 19</td><td class="num">5</td><td class="num">1 + 4</td><td class="num">80,0 %</td><td class="num">1,600</td></tr>
+<tr><td class="num">128</td><td class="num">3 + 32 = 35</td><td class="num">9</td><td class="num">1 + 8</td><td class="num">88,9 %</td><td class="num">1,778</td></tr>
+<tr><td class="num">256</td><td class="num">3 + 64 = 67</td><td class="num"><b>17</b></td><td class="num">1 + 16</td><td class="num">16/17 = 94,1 %</td><td class="num"><b>1,882</b></td></tr>
+<tr><td class="num">512</td><td class="num">3 + 128 = 131</td><td class="num">33</td><td class="num">1 + 32</td><td class="num">97,0 %</td><td class="num">1,939</td></tr>
+</table></div>
+
+<p>Та же доля 94,1 % получается на 64-битной шине @ 250 МГц: 34 beat'а по 2 DW, то есть 64 DW данных из 68 DW-позиций. Отсюда часто цитируемое «64/68». Выбор между 64 бит @ 250 МГц и 128 бит @ 125 МГц на скорость не влияет.</p>
+
+<figure class="wave">
+<!--WAVE:ch6_tx_cpld_stream-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1194.4" height="244" viewBox="0 0 1194.4 244" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wvdc7725h" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wvdc7725a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker><mask id="wvdc7725m3" maskUnits="userSpaceOnUse" x="82.4" y="124" width="1104" height="30"><rect x="82.4" y="124" width="1104" height="30" fill="#fff"/><polygon points="237.4,154 243.4,154 249.4,124 243.4,124" fill="#000"/><polygon points="559.4,154 565.4,154 571.4,124 565.4,124" fill="#000"/><polygon points="973.4,154 979.4,154 985.4,124 979.4,124" fill="#000"/></mask></defs><path d="M82.4,34 V214 M128.4,34 V214 M174.4,34 V214 M220.4,34 V214 M266.4,34 V214 M312.4,34 V214 M358.4,34 V214 M404.4,34 V214 M450.4,34 V214 M496.4,34 V214 M542.4,34 V214 M588.4,34 V214 M634.4,34 V214 M680.4,34 V214 M726.4,34 V214 M772.4,34 V214 M818.4,34 V214 M864.4,34 V214 M910.4,34 V214 M956.4,34 V214 M1002.4,34 V214 M1048.4,34 V214 M1094.4,34 V214 M1140.4,34 V214 M1186.4,34 V214" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="74.4" y="53.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">user_clk</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M82.4,58 L85.4,40 L105.4,40 L108.4,58 L128.4,58 M128.4,58 L131.4,40 L151.4,40 L154.4,58 L174.4,58 M174.4,58 L177.4,40 L197.4,40 L200.4,58 L220.4,58 M220.4,58 L223.4,40 L243.4,40 L246.4,58 L266.4,58 M266.4,58 L269.4,40 L289.4,40 L292.4,58 L312.4,58 M312.4,58 L315.4,40 L335.4,40 L338.4,58 L358.4,58 M358.4,58 L361.4,40 L381.4,40 L384.4,58 L404.4,58 M404.4,58 L407.4,40 L427.4,40 L430.4,58 L450.4,58 M450.4,58 L453.4,40 L473.4,40 L476.4,58 L496.4,58 M496.4,58 L499.4,40 L519.4,40 L522.4,58 L542.4,58 M542.4,58 L545.4,40 L565.4,40 L568.4,58 L588.4,58 M588.4,58 L591.4,40 L611.4,40 L614.4,58 L634.4,58 M634.4,58 L637.4,40 L657.4,40 L660.4,58 L680.4,58 M680.4,58 L683.4,40 L703.4,40 L706.4,58 L726.4,58 M726.4,58 L729.4,40 L749.4,40 L752.4,58 L772.4,58 M772.4,58 L775.4,40 L795.4,40 L798.4,58 L818.4,58 M818.4,58 L821.4,40 L841.4,40 L844.4,58 L864.4,58 M864.4,58 L867.4,40 L887.4,40 L890.4,58 L910.4,58 M910.4,58 L913.4,40 L933.4,40 L936.4,58 L956.4,58 M956.4,58 L959.4,40 L979.4,40 L982.4,58 L1002.4,58 M1002.4,58 L1005.4,40 L1025.4,40 L1028.4,58 L1048.4,58 M1048.4,58 L1051.4,40 L1071.4,40 L1074.4,58 L1094.4,58 M1094.4,58 L1097.4,40 L1117.4,40 L1120.4,58 L1140.4,58 M1140.4,58 L1143.4,40 L1163.4,40 L1166.4,58 L1186.4,58" fill="none"/></g><text x="74.4" y="83.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M82.4,70 L1186.4,70" fill="none"/></g><text x="74.4" y="113.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tready</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M82.4,100 L680.4,100 M680.4,100 L683.4,118 L772.4,118 M772.4,118 L775.4,100 L1186.4,100" fill="none"/></g><text x="74.4" y="143.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tdata</text><g mask="url(#wvdc7725m3)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="82.4,148 82.4,130 125.4,130 128.4,139 125.4,148" fill="#ffd7a8"/><text x="105.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H+D0</text><polygon points="131.4,148 128.4,139 131.4,130 171.4,130 174.4,139 171.4,148" fill="#a8d4ff"/><text x="151.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D1–4</text><polygon points="177.4,148 174.4,139 177.4,130 263.4,130 266.4,139 263.4,148" fill="#a8d4ff"/><text x="220.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D5–8</text><polygon points="269.4,148 266.4,139 269.4,130 309.4,130 312.4,139 309.4,148" fill="#a8d4ff"/><text x="289.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D57–60</text><polygon points="315.4,148 312.4,139 315.4,130 355.4,130 358.4,139 355.4,148" fill="#a8d4ff"/><text x="335.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D61–63</text><polygon points="361.4,148 358.4,139 361.4,130 401.4,130 404.4,139 401.4,148" fill="#ffd7a8"/><text x="381.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H+D0</text><polygon points="407.4,148 404.4,139 407.4,130 447.4,130 450.4,139 447.4,148" fill="#a8d4ff"/><text x="427.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D1–4</text><polygon points="453.4,148 450.4,139 453.4,130 493.4,130 496.4,139 493.4,148" fill="#a8d4ff"/><text x="473.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D5–8</text><polygon points="499.4,148 496.4,139 499.4,130 585.4,130 588.4,139 585.4,148" fill="#a8d4ff"/><text x="542.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D9–12</text><polygon points="591.4,148 588.4,139 591.4,130 631.4,130 634.4,139 631.4,148" fill="#a8d4ff"/><text x="611.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D49–52</text><polygon points="637.4,148 634.4,139 637.4,130 677.4,130 680.4,139 677.4,148" fill="#a8d4ff"/><text x="657.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D53–56</text><polygon points="683.4,148 680.4,139 683.4,130 769.4,130 772.4,139 769.4,148" fill="#a8d4ff"/><text x="726.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D57–60</text><polygon points="775.4,148 772.4,139 775.4,130 815.4,130 818.4,139 815.4,148" fill="#a8d4ff"/><text x="795.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D61–63</text><polygon points="821.4,148 818.4,139 821.4,130 861.4,130 864.4,139 861.4,148" fill="#ffd7a8"/><text x="841.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H+D0</text><polygon points="867.4,148 864.4,139 867.4,130 907.4,130 910.4,139 907.4,148" fill="#a8d4ff"/><text x="887.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D1–4</text><polygon points="913.4,148 910.4,139 913.4,130 999.4,130 1002.4,139 999.4,148" fill="#a8d4ff"/><text x="956.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D5–8</text><polygon points="1005.4,148 1002.4,139 1005.4,130 1045.4,130 1048.4,139 1045.4,148" fill="#a8d4ff"/><text x="1025.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D57–60</text><polygon points="1051.4,148 1048.4,139 1051.4,130 1091.4,130 1094.4,139 1091.4,148" fill="#a8d4ff"/><text x="1071.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D61–63</text><polygon points="1097.4,148 1094.4,139 1097.4,130 1137.4,130 1140.4,139 1137.4,148" fill="#ffd7a8"/><text x="1117.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H+D0</text><polygon points="1143.4,148 1140.4,139 1143.4,130 1186.4,130 1186.4,148" fill="#a8d4ff"/><text x="1163.4" y="142.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D1–4</text></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M237.4,151 L243.4,127"/><path d="M243.4,151 L249.4,127"/><path d="M559.4,151 L565.4,127"/><path d="M565.4,151 L571.4,127"/><path d="M973.4,151 L979.4,127"/><path d="M979.4,151 L985.4,127"/></g><text x="74.4" y="173.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tkeep</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="82.4,178 82.4,160 309.4,160 312.4,169 309.4,178" fill="#e4e4e4"/><text x="197.4" y="172.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">FFFF</text><polygon points="315.4,178 312.4,169 315.4,160 355.4,160 358.4,169 355.4,178" fill="#a8f0ee"/><text x="335.4" y="172.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">0FFF</text><polygon points="361.4,178 358.4,169 361.4,160 769.4,160 772.4,169 769.4,178" fill="#e4e4e4"/><text x="565.4" y="172.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">FFFF</text><polygon points="775.4,178 772.4,169 775.4,160 815.4,160 818.4,169 815.4,178" fill="#a8f0ee"/><text x="795.4" y="172.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">0FFF</text><polygon points="821.4,178 818.4,169 821.4,160 1045.4,160 1048.4,169 1045.4,178" fill="#e4e4e4"/><text x="933.4" y="172.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">FFFF</text><polygon points="1051.4,178 1048.4,169 1051.4,160 1091.4,160 1094.4,169 1091.4,178" fill="#a8f0ee"/><text x="1071.4" y="172.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">0FFF</text><polygon points="1097.4,178 1094.4,169 1097.4,160 1186.4,160 1186.4,178" fill="#e4e4e4"/><text x="1140.4" y="172.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">FFFF</text></g><text x="74.4" y="203.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tlast</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M82.4,208 L312.4,208 M312.4,208 L315.4,190 L358.4,190 M358.4,190 L361.4,208 L772.4,208 M772.4,208 L775.4,190 L818.4,190 M818.4,190 L821.4,208 L1048.4,208 M1048.4,208 L1051.4,190 L1094.4,190 M1094.4,190 L1097.4,208 L1186.4,208" fill="none"/></g><g stroke="var(--wave-edge, #2a6fb0)" stroke-width="1.2" fill="none"><path d="M681.9,109 L773.9,109" marker-end="url(#wvdc7725a)" marker-start="url(#wvdc7725a)"/><rect x="710.7" y="91" width="34.4" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="727.9" y="101" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">DLLP</text></g><text x="634.4" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">s_axis_tx: CplD по 256 B встык, 17 beats на пакет (оси с разрывами)</text><text x="634.4" y="230" font-size="12" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">Первый beat = {D0,H2,H1,H0}; последний несёт D61–D63 (tkeep 0FFF). tready=0 — ядро вставило DLLP/SKP</text></svg>
+<!--/WAVE:ch6_tx_cpld_stream-->
+<figcaption>Рис. 6.2. Поток CplD по 256 B на интерфейсе <code>s_axis_tx</code> ядра (<code>docs/wave/ch6_tx_cpld_stream.json</code>). Первый beat несёт три DW заголовка и D0, последний — D61…D63 (tkeep = 0FFF). Пакеты идут встык. Когда ядро вставляет DLLP или SKP, оно снимает <code>tready</code>; источник держит <code>tvalid</code> и данные неизменными.</figcaption>
+</figure>
+
+<h3>6.2.2. Почему любой пузырь сразу становится узким местом</h3>
+<p>Сравним время одного CplD 256 B на шине и на линке:</p>
+<ul>
+<li>шина: 17 beat'ов × 8 нс = <b>136 нс</b>;</li>
+<li>линк: 276 B / 2,0 ГБ/с = 138 нс, плюс доля DLLP (≈ 4 B на CplD = 2 нс) и SKP — ≈ <b>140–142 нс</b>.</li>
+</ul>
+<p>Запас шины — около 4–6 нс, то есть <b>меньше одного такта на CplD</b>. Интересно, что запас почти не зависит от MPS. Накладные линка — 20 B ≈ 10 нс на пакет, а накладные шины — один beat = 8 нс на пакет; разница постоянна. Поэтому один пустой такт на каждый CplD (18 тактов вместо 17) мгновенно делает узким местом ПЛИС:</p>
+<pre><code>16/18 · 2,0 ГБ/с = 1,78 ГБ/с  &lt;  1,82 ГБ/с линка</code></pre>
+
+<figure class="wave">
+<!--WAVE:ch6_bubble-->
+<svg xmlns="http://www.w3.org/2000/svg" width="844.8" height="229" viewBox="0 0 844.8 229" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wva7b813h" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wva7b813a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker><mask id="wva7b813m2" maskUnits="userSpaceOnUse" x="88.8" y="94" width="748" height="30"><rect x="88.8" y="94" width="748" height="30" fill="#fff"/><polygon points="167.8,124 173.8,124 179.8,94 173.8,94" fill="#000"/><polygon points="303.8,124 309.8,124 315.8,94 309.8,94" fill="#000"/><polygon points="439.8,124 445.8,124 451.8,94 445.8,94" fill="#000"/><polygon points="575.8,124 581.8,124 587.8,94 581.8,94" fill="#000"/><polygon points="711.8,124 717.8,124 723.8,94 717.8,94" fill="#000"/></mask><mask id="wva7b813m5" maskUnits="userSpaceOnUse" x="88.8" y="169" width="748" height="30"><rect x="88.8" y="169" width="748" height="30" fill="#fff"/><polygon points="167.8,199 173.8,199 179.8,169 173.8,169" fill="#000"/><polygon points="337.8,199 343.8,199 349.8,169 343.8,169" fill="#000"/><polygon points="507.8,199 513.8,199 519.8,169 513.8,169" fill="#000"/><polygon points="677.8,199 683.8,199 689.8,169 683.8,169" fill="#000"/></mask></defs><path d="M88.8,34 V199 M122.8,34 V199 M156.8,34 V199 M190.8,34 V199 M224.8,34 V199 M258.8,34 V199 M292.8,34 V199 M326.8,34 V199 M360.8,34 V199 M394.8,34 V199 M428.8,34 V199 M462.8,34 V199 M496.8,34 V199 M530.8,34 V199 M564.8,34 V199 M598.8,34 V199 M632.8,34 V199 M666.8,34 V199 M700.8,34 V199 M734.8,34 V199 M768.8,34 V199 M802.8,34 V199 M836.8,34 V199" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="80.8" y="53.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">clk</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M88.8,58 L91.8,40 L105.8,40 L108.8,58 L122.8,58 M122.8,58 L125.8,40 L139.8,40 L142.8,58 L156.8,58 M156.8,58 L159.8,40 L173.8,40 L176.8,58 L190.8,58 M190.8,58 L193.8,40 L207.8,40 L210.8,58 L224.8,58 M224.8,58 L227.8,40 L241.8,40 L244.8,58 L258.8,58 M258.8,58 L261.8,40 L275.8,40 L278.8,58 L292.8,58 M292.8,58 L295.8,40 L309.8,40 L312.8,58 L326.8,58 M326.8,58 L329.8,40 L343.8,40 L346.8,58 L360.8,58 M360.8,58 L363.8,40 L377.8,40 L380.8,58 L394.8,58 M394.8,58 L397.8,40 L411.8,40 L414.8,58 L428.8,58 M428.8,58 L431.8,40 L445.8,40 L448.8,58 L462.8,58 M462.8,58 L465.8,40 L479.8,40 L482.8,58 L496.8,58 M496.8,58 L499.8,40 L513.8,40 L516.8,58 L530.8,58 M530.8,58 L533.8,40 L547.8,40 L550.8,58 L564.8,58 M564.8,58 L567.8,40 L581.8,40 L584.8,58 L598.8,58 M598.8,58 L601.8,40 L615.8,40 L618.8,58 L632.8,58 M632.8,58 L635.8,40 L649.8,40 L652.8,58 L666.8,58 M666.8,58 L669.8,40 L683.8,40 L686.8,58 L700.8,58 M700.8,58 L703.8,40 L717.8,40 L720.8,58 L734.8,58 M734.8,58 L737.8,40 L751.8,40 L754.8,58 L768.8,58 M768.8,58 L771.8,40 L785.8,40 L788.8,58 L802.8,58 M802.8,58 L805.8,40 L819.8,40 L822.8,58 L836.8,58" fill="none"/></g><text x="80.8" y="83.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M88.8,70 L836.8,70" fill="none"/></g><text x="80.8" y="113.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tdata</text><g mask="url(#wva7b813m2)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="88.8,118 88.8,100 119.8,100 122.8,109 119.8,118" fill="#a8f0ee"/><text x="105.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="125.8,118 122.8,109 125.8,100 187.8,100 190.8,109 187.8,118" fill="#ffd7a8"/><text x="156.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="193.8,118 190.8,109 193.8,100 221.8,100 224.8,109 221.8,118" fill="#ffd7a8"/><text x="207.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="227.8,118 224.8,109 227.8,100 255.8,100 258.8,109 255.8,118" fill="#a8f0ee"/><text x="241.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="261.8,118 258.8,109 261.8,100 323.8,100 326.8,109 323.8,118" fill="#ffd7a8"/><text x="292.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="329.8,118 326.8,109 329.8,100 357.8,100 360.8,109 357.8,118" fill="#ffd7a8"/><text x="343.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="363.8,118 360.8,109 363.8,100 391.8,100 394.8,109 391.8,118" fill="#a8f0ee"/><text x="377.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="397.8,118 394.8,109 397.8,100 459.8,100 462.8,109 459.8,118" fill="#ffd7a8"/><text x="428.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="465.8,118 462.8,109 465.8,100 493.8,100 496.8,109 493.8,118" fill="#ffd7a8"/><text x="479.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="499.8,118 496.8,109 499.8,100 527.8,100 530.8,109 527.8,118" fill="#a8f0ee"/><text x="513.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="533.8,118 530.8,109 533.8,100 595.8,100 598.8,109 595.8,118" fill="#ffd7a8"/><text x="564.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="601.8,118 598.8,109 601.8,100 629.8,100 632.8,109 629.8,118" fill="#ffd7a8"/><text x="615.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="635.8,118 632.8,109 635.8,100 663.8,100 666.8,109 663.8,118" fill="#a8f0ee"/><text x="649.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="669.8,118 666.8,109 669.8,100 731.8,100 734.8,109 731.8,118" fill="#ffd7a8"/><text x="700.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="737.8,118 734.8,109 737.8,100 765.8,100 768.8,109 765.8,118" fill="#ffd7a8"/><text x="751.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="771.8,118 768.8,109 771.8,100 799.8,100 802.8,109 799.8,118" fill="#a8f0ee"/><text x="785.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="805.8,118 802.8,109 805.8,100 836.8,100 836.8,118" fill="#ffd7a8"/><text x="819.8" y="112.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M167.8,121 L173.8,97"/><path d="M173.8,121 L179.8,97"/><path d="M303.8,121 L309.8,97"/><path d="M309.8,121 L315.8,97"/><path d="M439.8,121 L445.8,97"/><path d="M445.8,121 L451.8,97"/><path d="M575.8,121 L581.8,97"/><path d="M581.8,121 L587.8,97"/><path d="M711.8,121 L717.8,97"/><path d="M717.8,121 L723.8,97"/></g><text x="80.8" y="158.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M88.8,145 L224.8,145 M224.8,145 L227.8,163 L258.8,163 M258.8,163 L261.8,145 L394.8,145 M394.8,145 L397.8,163 L428.8,163 M428.8,163 L431.8,145 L564.8,145 M564.8,145 L567.8,163 L598.8,163 M598.8,163 L601.8,145 L734.8,145 M734.8,145 L737.8,163 L768.8,163 M768.8,163 L771.8,145 L836.8,145" fill="none"/></g><text x="80.8" y="188.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">tdata</text><g mask="url(#wva7b813m5)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="88.8,193 88.8,175 119.8,175 122.8,184 119.8,193" fill="#a8f0ee"/><text x="105.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="125.8,193 122.8,184 125.8,175 187.8,175 190.8,184 187.8,193" fill="#ffd7a8"/><text x="156.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="193.8,193 190.8,184 193.8,175 221.8,175 224.8,184 221.8,193" fill="#ffd7a8"/><text x="207.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="227.8,193 224.8,184 227.8,175 255.8,175 258.8,184 255.8,193" fill="url(#wva7b813h)"/><polygon points="261.8,193 258.8,184 261.8,175 289.8,175 292.8,184 289.8,193" fill="#a8f0ee"/><text x="275.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="295.8,193 292.8,184 295.8,175 357.8,175 360.8,184 357.8,193" fill="#ffd7a8"/><text x="326.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="363.8,193 360.8,184 363.8,175 391.8,175 394.8,184 391.8,193" fill="#ffd7a8"/><text x="377.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="397.8,193 394.8,184 397.8,175 425.8,175 428.8,184 425.8,193" fill="url(#wva7b813h)"/><polygon points="431.8,193 428.8,184 431.8,175 459.8,175 462.8,184 459.8,193" fill="#a8f0ee"/><text x="445.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="465.8,193 462.8,184 465.8,175 527.8,175 530.8,184 527.8,193" fill="#ffd7a8"/><text x="496.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="533.8,193 530.8,184 533.8,175 561.8,175 564.8,184 561.8,193" fill="#ffd7a8"/><text x="547.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="567.8,193 564.8,184 567.8,175 595.8,175 598.8,184 595.8,193" fill="url(#wva7b813h)"/><polygon points="601.8,193 598.8,184 601.8,175 629.8,175 632.8,184 629.8,193" fill="#a8f0ee"/><text x="615.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="635.8,193 632.8,184 635.8,175 697.8,175 700.8,184 697.8,193" fill="#ffd7a8"/><text x="666.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="703.8,193 700.8,184 703.8,175 731.8,175 734.8,184 731.8,193" fill="#ffd7a8"/><text x="717.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text><polygon points="737.8,193 734.8,184 737.8,175 765.8,175 768.8,184 765.8,193" fill="url(#wva7b813h)"/><polygon points="771.8,193 768.8,184 771.8,175 799.8,175 802.8,184 799.8,193" fill="#a8f0ee"/><text x="785.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="805.8,193 802.8,184 805.8,175 836.8,175 836.8,193" fill="#ffd7a8"/><text x="819.8" y="187.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D</text></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M167.8,196 L173.8,172"/><path d="M173.8,196 L179.8,172"/><path d="M337.8,196 L343.8,172"/><path d="M343.8,196 L349.8,172"/><path d="M507.8,196 L513.8,172"/><path d="M513.8,196 L519.8,172"/><path d="M677.8,196 L683.8,172"/><path d="M683.8,196 L689.8,172"/></g><path d="M28,67 H24 V121 H28" stroke="var(--wave-fg, #222)" stroke-width="1.2" fill="none"/><text x="16" y="98" font-size="11" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" transform="rotate(-90 16 94)">встык</text><path d="M28,142 H24 V196 H28" stroke="var(--wave-fg, #222)" stroke-width="1.2" fill="none"/><text x="16" y="173" font-size="11" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" transform="rotate(-90 16 169)">пузырь</text><text x="462.8" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">Один такт простоя на каждый CplD 256 B: 18 тактов вместо 17</text><text x="462.8" y="215" font-size="12" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">16/17 × 2,0 = 1,88 ГБ/с → 16/18 × 2,0 = 1,78 ГБ/с &lt; 1,82 ГБ/с линка: узким местом стала FPGA</text></svg>
+<!--/WAVE:ch6_bubble-->
+<figcaption>Рис. 6.3. Цена одного пузыря (<code>docs/wave/ch6_bubble.json</code>). Вверху CplD идут встык: H — beat с заголовком, D — beat'ы данных, «|» скрывает середину пакета. Внизу после каждого CplD один такт <code>tvalid</code> = 0. Через пять пакетов нижний поток отстаёт на пять тактов, то есть на 1/18 скорости.</figcaption>
+</figure>
+
+<p>Пузыри появляются в трёх типичных местах. Первое — BRAM без упреждающего чтения: 2 такта латентности между CplD. Второе — FSM, которая тратит такт на формирование заголовка. Третье — арбитр, переключающийся между источниками с холостым тактом. <code>hostmem_completer</code> устроен так, чтобы ни одного из них не было: дескриптор следующего CplD готовится, пока передаётся текущий, а чтения памяти выдаются с опережением (глава 4).</p>
+
+<h3>6.2.3. Что измерено</h3>
+<p>Тестбенч <code>tb_completer</code> подаёт пачки MRd и считает выходные beat'ы completer'а (заголовки плюс данные) за такт при постоянно готовом приёмнике.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.4. Измеренная пропускная способность <code>hostmem_completer</code> (симуляция <code>tb_completer</code>)</caption>
+<tr><th>Нагрузка</th><th class="num">MPS</th><th class="num">Beat'ов/такт</th><th>Комментарий</th></tr>
+<tr><td>64 × MRd 512 B, выровненные</td><td class="num">128 / 256 / 512</td><td class="num">1,0000</td><td>без пузырей ни внутри пакетов, ни между ними</td></tr>
+<tr><td>128 × MRd 4096 B</td><td class="num">256</td><td class="num">1,0000</td><td>деление на 16 CplD без потерь</td></tr>
+<tr><td>256 × MRd 64 B (как выборка SQE)</td><td class="num">256</td><td class="num">1,0000</td><td>короткие запросы подряд</td></tr>
+<tr><td>64 × MRd 512 B со смещением 4–12 B внутри 16-байтного слова</td><td class="num">256</td><td class="num">0,9732</td><td>+1 такт на запрос: выравнивающий сдвигатель выдаёт «хвост»</td></tr>
+<tr><td>256 × MRd 64 B со смещением 4 B</td><td class="num">256</td><td class="num">0,8337</td><td>то же, на коротких запросах заметнее</td></tr>
+</table></div>
+
+<p>Смещённые запросы — не наш рабочий случай: данные SSD читает с адресов, кратных 512 B, а SQE и PRP-списки выровнены на 64 B. Для реального потока completer работает на 1,0 beat'а за такт, то есть на полной скорости шины.</p>
+
+<h3>6.2.4. Store-and-forward в TX-адаптере</h3>
+<p>Ядро 7-series требует, чтобы <code>tvalid</code> не падал внутри пакета (в потоковом режиме это обязательно, и мы соблюдаем правило всегда). Поэтому <code>pcie7x_tx_adapt</code> по умолчанию накапливает пакет целиком в FIFO на 64 beat'а и отдаёт его ядру только после последнего beat'а (<code>STORE_AND_FORWARD</code> = 1).</p>
+<ul>
+<li><b>Латентность</b> растёт на длину пакета: 17 тактов (136 нс) для CplD 256 B.</li>
+<li><b>Пропускная способность не меняется.</b> FIFO вмещает почти четыре таких пакета. Пока ядро забирает пакет N, в FIFO уже накапливается пакет N + 1, и на выходе beat'ы идут встык.</li>
+</ul>
+<p>Условие корректности: глубина FIFO не меньше самого длинного пакета (33 beat'а при MPS 512), иначе store-and-forward заблокируется навсегда. Латентность в 136 нс, как мы увидим в разделе 6.3, на скорость не влияет.</p>
+
+<!-- ============================================================ -->
+<h2 id="s3">6.3. Закон Литтла и окно outstanding-чтений SSD</h2>
+
+<p>Скорость записи определяет SSD: он сам решает, сколько MRd держать в полёте. Если наш ответ медленный, SSD упрётся в своё окно. Закон Литтла (Little's law) связывает три величины:</p>
+<pre><code>N = X · T     (байт в полёте = скорость × время пребывания одного запроса)
+T = L + S / X (латентность до первого байта + передача S байт ответа)</code></pre>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.5. Сколько чтений по 512 B должен держать SSD для 1,82 ГБ/с</caption>
+<tr><th class="num">T (полный путь MRd → последний байт CplD)</th><th class="num">Байт в полёте</th><th class="num">MRd по 512 B</th></tr>
+<tr><td class="num">0,5 мкс</td><td class="num">0,9 KB</td><td class="num">2</td></tr>
+<tr><td class="num">1 мкс</td><td class="num">1,8 KB</td><td class="num">4</td></tr>
+<tr><td class="num">2 мкс</td><td class="num">3,6 KB</td><td class="num">8</td></tr>
+<tr><td class="num">4 мкс</td><td class="num">7,3 KB</td><td class="num">15</td></tr>
+<tr><td class="num">8 мкс</td><td class="num">14,6 KB</td><td class="num">29</td></tr>
+</table></div>
+
+<h3>6.3.1. Наш вклад в латентность</h3>
+
+<figure class="wave">
+<!--WAVE:ch6_completer_latency-->
+<svg xmlns="http://www.w3.org/2000/svg" width="825.6" height="288" viewBox="0 0 825.6 288" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wv10c8efh" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wv10c8efa" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker></defs><path d="M113.6,48 V258 M157.6,48 V258 M201.6,48 V258 M245.6,48 V258 M289.6,48 V258 M333.6,48 V258 M377.6,48 V258 M421.6,48 V258 M465.6,48 V258 M509.6,48 V258 M553.6,48 V258 M597.6,48 V258 M641.6,48 V258 M685.6,48 V258 M729.6,48 V258 M773.6,48 V258 M817.6,48 V258" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="135.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">0</text><text x="179.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">1</text><text x="223.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">2</text><text x="267.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">3</text><text x="311.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">4</text><text x="355.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">5</text><text x="399.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">6</text><text x="443.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">7</text><text x="487.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">8</text><text x="531.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">9</text><text x="575.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">10</text><text x="619.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">11</text><text x="663.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">12</text><text x="707.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">13</text><text x="751.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">14</text><text x="795.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">15</text><text x="105.6" y="67.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">clk</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M113.6,72 L116.6,54 L135.6,54 L138.6,72 L157.6,72 M157.6,72 L160.6,54 L179.6,54 L182.6,72 L201.6,72 M201.6,72 L204.6,54 L223.6,54 L226.6,72 L245.6,72 M245.6,72 L248.6,54 L267.6,54 L270.6,72 L289.6,72 M289.6,72 L292.6,54 L311.6,54 L314.6,72 L333.6,72 M333.6,72 L336.6,54 L355.6,54 L358.6,72 L377.6,72 M377.6,72 L380.6,54 L399.6,54 L402.6,72 L421.6,72 M421.6,72 L424.6,54 L443.6,54 L446.6,72 L465.6,72 M465.6,72 L468.6,54 L487.6,54 L490.6,72 L509.6,72 M509.6,72 L512.6,54 L531.6,54 L534.6,72 L553.6,72 M553.6,72 L556.6,54 L575.6,54 L578.6,72 L597.6,72 M597.6,72 L600.6,54 L619.6,54 L622.6,72 L641.6,72 M641.6,72 L644.6,54 L663.6,54 L666.6,72 L685.6,72 M685.6,72 L688.6,54 L707.6,54 L710.6,72 L729.6,72 M729.6,72 L732.6,54 L751.6,54 L754.6,72 L773.6,72 M773.6,72 L776.6,54 L795.6,54 L798.6,72 L817.6,72" fill="none"/></g><text x="105.6" y="97.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_mrd_tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M113.6,102 L201.6,102 M201.6,102 L204.6,84 L245.6,84 M245.6,84 L248.6,102 L817.6,102" fill="none"/></g><text x="105.6" y="127.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_mrd_tdata</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="113.6,132 113.6,114 198.6,114 201.6,123 198.6,132" fill="url(#wv10c8efh)"/><polygon points="204.6,132 201.6,123 204.6,114 242.6,114 245.6,123 242.6,132" fill="#a8d4ff"/><polygon points="248.6,132 245.6,123 248.6,114 817.6,114 817.6,132" fill="url(#wv10c8efh)"/></g><text x="105.6" y="157.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">rd_en</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M113.6,162 L333.6,162 M333.6,162 L336.6,144 L817.6,144" fill="none"/></g><text x="105.6" y="187.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">rd_data</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="113.6,192 113.6,174 418.6,174 421.6,183 418.6,192" fill="url(#wv10c8efh)"/><polygon points="424.6,192 421.6,183 424.6,174 462.6,174 465.6,183 462.6,192" fill="#ffd7a8"/><text x="443.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m0</text><polygon points="468.6,192 465.6,183 468.6,174 506.6,174 509.6,183 506.6,192" fill="#ffd7a8"/><text x="487.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m1</text><polygon points="512.6,192 509.6,183 512.6,174 550.6,174 553.6,183 550.6,192" fill="#ffd7a8"/><text x="531.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m2</text><polygon points="556.6,192 553.6,183 556.6,174 594.6,174 597.6,183 594.6,192" fill="#ffd7a8"/><text x="575.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m3</text><polygon points="600.6,192 597.6,183 600.6,174 638.6,174 641.6,183 638.6,192" fill="#ffd7a8"/><text x="619.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m4</text><polygon points="644.6,192 641.6,183 644.6,174 682.6,174 685.6,183 682.6,192" fill="#ffd7a8"/><text x="663.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m5</text><polygon points="688.6,192 685.6,183 688.6,174 726.6,174 729.6,183 726.6,192" fill="#ffd7a8"/><text x="707.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m6</text><polygon points="732.6,192 729.6,183 732.6,174 770.6,174 773.6,183 770.6,192" fill="#ffd7a8"/><text x="751.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m7</text><polygon points="776.6,192 773.6,183 776.6,174 817.6,174 817.6,192" fill="#ffd7a8"/><text x="795.6" y="186.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m8</text></g><text x="105.6" y="217.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">m_cpl_tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M113.6,222 L553.6,222 M553.6,222 L556.6,204 L817.6,204" fill="none"/></g><text x="105.6" y="247.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">m_cpl_tdata</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="113.6,252 113.6,234 550.6,234 553.6,243 550.6,252" fill="url(#wv10c8efh)"/><polygon points="556.6,252 553.6,243 556.6,234 594.6,234 597.6,243 594.6,252" fill="#a8f0ee"/><text x="575.6" y="246.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="600.6,252 597.6,243 600.6,234 638.6,234 641.6,243 638.6,252" fill="#ffd7a8"/><text x="619.6" y="246.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m0</text><polygon points="644.6,252 641.6,243 644.6,234 682.6,234 685.6,243 682.6,252" fill="#ffd7a8"/><text x="663.6" y="246.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m1</text><polygon points="688.6,252 685.6,243 688.6,234 726.6,234 729.6,243 726.6,252" fill="#ffd7a8"/><text x="707.6" y="246.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m2</text><polygon points="732.6,252 729.6,243 732.6,234 770.6,234 773.6,243 770.6,252" fill="#ffd7a8"/><text x="751.6" y="246.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m3</text><polygon points="776.6,252 773.6,243 776.6,234 817.6,234 817.6,252" fill="#ffd7a8"/><text x="795.6" y="246.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">m4</text></g><g stroke="var(--wave-edge, #2a6fb0)" stroke-width="1.2" fill="none"><path d="M203.1,93 C379.1,93 379.1,213 555.1,213" marker-end="url(#wv10c8efa)"/><rect x="322.3" y="132" width="113.6" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="379.1" y="142" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">8 тактов = 64 нс</text></g><text x="465.6" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">hostmem_completer: заголовок MRd принят → первый beat CplD через 8 тактов</text><text x="465.6" y="274" font-size="12" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">Чтение BRAM — 2 такта; затем FIFO возврата, dw_shift и склейка с заголовком. Дальше 1 beat/такт</text></svg>
+<!--/WAVE:ch6_completer_latency-->
+<figcaption>Рис. 6.4. Латентность <code>hostmem_completer</code> (<code>docs/wave/ch6_completer_latency.json</code>, упрощённо). Заголовок MRd принят на такте 2. Через несколько тактов выдаётся первое чтение памяти, данные возвращаются через 2 такта, проходят FIFO возврата и выравнивающий сдвигатель. Первый beat CplD (заголовок) выходит на такте 10, через 8 тактов. Дальше — 1 beat за такт. Значение 8 тактов измерено в <code>tb_completer</code>.</figcaption>
+</figure>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 270" style="width:100%;height:auto;max-width:760px" role="img" aria-label="Путь MRd и CplD через ПЛИС и оценки латентности" font-size="12">
+<defs><marker id="f65" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+<g fill="var(--note-bg)" stroke="var(--accent2)" stroke-width="1.5">
+<rect x="15" y="40" width="160" height="56" rx="6"/><rect x="15" y="160" width="160" height="56" rx="6"/>
+</g>
+<g fill="none" stroke="var(--muted)" stroke-dasharray="5,3">
+<rect x="200" y="40" width="160" height="56" rx="6"/><rect x="200" y="160" width="160" height="56" rx="6"/>
+</g>
+<g fill="var(--code-bg)" stroke="var(--accent)" stroke-width="1.5">
+<rect x="385" y="40" width="160" height="56" rx="6"/><rect x="570" y="40" width="175" height="56" rx="6"/>
+<rect x="570" y="160" width="175" height="56" rx="6"/><rect x="385" y="160" width="160" height="56" rx="6"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="95" y="64" font-weight="700">SSD</text><text x="95" y="82" font-size="11">выдаёт MRd 512 B</text>
+<text x="280" y="64">линк + pcie_7x RX</text><text x="280" y="82" font-size="11" fill="var(--muted)">≈ 0,1–0,3 мкс (оценка)</text>
+<text x="465" y="64" font-family="monospace">rx_adapt + demux</text><text x="465" y="82" font-size="11">≈ 3–6 тактов</text>
+<text x="657" y="64" font-family="monospace">hostmem_completer</text><text x="657" y="82" font-size="11"><tspan font-weight="700">8 тактов</tspan> (измерено)</text>
+<text x="657" y="184" font-family="monospace">tlp_tx_arb</text><text x="657" y="202" font-size="11">≈ 1–2 такта</text>
+<text x="465" y="184" font-family="monospace">pcie7x_tx_adapt</text><text x="465" y="202" font-size="11">2 такта + S&amp;F 17 тактов</text>
+<text x="280" y="184">pcie_7x TX + линк</text><text x="280" y="202" font-size="11" fill="var(--muted)">138 нс/CplD + ≈ 0,1–0,3 мкс</text>
+<text x="95" y="184" font-weight="700">SSD</text><text x="95" y="202" font-size="11">получил данные</text>
+</g>
+<g stroke="var(--fg)" stroke-width="1.4" fill="none">
+<path d="M175,68 H196" marker-end="url(#f65)"/><path d="M360,68 H381" marker-end="url(#f65)"/><path d="M545,68 H566" marker-end="url(#f65)"/>
+<path d="M732,96 V156" marker-end="url(#f65)"/>
+<path d="M570,188 H549" marker-end="url(#f65)"/><path d="M385,188 H364" marker-end="url(#f65)"/><path d="M200,188 H179" marker-end="url(#f65)"/>
+</g>
+<path d="M385,118 H715" stroke="var(--accent)" stroke-width="1.2" fill="none"/>
+<path d="M385,112 V124 M715,112 V124" stroke="var(--accent)" stroke-width="1.2"/>
+<text x="550" y="138" text-anchor="middle" font-size="11" fill="var(--fg)">наша логика: ≈ 15–18 тактов ≈ 0,12–0,15 мкс + store-and-forward ≈ 0,14 мкс</text>
+<text x="380" y="245" text-anchor="middle" font-size="11.5" fill="var(--fg)">Полный путь T, видимый SSD: ≈ 0,5–1,5 мкс (оценка) → нужно лишь 2–6 чтений по 512 B в полёте</text>
+<text x="380" y="263" text-anchor="middle" font-size="10.5" fill="var(--muted)">синие — наши модули; пунктир — аппаратный блок и линк (не измерено); оранжевые — SSD</text>
+</svg>
+<figcaption>Рис. 6.5. Путь одного чтения SSD через ПЛИС. Измерено только число тактов completer'а; остальные значения — оценки по структуре модулей (адаптеры, арбитр) или по порядку величины (блок <code>pcie_7x</code> и линк).</figcaption>
+</figure>
+
+<p>Сложим наш вклад: ≈ 15–18 тактов собственной логики (≈ 120–150 нс) плюс store-and-forward первого CplD (17 тактов, 136 нс). Итого ≈ 0,25–0,3 мкс; без store-and-forward — ≈ 0,15 мкс. Добавим аппаратный блок PCIe и SerDes с обеих сторон и время передачи 512 B (≈ 0,28 мкс). Полный путь, который видит SSD, — порядка 0,5–1,5 мкс (оценка). По табл. 6.5 этому соответствуют 2–6 одновременных MRd по 512 B.</p>
+<p>Современные SSD держат в полёте десятки чтений: 32 тега без Extended Tags, до 256 с ними. Для сравнения: при 32 тегах × 512 B = 16 KB полная скорость сохраняется вплоть до T ≈ 9 мкс. Отсюда главный вывод раздела.</p>
+
+<div class="box ok"><span class="t">Вывод</span> При ответе из BRAM <b>скорость задаёт SSD, а не латентность хоста</b>. Латентность нашей логики в 0,25 мкс в разы меньше той, которую SSD «прощает». Важно другое: никогда не задерживать CplD (completion timeout у SSD — от 50 мкс до 50 мс) и не ограничивать приём MRd. Модуль <code>hostmem_completer</code> принимает до 16 запросов. <code>rx_np_ok</code> опускается, только когда в его FIFO остаётся меньше 2 мест. Для DDR-варианта (глава 8) латентность вырастет до 0,5–2 мкс — и это всё ещё в пределах окна SSD.</div>
+
+<!-- ============================================================ -->
+<h2 id="s4">6.4. Размер команды и глубина очереди</h2>
+
+<p>Закон Литтла работает и на уровне команд. Одна команда 128 KiB передаётся по линку за 131 072 B / 1,82 ГБ/с ≈ <b>72 мкс</b>. Но от doorbell'а до CQE проходит больше: SSD нужно выбрать SQE и PRP, прочитать данные и записать их в кэш или NAND. Чтобы линк не простаивал, в полёте должно быть столько команд, чтобы их суммарное время перекрывало латентность одной команды:</p>
+<pre><code>QD ≥ X · T_cmd / SLOT_BYTES</code></pre>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.6. Необходимая глубина очереди для 1,82 ГБ/с при команде 128 KiB</caption>
+<tr><th class="num">Латентность команды T<sub>cmd</sub></th><th class="num">QD</th><th>Комментарий</th></tr>
+<tr><td class="num">100 мкс</td><td class="num">2</td><td>запись в DRAM-кэш почти без очереди</td></tr>
+<tr><td class="num">200 мкс</td><td class="num">3</td><td>типичная запись в SLC-кэш (оценка)</td></tr>
+<tr><td class="num">500 мкс</td><td class="num">7</td><td>предел нашей конфигурации</td></tr>
+<tr><td class="num">1 мс</td><td class="num">14</td><td>нужно больше слотов или DDR</td></tr>
+<tr><td class="num">2 мс</td><td class="num">28</td><td>«икота» при сборке мусора</td></tr>
+<tr><td class="num">10 мс</td><td class="num">139</td><td>пауза GC (pl-nvme измерил 10,5 мс) — только буфер</td></tr>
+</table></div>
+
+<p>У нас 8 слотов, но при непрерывном потоке один слот всегда заполняется. Значит, в полёте не больше 7 команд, и источник не тормозится, пока T<sub>cmd</sub> ≤ 7 × 72 ≈ <b>500 мкс</b>. Design Gateway достигает 3,3 ГБ/с на Gen3 с буфером всего 256 KB: в нормальном режиме современным SSD хватает небольшой очереди.</p>
+
+<h3>6.4.1. Буферизация: 1 МиБ ≈ 580 мкс</h3>
+<p>Кольцо — это одновременно очередь команд и буфер на случай паузы SSD. Пока SSD молчит, источник продолжает писать в свободные слоты:</p>
+<pre><code>t_buf = N_SLOTS · SLOT_BYTES / R = 1 048 576 B / 1,8 ГБ/с ≈ 583 мкс</code></pre>
+<p>Здесь R — скорость источника. Тонкость: слот освобождается по CQE, а не по чтению данных. Поэтому в установившемся режиме часть кольца уже занята командами в полёте, и реальный запас на паузу меньше: 583 мкс минус нормальная латентность команды.</p>
+
+<h3>6.4.2. Паузы GC и DDR</h3>
+<p>Пауза SSD на сборку мусора длится до 10 мс и больше (pl-nvme: пиковая латентность записи 10,5 мс). Чтобы её пережить, нужен буфер:</p>
+<pre><code>B ≥ R · T_pause = 1,8 ГБ/с · 10 мс = 18 МБ
+после паузы буфер опустошается за  t_rec = B / (X_ssd − R)</code></pre>
+<p>Это в 18 раз больше всей BRAM кристалла, поэтому нужна DDR. На KC705 есть модуль DDR3 SODIMM на 1 ГБ (64 бит, DDR3-1600, пик 12,8 ГБ/с). Кольцу нужно R на запись плюс X на чтение, ≈ 3,6 ГБ/с: это ≈ 30 % пика, реально для длинных пачек через MIG (оценка). 1 ГБ хватает на паузу ≈ 0,5 с.</p>
+<p>Второе условие видно из t<sub>rec</sub>: средняя скорость источника должна быть строго меньше устойчивой скорости SSD. Если R = 1,5 ГБ/с, а SSD держит 1,75 ГБ/с, буфер в 15 МБ после паузы 10 мс опустеет за 15 МБ / 0,25 ГБ/с = 60 мс. Если R = X<sub>ssd</sub>, буфер не опустеет никогда, и вторая пауза станет переполнением. DDR-кольцо — первая лабораторная работа главы 8.</p>
+
+<div class="box warn"><span class="t">Типичная ошибка</span> Увеличить QD в надежде пережить паузы GC. Глубина очереди помогает против <em>латентности</em>: SSD видит больше работы и сам распараллеливает её по кристаллам NAND. Против <em>паузы</em>, когда SSD не принимает ничего, помогает только объём буфера.</div>
+
+<!-- ============================================================ -->
+<h2 id="s5">6.5. Сторона SSD</h2>
+
+<p>Любой современный NVMe SSD быстрее нашего линка — <em>пока пишет в SLC-кэш</em>. Регистратор пишет непрерывно десятки и сотни гигабайт, поэтому важно, что происходит после заполнения кэша.</p>
+
+<ul>
+<li><b>SLC-кэш и обрыв.</b> TLC- и QLC-накопители сначала пишут в часть ячеек в режиме SLC (1 бит на ячейку — быстро). Когда кэш кончается, скорость падает до «родной» скорости TLC/QLC, иногда в разы. Динамический кэш к тому же уменьшается по мере заполнения диска.</li>
+<li><b>DRAM-less и HMB.</b> Накопители без собственной DRAM просят у хоста кусок памяти (Host Memory Buffer). Мы HMB не даём (это законно), и такие диски работают медленнее. Для потоковой записи выбирайте накопители с DRAM.</li>
+<li><b>Температура.</b> На 1,8 ГБ/с контроллер и NAND греются. Бытовые M.2 начинают троттлинг при ≈ 70–80 °C (не проверено для конкретных моделей). Нужен радиатор. Температуру показывает SMART (Get Log Page, LID 02h) — в нашем хосте не реализовано.</li>
+<li><b>Состояние диска.</b> Освобождение пространства (Deallocate/Trim, Format NVM) перед сеансом восстанавливает кэш и снижает GC. pl-nvme обрезает весь регион записи перед захватом.</li>
+<li><b>Методика проверки.</b> Нули и повторяющиеся шаблоны некоторые контроллеры сжимают, и тогда цифры завышены. Пишите псевдослучайные данные, объёмом больше кэша, на прогретом диске.</li>
+</ul>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.7. Устойчивая запись после заполнения кэша — по публикациям (проверяйте на своём экземпляре)</caption>
+<tr><th>Накопитель</th><th>Тип</th><th>После заполнения кэша</th><th>Источник</th><th>Для 1,6+ ГБ/с на Gen2</th></tr>
+<tr><td>Samsung 970 PRO</td><td>MLC, DRAM</td><td>обрыва нет, ≈ 2,0 ГБ/с (pl-nvme: ≈ 2,2 ГБ/с на Gen3)</td><td>Tom's Hardware, pl-nvme</td><td>хорошо</td></tr>
+<tr><td>Samsung 980 PRO / 990 PRO, 2 TB</td><td>TLC, DRAM</td><td>≈ 2 ГБ/с (проверять по модели и ёмкости)</td><td>AnandTech, Tom's Hardware</td><td>хорошо</td></tr>
+<tr><td>Micron 7400/7450, Samsung PM9A3, Kioxia XD</td><td>TLC, DRAM, PLP</td><td>устойчивая запись, защита от пропадания питания</td><td>спецификации производителей</td><td>лучший выбор; часто M.2 22110 или U.2 — проверьте адаптер</td></tr>
+<tr><td>Samsung 970 EVO Plus 1 TB</td><td>TLC, DRAM</td><td>≈ 42 GB кэша, затем ≈ 1,7 ГБ/с; меньшие ёмкости медленнее</td><td>Tom's Hardware</td><td>на грани</td></tr>
+<tr><td>WD SN750</td><td>TLC, DRAM</td><td>≈ 1,0 ГБ/с устойчиво</td><td>pl-nvme</td><td>нет</td></tr>
+<tr><td>Seagate FireCuda 520</td><td>TLC</td><td>0,5–1,0 ГБ/с при записи &gt; 100 GB на частично заполненный диск</td><td>pl-nvme</td><td>нет</td></tr>
+<tr><td>WD Black SN770 1 TB</td><td>TLC, DRAM-less, HMB</td><td>≈ 130 GB при ≈ 2 ГБ/с, затем ≈ 0,4 ГБ/с</td><td>Tom's Hardware, PC Gamer</td><td>нет</td></tr>
+<tr><td>QLC: Intel 660p, Crucial P1/P3/P310</td><td>QLC</td><td>≈ 0,1–0,15 ГБ/с (не проверено)</td><td>обзоры</td><td>избегать</td></tr>
+</table></div>
+
+<p>Правило выбора: устойчивая скорость записи после кэша — <b>не ниже 1,8 ГБ/с с запасом</b>, DRAM на борту, радиатор. Скорость по паспорту (3,5 или 7 ГБ/с) для нас ничего не значит: Gen2 x4 всё равно отрежет её до 1,82.</p>
+
+<!-- ============================================================ -->
+<h2 id="s6">6.6. Методика измерений</h2>
+
+<h3>6.6.1. Счётчики в RTL</h3>
+<p><code>nvme_host_core</code> выводит набор счётчиков в домене <code>user_clk</code>. Их можно подключить к VIO, ILA или к своему регистровому интерфейсу.</p>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.8. Статистика <code>nvme_host_core</code></caption>
+<tr><th>Сигнал</th><th class="num">Бит</th><th>Что считает</th><th>Для чего</th></tr>
+<tr><td><code>stat_beats_in</code></td><td class="num">64</td><td>beat'ы (по 16 B), принятые в кольцо</td><td>скорость источника: ΔB = 16 · Δbeats</td></tr>
+<tr><td><code>stat_stall_cycles</code></td><td class="num">32</td><td>такты <code>user_clk</code>, когда источник ждал (<code>tvalid</code> &amp;&amp; !<code>tready</code>)</td><td>доля времени, когда кольцо было полно; переполнится через 2<sup>32</sup> · 8 нс ≈ 34 с непрерывного ожидания</td></tr>
+<tr><td><code>stat_bytes_done</code>, <code>stat_cmds_done</code></td><td class="num">64</td><td>успешно завершённые Write: байты и команды</td><td>скорость записи на диск</td></tr>
+<tr><td><code>stat_max_latency</code></td><td class="num">32</td><td>максимум тактов от SQ doorbell'а до сбора CQE</td><td>худшая латентность команды: × 8 нс</td></tr>
+<tr><td><code>stat_sq_full_stall_cycles</code></td><td class="num">32</td><td>такты, когда слот готов, но SQ полна</td><td>при <code>N_SLOTS</code> ≤ 63 должен быть 0</td></tr>
+<tr><td><code>stat_cmd_errors</code>, <code>stat_last_status</code></td><td class="num">32, 16</td><td>CQE с ненулевым статусом</td><td>ошибки накопителя</td></tr>
+<tr><td><code>stat_unexpected_cpl</code></td><td class="num">16</td><td>completion без ожидающего запроса</td><td>признак ошибки requester'а или таймаутов</td></tr>
+</table></div>
+
+<p><b>Как считать ГБ/с.</b> Возьмите два снимка счётчика с известным интервалом:</p>
+<pre><code>X = (bytes_done(t2) − bytes_done(t1)) / (t2 − t1)
+при интервале в тактах:  X = Δbytes · 125·10⁶ / Δcycles   [Б/с]</code></pre>
+<p>Свободно бегущего счётчика тактов среди выходов нет. Интервал задайте снаружи: таймер VIO, два триггера ILA с известным расстоянием или собственный счётчик <code>stat_cycles</code> (простое упражнение из главы 8). Пример: за 1 с <code>bytes_done</code> выросло на 1,70·10⁹ — это 1,70 ГБ/с, или 1,70·10⁹ / 131 072 ≈ 12 970 команд в секунду.</p>
+<p>Сравнение счётчиков даёт первую диагностику. Если Δ<code>beats_in</code> · 16 ≈ Δ<code>bytes_done</code>, а <code>stall_cycles</code> растёт, источник упирается в диск. Если <code>stall_cycles</code> не растёт, источник сам медленнее.</p>
+
+<h3>6.6.2. Что смотреть в ILA на интерфейсе <code>pcie_7x</code></h3>
+<p>Счётчики NVMe-уровня говорят, <em>сколько</em>. Чтобы понять, <em>почему</em>, нужно смотреть на границу с ядром. По примеру LiteNVMe полезно добавить три счётчика на TX-интерфейсе — их сумма равна числу тактов:</p>
+<ul>
+<li><b>busy</b> = <code>s_axis_tx_tvalid &amp; s_axis_tx_tready</code> — beat передан;</li>
+<li><b>wait</b> = <code>tvalid &amp; !tready</code> — нам есть что слать, но ядро не берёт (линк занят, нет кредитов, вставка DLLP/SKP);</li>
+<li><b>idle</b> = <code>!tvalid</code> — слать нечего.</li>
+</ul>
+<p>Доля busy (duty) пересчитывается в скорость так: X ≈ duty · 2,0 ГБ/с · 16/17 при MPS 256. Когда упираемся в линк, duty ≈ 14,6 / 15,1 ≈ <b>0,96–0,97</b>, а wait ≈ 0,03.</p>
+<p>Дополнительно смотрите:</p>
+<ul>
+<li><code>tx_buf_av</code> — свободные буферы передачи ядра; часто около нуля — линк насыщен;</li>
+<li><code>rx_np_ok</code> — если опускается, completer не успевает принимать MRd;</li>
+<li><code>m_axis_rx_tready</code> — RX-адаптер обязан держать его высоким почти всегда;</li>
+<li>частоту MRd на RX (по <code>m_axis_rx_tuser[14]</code> — начало TLP — и типу в заголовке) и их длину — так видно окно SSD;</li>
+<li>сигналы кредитов ядра (<code>fc_sel</code>, <code>fc_ph</code>, <code>fc_pd</code>, <code>fc_nph</code> и др.) — если хочется видеть кредиты партнёра напрямую.</li>
+</ul>
+
+<h3>6.6.3. Во что упёрлись</h3>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 370" style="width:100%;height:auto;max-width:760px" role="img" aria-label="Схема диагностики узкого места" font-size="12">
+<defs><marker id="f66" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+<rect x="250" y="8" width="260" height="34" rx="17" fill="var(--note-bg)" stroke="var(--accent)" stroke-width="1.5"/>
+<text x="380" y="30" text-anchor="middle" font-weight="700" fill="var(--fg)">Скорость ниже ожидаемой</text>
+<g fill="var(--code-bg)" stroke="var(--fg)">
+<rect x="200" y="70" width="360" height="48" rx="6"/><rect x="200" y="150" width="360" height="48" rx="6"/><rect x="200" y="230" width="360" height="48" rx="6"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="380" y="90">TX: duty (tvalid &amp; tready) ≥ 0,9,</text><text x="380" y="107">wait заметен?</text>
+<text x="380" y="170">MRd ждут в очереди completer'а или rx_np_ok = 0,</text><text x="380" y="187">а на TX есть такты idle?</text>
+<text x="380" y="250">Кольцо полно: stall_cycles растёт,</text><text x="380" y="267">slots_used = N_SLOTS (в ILA)?</text>
+</g>
+<g fill="var(--ok-bg)" stroke="#2f9e55">
+<rect x="590" y="66" width="160" height="56" rx="6"/>
+</g>
+<g fill="var(--warn-bg)" stroke="var(--accent2)">
+<rect x="590" y="146" width="160" height="56" rx="6"/><rect x="590" y="226" width="160" height="56" rx="6"/><rect x="200" y="310" width="360" height="48" rx="6"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="670" y="88" font-weight="700">Упёрлись в линк</text><text x="670" y="106" font-size="11">низко? Gen1, x2, MPS 128</text>
+<text x="670" y="168" font-weight="700">Упёрлись в себя</text><text x="670" y="186" font-size="11">пузыри, FIFO, арбитр</text>
+<text x="670" y="248" font-weight="700">Упёрлись в SSD</text><text x="670" y="266" font-size="11">кэш, GC, температура, QD</text>
+<text x="380" y="330" font-weight="700">Упёрлись в источник</text><text x="380" y="348" font-size="11">beats_in растёт медленно, stall_cycles = 0, SSD простаивает</text>
+</g>
+<g stroke="var(--fg)" stroke-width="1.3" fill="none">
+<path d="M380,42 V66" marker-end="url(#f66)"/>
+<path d="M380,118 V146" marker-end="url(#f66)"/><path d="M380,198 V226" marker-end="url(#f66)"/><path d="M380,278 V306" marker-end="url(#f66)"/>
+<path d="M560,94 H586" marker-end="url(#f66)"/><path d="M560,174 H586" marker-end="url(#f66)"/><path d="M560,254 H586" marker-end="url(#f66)"/>
+</g>
+<g font-size="11" fill="var(--muted)">
+<text x="566" y="88">да</text><text x="566" y="168">да</text><text x="566" y="248">да</text>
+<text x="386" y="136">нет</text><text x="386" y="216">нет</text><text x="386" y="296">нет</text>
+</g>
+<text x="20" y="100" font-size="11" fill="var(--muted)">1. смотрим TX-интерфейс</text>
+<text x="20" y="180" font-size="11" fill="var(--muted)">2. смотрим completer</text>
+<text x="20" y="260" font-size="11" fill="var(--muted)">3. смотрим кольцо</text>
+</svg>
+<figcaption>Рис. 6.6. Порядок диагностики узкого места. Сначала граница с ядром (duty TX), затем очередь completer'а, затем заполнение кольца. «Упёрлись в линк» — нормальное состояние; если при этом скорость всё же низкая, неверно обучен или настроен сам линк.</figcaption>
+</figure>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.9. Признаки четырёх видов узкого места</caption>
+<tr><th>Узкое место</th><th>TX duty / wait / idle</th><th>MRd и completer</th><th>Кольцо и счётчики</th></tr>
+<tr><td><b>Линк</b></td><td>≈ 0,96–0,97 / ≈ 0,03 / ≈ 0</td><td>MRd много, очередь completer'а не пуста, <code>tx_buf_av</code> мал</td><td>скорость ≈ потолку табл. 6.2</td></tr>
+<tr><td><b>SSD</b></td><td>низкий / ≈ 0 / большой</td><td>MRd приходят редко, очередь пуста, <code>rx_np_ok</code> = 1</td><td><code>stall_cycles</code> растёт, все слоты заняты (<code>slots_used</code> в ILA), <code>max_latency</code> большой</td></tr>
+<tr><td><b>Мы сами</b></td><td>есть idle при ожидающих MRd</td><td><code>rx_np_ok</code> падает или <code>m_axis_rx_tready</code> = 0</td><td>скорость ниже линка при свободном кольце</td></tr>
+<tr><td><b>Источник</b></td><td>низкий / ≈ 0 / большой</td><td>MRd редки — SSD нечего читать</td><td><code>stall_cycles</code> = 0, кольцо почти пусто</td></tr>
+</table></div>
+
+<div class="box"><span class="t">Что показывает симуляция</span> Системный тест <code>tb_top</code> с моделью SSD записывает 1 МиБ и печатает долю beat'ов на TX: <b>0,914 beat'а за такт</b>, ≈ 1,61 ГБ/с полезных данных. Окно измерения — от первого до последнего CplD с данными. В него входят разгон, выборки SQE и PRP и паузы, которые сама модель SSD вставляет между MRd. Это проверка того, что хост «не тормозит» при реалистичном поведении партнёра, а не предсказание скорости на железе. На железе используйте счётчики и ILA, как описано выше.</div>
+
+<!-- ============================================================ -->
+<h2 id="s7">6.7. Чек-лист оптимизаций и типичные причины низкой скорости</h2>
+
+<div style="overflow-x:auto"><table>
+<caption>Табл. 6.10. Типичные причины низкой скорости записи</caption>
+<tr><th>#</th><th>Симптом</th><th>Причина</th><th>Цена</th><th>Что делать</th></tr>
+<tr><td>1</td><td>≈ 0,9 ГБ/с, duty высокий</td><td>линк обучился на Gen1 (2,5 GT/s) или x2</td><td>−50 %</td><td>проверить <code>status_gen2</code>, <code>status_link_width</code>; общий REFCLK, линии на FMC</td></tr>
+<tr><td>2</td><td>≈ 1,70 ГБ/с вместо 1,82</td><td>MPS 128: не записан DevCtl.MPS Root Port через <code>cfg_mgmt</code> или SSD поддерживает только 128</td><td>−7 %</td><td>проверить <code>rp_cfg_init</code> и MPSS; MPS обеих сторон одинаков</td></tr>
+<tr><td>3</td><td>тихие таймауты, admin-команды не завершаются</td><td>MPS поднят только у одной стороны или выше значения в GUI ядра</td><td>не работает</td><td>MPS = min(MPSS, <code>MPS_CAP_CODE</code>) на обеих сторонах; GUI = <code>MPS_CAP_CODE</code></td></tr>
+<tr><td>4</td><td>≈ 1,64 ГБ/с при MPS 256</td><td>MRRS = 128: каждый CplD не больше запроса, то есть 128 B; MRd вчетверо больше</td><td>−10 %</td><td>MRRS ≥ 512 (у нас <code>MRRS_CODE</code> = 2)</td></tr>
+<tr><td>5</td><td>SSD выдаёт мало MRd, <code>rx_np_ok</code> часто 0</td><td>completer не успевает, или ядро объявляет мало NP-кредитов</td><td>до −50 %</td><td>не задерживать MRd; уровень производительности RX-буфера ядра «High»</td></tr>
+<tr><td>6</td><td>duty ≈ 0,9, idle между CplD</td><td>пузырь на CplD: BRAM без упреждения, лишний такт FSM или арбитра</td><td>−5 % за такт/CplD</td><td>проверить в симуляции beat'ы/такт (≥ 0,99); упреждающее чтение</td></tr>
+<tr><td>7</td><td>ошибки ядра на TX, «рваные» пакеты</td><td>TX-адаптер в cut-through, источник с пузырями внутри пакета</td><td>не работает</td><td><code>STORE_AND_FORWARD</code> = 1, FIFO ≥ самого длинного пакета</td></tr>
+<tr><td>8</td><td>запись останавливается ровно после 63 команд (≈ 7,9 МиБ)</td><td>не отправляется CQ head doorbell: SSD считает CQ полной</td><td>остановка</td><td>MWr CQ1HDBL после сбора CQE</td></tr>
+<tr><td>9</td><td>—</td><td>«doorbell на каждую команду дорог»</td><td>≈ 0,02 %</td><td>не проблема: 24 B на 128 KiB; объединение и так встроено</td></tr>
+<tr><td>10</td><td>скорость падает через десятки секунд</td><td>кончился SLC-кэш или троттлинг по температуре</td><td>в разы</td><td>другой SSD (табл. 6.7), радиатор, Trim перед сеансом</td></tr>
+<tr><td>11</td><td>редкие остановки источника на 5–20 мс</td><td>паузы GC больше буфера 0,58 мс</td><td>потеря данных, если источник не умеет ждать</td><td>DDR-кольцо (глава 8), R &lt; X<sub>ssd</sub></td></tr>
+<tr><td>12</td><td>цифры выше 1,82 ГБ/с или «слишком хорошие»</td><td>сжимаемые данные или запись, подтверждённая из кэша</td><td>—</td><td>псевдослучайные данные, объём больше кэша, проверка чтением на ПК</td></tr>
+<tr><td>13</td><td>скорость ≈ R &lt; 1,8, <code>stall_cycles</code> = 0</td><td>источник медленнее линка: 16 B × f<sub>data</sub> &lt; 1,82 ГБ/с</td><td>—</td><td>f<sub>data</sub> ≥ 114 МГц при непрерывном <code>tvalid</code></td></tr>
+<tr><td>14</td><td>QD всегда 1–2, скорость низкая</td><td>слот подаётся с задержкой: условие подачи, <code>busy</code> не сбрасывается</td><td>в разы</td><td>смотреть <code>slot_full</code>, <code>busy</code>, doorbell в ILA</td></tr>
+</table></div>
+
+<div class="box task"><span class="t">Минимальный план оптимизации</span>
+<ol>
+<li>Убедиться, что линк — Gen2 x4, а MPS = 256 на обеих сторонах.</li>
+<li>В симуляции добиться 1,0 beat'а за такт на выходе completer'а и ≥ 0,9 на TX в системном тесте.</li>
+<li>На железе измерить duty TX: ≥ 0,95 — дальше оптимизировать хост бессмысленно.</li>
+<li>Выбрать SSD с устойчивой записью ≥ 1,8 ГБ/с, поставить радиатор, освободить диск перед сеансом.</li>
+<li>Если источник не умеет ждать — DDR-кольцо на десятки мегабайт.</li>
+<li>Только после этого — MPS 512 (+3,8 %), если SSD поддерживает.</li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8">6.8. Вопросы для самопроверки и задачи</h2>
+
+<div class="box task"><span class="t">Вопросы для самопроверки</span>
+<ol>
+<li>Из каких полей складываются 20 байт накладных расходов CplD на линке? Какие из них добавляет канальный, а какие физический уровень?</li>
+<li>Почему DLLP от нашего Root Port пропорциональны числу MRd от SSD, хотя данные идут в другую сторону?</li>
+<li>Шина 128 бит × 125 МГц и линк x4 Gen2 — оба 2,0 ГБ/с. Почему шина всё-таки быстрее линка с учётом пакетов и на сколько?</li>
+<li>Почему одного пустого такта на каждый CplD достаточно, чтобы ПЛИС стала узким местом при любом MPS?</li>
+<li>Store-and-forward в TX-адаптере увеличивает латентность на 17 тактов. Почему это не снижает пропускную способность? При каком условии store-and-forward заблокируется?</li>
+<li>По закону Литтла: SSD держит 4 чтения по 512 B, полный путь — 1 мкс. Хватит ли этого для 1,82 ГБ/с? А 2 мкс?</li>
+<li>Почему глубина очереди не помогает пережить паузу GC в 10 мс, а объём буфера помогает?</li>
+<li>TX duty = 0,62, wait ≈ 0, MRd приходят редко, <code>stall_cycles</code> растёт. Куда смотреть дальше?</li>
+</ol>
+</div>
+
+<h3>Расчётные задачи с ответами</h3>
+
+<p><b>Задача 1.</b> SSD поддерживает MPSS = 512 B. Вы перенастроили ядро и <code>MPS_CAP_CODE</code> на 512. Найдите потолок шины ПЛИС, потолок линка (MRRS = 512) и выигрыш относительно MPS 256. Что ещё нужно проверить в RTL?</p>
+<details><summary>Ответ</summary>
+<ul>
+<li>Шина: CplD = 3 + 128 = 131 DW → 33 beat'а, из них 32 — данные: 32/33 · 2,0 = <b>1,939 ГБ/с</b>.</li>
+<li>Линк: MRd 512 B → один CplD: 532 B + 8 B DLLP = 540 B. 512/540 · 2,0 · 0,997 ≈ <b>1,89 ГБ/с</b>.</li>
+<li>Выигрыш: 1,89 / 1,82 ≈ +3,8 %. Запас шины над линком: 33 такта = 264 нс против 540 B / 2,0 = 270 нс на линке — по-прежнему меньше одного такта на CplD.</li>
+<li>В RTL: FIFO TX-адаптера должно вмещать пакет из 33 beat'ов (по умолчанию 64 — достаточно). Completer поддерживает MPS 512 (<code>mps_code</code> = 2, проверено в <code>tb_completer</code>). GUI ядра и DevCtl обеих сторон — 512.</li>
+</ul>
+</details>
+
+<p><b>Задача 2.</b> Студент заменил BRAM-кольцо на DDR3 без кэша упреждения. Латентность completer'а выросла до 1,5 мкс, а полный путь T, видимый SSD, — до 2,5 мкс. SSD держит 8 чтений по 512 B. Какую скорость он получит? Сколько чтений нужно для 1,82 ГБ/с? Что изменится, если SSD использует Extended Tags и держит 32 чтения?</p>
+<details><summary>Ответ</summary>
+<ul>
+<li>По Литтлу: X = N · S / T = 8 · 512 B / 2,5 мкс = 4096 / 2,5·10⁻⁶ ≈ <b>1,64 ГБ/с</b> — ниже потолка 1,82 на 10 %.</li>
+<li>Для 1,82 ГБ/с: N ≥ X · T / S = 1,82·10⁹ · 2,5·10⁻⁶ / 512 ≈ 8,9 → <b>9 чтений</b>.</li>
+<li>С 32 чтениями: 32 · 512 / 2,5 мкс ≈ 6,5 ГБ/с &gt; 1,82 — упираемся в линк; хватает с четырёхкратным запасом.</li>
+<li>Вывод: DDR без упреждения рискованна для SSD с небольшим окном. Простое средство — FIFO упреждающего чтения из DDR в BRAM для слота, который сейчас читает SSD: адреса известны заранее (слот k читается последовательно).</li>
+</ul>
+</details>
+
+<p><b>Задача 3.</b> Источник выдаёт R = 1,5 ГБ/с, может ждать не более 50 мкс (у него свой FIFO на 75 KB). SSD устойчиво пишет 1,75 ГБ/с, но раз в 2 с делает паузу на 12 мс. Хватит ли кольца 1 МиБ? Какой нужен буфер? Успеет ли он опустеть до следующей паузы?</p>
+<details><summary>Ответ</summary>
+<ul>
+<li>Кольцо 1 МиБ + FIFO источника 75 KB ≈ 1,12 МБ закрывают 1,12 МБ / 1,5 ГБ/с ≈ 0,75 мс. Пауза 12 мс — в 16 раз больше: <b>не хватит</b>, данные будут потеряны.</li>
+<li>Нужный буфер: B ≥ R · T<sub>pause</sub> = 1,5 ГБ/с · 12 мс = <b>18 МБ</b>, плюс запас на нормальную латентность команд (≈ 1 МиБ) — берём 32 МБ DDR.</li>
+<li>Опустошение: t<sub>rec</sub> = 18 МБ / (1,75 − 1,5) ГБ/с = <b>72 мс</b> ≪ 2 с. Успеет.</li>
+<li>Если бы источник выдавал 1,75 ГБ/с, t<sub>rec</sub> стремилось бы к бесконечности: каждая пауза добавляла бы 21 МБ к заполнению, и любой конечный буфер рано или поздно переполнился бы.</li>
+</ul>
+</details>
+
+<p><b>Задача 4 (диагностика).</b> За интервал 2,5·10⁸ тактов (2 с) получено: Δ<code>bytes_done</code> = 2,9·10⁹ B, TX: busy = 1,93·10⁸, wait = 0,4·10⁷, idle = 5,3·10⁷ тактов, <code>stall_cycles</code> вырос на 1,1·10⁸, <code>rx_np_ok</code> всё время 1. Найдите скорость, duty и вид узкого места.</p>
+<details><summary>Ответ</summary>
+<ul>
+<li>X = 2,9·10⁹ / 2 с = <b>1,45 ГБ/с</b>.</li>
+<li>duty = 1,93·10⁸ / 2,5·10⁸ ≈ 0,77; проверка: 0,77 · 2,0 · 16/17 ≈ 1,45 ГБ/с — сходится со счётчиком. До насыщения линка (≈ 0,96) далеко.</li>
+<li>wait мал (1,6 %), idle велик (21 %), <code>rx_np_ok</code> = 1: в эти такты SSD просто не просит данных, а наша очередь пуста.</li>
+<li><code>stall_cycles</code> растёт (44 % времени источник ждёт): кольцо заполнено. Вывод: <b>упёрлись в SSD</b>. Следующие шаги: <code>stat_max_latency</code>, температура, состояние кэша, Trim перед сеансом.</li>
+</ul>
+</details>
+
+<div class="pager"><a href="05_bringup.html">← Глава 5. Запуск: от PERST# до первой записи</a><a href="07_verification.html">Глава 7. Верификация и симуляция →</a></div>
+<footer>Учебный проект «NVMe-хост на голой Kintex-7». Исходники: <a href="https://github.com/alexander-hdl/NVME">github.com/alexander-hdl/NVME</a>.</footer>
+</main>
+</div>
+</body>
+</html>
