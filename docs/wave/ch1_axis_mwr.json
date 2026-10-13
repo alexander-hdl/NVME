@@ -1,0 +1,17 @@
+{
+  "signal": [
+    {"name": "user_clk", "wave": "p......."},
+    ["TX AXI-ST",
+      {"name": "tvalid", "wave": "01...0..", "node": "...a"},
+      {"name": "tready", "wave": "1..01...", "node": "....b"},
+      {"name": "tdata[127:0]", "wave": "x345.x..", "data": ["H0 H1 H2 D0", "H0 H1 H2 D0", "D1 D2 D3 --"]},
+      {"name": "tkeep[15:0]", "wave": "x223.x..", "data": ["FFFF", "FFFF", "0FFF"]},
+      {"name": "tlast", "wave": "0101.0.."}
+    ],
+    {},
+    {"name": "передача", "wave": "01.010.."}
+  ],
+  "head": {"text": "128-битный AXI-Stream: MWr32 с 1 DW (1 такт) и MWr32 с 4 DW (2 такта)", "tick": 0},
+  "config": {"cell_width": 86},
+  "edge": ["a~>b tready=0: ждём"]
+}

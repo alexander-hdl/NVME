@@ -1,0 +1,13 @@
+{
+  "signal": [
+    {"name": "TX FPGA→SSD", "wave": "x3....x.|..........5....x", "data": ["MWr SQ1TDBL ← 6", "CplD 64 B, tag 3"], "node": ".a...................d"},
+    {"name": "RX SSD→FPGA", "wave": "x.......|.4......x.......", "data": ["MRd 64 B @ 0x1000_3140, tag 3"], "node": "..........b......c"},
+    {},
+    {"name": "SQ1 tail (SSD)", "wave": "=.....=.|................", "data": ["5", "6"]},
+    {"name": "SQ1 head (SSD)", "wave": "=.......|.........=......", "data": ["5", "6"]}
+  ],
+  "head": {"text": "Doorbell (posted MWr) → SSD сам читает SQE (MRd) → наш CplD"},
+  "foot": {"text": "Разрыв оси «|»: SSD обрабатывает doorbell; адрес MWr = 0xC000_1008"},
+  "config": {"cell_width": 28},
+  "edge": ["a~>b реакция SSD", "c~>d ответ хоста"]
+}
