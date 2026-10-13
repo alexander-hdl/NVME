@@ -42,8 +42,9 @@ def pts(points) -> str:
 
 
 def text(x, y, s, size=12, anchor="start", fill=FG, extra="") -> str:
+    stroke = "" if "stroke=" in extra else ' stroke="none"'   # labels never inherit a group stroke
     return (f'<text x="{f(x)}" y="{f(y)}" font-size="{size}" text-anchor="{anchor}" '
-            f'fill="{fill}" stroke="none"{extra}>{escape(str(s))}</text>')
+            f'fill="{fill}"{stroke}{extra}>{escape(str(s))}</text>')
 
 
 # ---------------------------------------------------------------- разбор wave
