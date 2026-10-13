@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NVMe-хост на голой Kintex-7 — лабораторная работа</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <h2>NVMe-хост на Kintex-7</h2>
+  <ul>
+    <li><a href="index.html" class="cur">Введение и цели</a></li>
+    <li><a href="01_pcie_basics.html">1. PCIe с нуля</a></li>
+    <li><a href="02_nvme_basics.html">2. NVMe с нуля</a></li>
+    <li><a href="03_architecture.html">3. Архитектура хоста</a></li>
+    <li><a href="04_modules.html">4. Модули и интерфейсы</a></li>
+    <li><a href="05_bringup.html">5. Запуск: от PERST# до первой записи</a></li>
+    <li><a href="06_performance.html">6. Пропускная способность</a></li>
+    <li><a href="07_verification.html">7. Верификация и симуляция</a></li>
+    <li><a href="08_lab.html">8. Лабораторные задания</a></li>
+    <li><a href="glossary.html">Глоссарий</a></li>
+  </ul>
+</nav>
+<main>
+<h1>NVMe-хост на «голой» Kintex-7</h1>
+<p class="lead">Лабораторный курс: как заставить FPGA без процессора самостоятельно поднять PCIe-линк,
+проинициализировать NVMe-накопитель и писать на него непрерывный поток данных на предельной для линка скорости.</p>
+
+<h2 id="goal">Что мы строим</h2>
+<p>Обычно NVMe SSD работает под управлением операционной системы: драйвер в ядре Linux или Windows
+настраивает PCIe, создаёт очереди команд в оперативной памяти и обменивается с контроллером накопителя.
+В нашем проекте <strong>процессора нет вообще</strong>. Всю роль хоста (Root Complex) играет логика FPGA
+семейства Xilinx Kintex-7: она управляет сигналом сброса накопителя, обучает линк PCIe Gen2 x4,
+перечисляет устройство (enumeration), программирует регистры NVMe-контроллера, формирует команды записи
+и, самое главное, выступает «памятью хоста», из которой накопитель сам забирает данные.</p>
+
+<figure>
+<svg viewBox="0 0 760 250" width="760" height="250" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="13">
+  <defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg,#222)"/></marker></defs>
+  <rect x="20" y="30" width="330" height="190" rx="10" fill="var(--code-bg,#f4f6f9)" stroke="var(--fg,#222)"/>
+  <text x="185" y="52" text-anchor="middle" font-weight="bold" fill="var(--fg,#222)">FPGA Kintex-7 (XC7K325T)</text>
+  <rect x="40" y="70" width="130" height="40" rx="6" fill="var(--note-bg,#eef5ff)" stroke="var(--accent,#1f5fbf)"/>
+  <text x="105" y="94" text-anchor="middle" fill="var(--fg,#222)">источник данных</text>
+  <rect x="40" y="130" width="130" height="70" rx="6" fill="var(--note-bg,#eef5ff)" stroke="var(--accent,#1f5fbf)"/>
+  <text x="105" y="155" text-anchor="middle" fill="var(--fg,#222)">NVMe-хост (RTL)</text>
+  <text x="105" y="175" text-anchor="middle" fill="var(--muted,#5b6675)">очереди, PRP,</text>
+  <text x="105" y="190" text-anchor="middle" fill="var(--muted,#5b6675)">кольцо данных</text>
+  <rect x="200" y="130" width="130" height="70" rx="6" fill="var(--warn-bg,#fff4e8)" stroke="var(--accent2,#b8431f)"/>
+  <text x="265" y="155" text-anchor="middle" fill="var(--fg,#222)">pcie_7x</text>
+  <text x="265" y="175" text-anchor="middle" fill="var(--muted,#5b6675)">Root Port</text>
+  <text x="265" y="190" text-anchor="middle" fill="var(--muted,#5b6675)">Gen2 x4</text>
+  <line x1="105" y1="110" x2="105" y2="130" stroke="var(--fg,#222)" marker-end="url(#arr)"/>
+  <line x1="170" y1="165" x2="200" y2="165" stroke="var(--fg,#222)" marker-end="url(#arr)"/>
+  <line x1="200" y1="150" x2="170" y2="150" stroke="var(--fg,#222)" marker-end="url(#arr)"/>
+  <!-- link -->
+  <line x1="330" y1="150" x2="470" y2="150" stroke="var(--accent,#1f5fbf)" stroke-width="3" marker-end="url(#arr)"/>
+  <line x1="470" y1="170" x2="330" y2="170" stroke="var(--accent,#1f5fbf)" stroke-width="3" marker-end="url(#arr)"/>
+  <text x="400" y="140" text-anchor="middle" fill="var(--fg,#222)">TLP: CplD (данные)</text>
+  <text x="400" y="192" text-anchor="middle" fill="var(--fg,#222)">TLP: MRd, MWr (CQE)</text>
+  <text x="400" y="112" text-anchor="middle" fill="var(--muted,#5b6675)">PCIe Gen2 x4 ≈ 2,0 ГБ/с</text>
+  <!-- ssd -->
+  <rect x="470" y="60" width="270" height="160" rx="10" fill="var(--code-bg,#f4f6f9)" stroke="var(--fg,#222)"/>
+  <text x="605" y="82" text-anchor="middle" font-weight="bold" fill="var(--fg,#222)">M.2 NVMe SSD (Endpoint)</text>
+  <rect x="490" y="100" width="230" height="50" rx="6" fill="var(--ok-bg,#eefaf0)" stroke="#2f9e55"/>
+  <text x="605" y="121" text-anchor="middle" fill="var(--fg,#222)">контроллер NVMe</text>
+  <text x="605" y="139" text-anchor="middle" fill="var(--muted,#5b6675)">сам читает SQE, PRP, данные</text>
+  <rect x="490" y="160" width="230" height="45" rx="6" fill="var(--note-bg,#eef5ff)" stroke="var(--accent,#1f5fbf)"/>
+  <text x="605" y="187" text-anchor="middle" fill="var(--fg,#222)">NAND flash</text>
+  <text x="380" y="235" text-anchor="middle" fill="var(--muted,#5b6675)">REFCLK 100 МГц общий; PERST# формирует FPGA</text>
+</svg>
+<figcaption>Рис. 0.1. Общая картина: FPGA является хостом и «памятью хоста», SSD — ведущим устройством шины.</figcaption>
+</figure>
+
+<div class="box"><span class="t">Ключевая идея, которую стоит понять сразу</span>
+В NVMe хост почти ничего не «посылает» накопителю. Хост кладёт команду в очередь в своей памяти и пишет
+одно 32-битное слово в регистр-«звонок» (doorbell). Дальше накопитель сам читает команду, сам читает список
+адресов данных, сам читает сами данные и сам записывает запись о завершении в память хоста. Поэтому
+центральная часть нашей FPGA — не «передатчик», а <em>быстрый ответчик</em> (completer) на запросы чтения памяти.</div>
+
+<h2 id="targets">Целевые характеристики</h2>
+<table>
+<caption>Таблица 0.1. Что должно получиться</caption>
+<tr><th>Параметр</th><th>Значение</th><th>Почему</th></tr>
+<tr><td>Линк</td><td>PCIe Gen2 x4 (5 GT/s × 4)</td><td>максимум аппаратного блока Kintex-7 для устройства x4</td></tr>
+<tr><td>Полезная скорость линка</td><td>2,0 ГБ/с в каждую сторону</td><td>20 Гбит/с сырых, кодирование 8b/10b</td></tr>
+<tr><td>Ожидаемая скорость записи</td><td>1,6–1,8 ГБ/с</td><td>накладные расходы TLP при MPS = 256 Б, см. главу 6</td></tr>
+<tr><td>Размер команды</td><td>128 КиБ (256 LBA по 512 Б)</td><td>укладывается в любой MDTS ≥ 5</td></tr>
+<tr><td>Глубина очереди</td><td>до 8 команд в полёте</td><td>8 слотов кольца по 128 КиБ = 1 МиБ BRAM</td></tr>
+<tr><td>Процессор</td><td>нет</td><td>все конечные автоматы в логике</td></tr>
+</table>
+
+<h2 id="prereq">Что нужно знать и иметь</h2>
+<div class="grid2">
+<div>
+<h3>Знания</h3>
+<ul>
+<li>Цифровая схемотехника: конечные автоматы, конвейеры, BRAM, домены тактирования.</li>
+<li>SystemVerilog на уровне синтезируемого подмножества.</li>
+<li>Понятие шины с рукопожатием valid/ready (AXI-Stream) — разбираем в главе 1.</li>
+<li>Главы 1 и 2 дают всё необходимое о PCIe и NVMe с нуля.</li>
+</ul>
+</div>
+<div>
+<h3>Инструменты и железо</h3>
+<ul>
+<li>Vivado 2022.2 (xsim для симуляции, синтез для платы).</li>
+<li>Python 3 для генератора осциллограмм (docs/tools/wave.py).</li>
+<li>Для аппаратной части: плата с Kintex-7 (например KC705) и FMC-адаптер M.2 с собственным генератором 100 МГц
+(Opsero FPGA Drive FMC, Design Gateway AB17-M2FMC) — см. главу 5.</li>
+<li>Симуляция работает без платы: поведенческая модель SSD в <code>sim/models/</code>.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="howto">Как устроен курс</h2>
+<ol class="toc-page">
+<li><a href="01_pcie_basics.html">PCIe с нуля</a> — топология, уровни, TLP, конфигурационное пространство, расчёт скорости.</li>
+<li><a href="02_nvme_basics.html">NVMe с нуля</a> — регистры, очереди, SQE/CQE, PRP, инициализация, команда Write.</li>
+<li><a href="03_architecture.html">Архитектура хоста</a> — принятые решения и их обоснование, карта памяти, потоки данных.</li>
+<li><a href="04_modules.html">Модули и интерфейсы</a> — каждый модуль: порты, протокол, осциллограммы.</li>
+<li><a href="05_bringup.html">Запуск</a> — последовательность от PERST# до первой записанной команды, шаг за шагом.</li>
+<li><a href="06_performance.html">Пропускная способность</a> — где теряются байты и как их не терять.</li>
+<li><a href="07_verification.html">Верификация</a> — модель SSD, тестбенчи, как запускать и читать результаты.</li>
+<li><a href="08_lab.html">Лабораторные задания</a> — от «запусти симуляцию» до «добавь движок чтения».</li>
+</ol>
+<p>Каждая глава заканчивается вопросами для самопроверки и задачами с ответами. Все осциллограммы в
+пособии сгенерированы из текстовых описаний (<code>docs/wave/*.json</code>), поэтому их легко воспроизвести и
+изменить.</p>
+
+<h2 id="repo">Структура репозитория</h2>
+<table>
+<caption>Таблица 0.2. Каталоги проекта</caption>
+<tr><th>Каталог</th><th>Содержимое</th></tr>
+<tr><td><code>ARCHITECTURE.md</code></td><td>инженерная спецификация (контракт между модулями); главы 3–4 — её учебное изложение</td></tr>
+<tr><td><code>rtl/nvme_host_pkg.sv</code></td><td>константы, карта памяти, функции сборки заголовков TLP</td></tr>
+<tr><td><code>rtl/common/</code></td><td>примитивы: регистровые срезы, FIFO, сдвигатель DW, RAM</td></tr>
+<tr><td><code>rtl/pcie/</code></td><td>адаптеры к блоку pcie_7x, демультиплексор/арбитр TLP, requester, перечисление, запуск линка</td></tr>
+<tr><td><code>rtl/nvme/</code></td><td>completer памяти хоста, приём записей, очереди, инициализация NVMe, движок записи</td></tr>
+<tr><td><code>sim/models/</code></td><td>поведенческие модели блока pcie_7x и NVMe SSD</td></tr>
+<tr><td><code>sim/tb/</code></td><td>модульные и системный тестбенчи, скрипты запуска в <code>sim/scripts/</code></td></tr>
+<tr><td><code>fpga/</code></td><td>скрипт создания проекта Vivado, констрейны</td></tr>
+<tr><td><code>research/</code></td><td>отчёты об открытых проектах и выжимки из спецификаций, на которых основаны решения</td></tr>
+</table>
+
+<div class="box ok"><span class="t">Как читать</span> Если вы хотите сначала увидеть «как это работает целиком», начните с
+главы 3, затем вернитесь к главам 1–2 за фундаментом. Если PCIe для вас новая тема — читайте по порядку.</div>
+
+<div class="pager"><span></span><a href="01_pcie_basics.html">Глава 1. PCIe с нуля →</a></div>
+<footer>Учебный проект «NVMe-хост на голой Kintex-7». Исходники: <a href="https://github.com/alexander-hdl/NVME">github.com/alexander-hdl/NVME</a>.</footer>
+</main>
+</div>
+</body>
+</html>

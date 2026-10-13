@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Глоссарий</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <h2>NVMe-хост на Kintex-7</h2>
+  <ul>
+    <li><a href="index.html">Введение и цели</a></li>
+    <li><a href="01_pcie_basics.html">1. PCIe с нуля</a></li>
+    <li><a href="02_nvme_basics.html">2. NVMe с нуля</a></li>
+    <li><a href="03_architecture.html">3. Архитектура хоста</a></li>
+    <li><a href="04_modules.html">4. Модули и интерфейсы</a></li>
+    <li><a href="05_bringup.html">5. Запуск: от PERST# до первой записи</a></li>
+    <li><a href="06_performance.html">6. Пропускная способность</a></li>
+    <li><a href="07_verification.html">7. Верификация и симуляция</a></li>
+    <li><a href="08_lab.html">8. Лабораторные задания</a></li>
+    <li><a href="glossary.html" class="cur">Глоссарий</a></li>
+  </ul>
+</nav>
+<main>
+<h1>Глоссарий</h1>
+<p class="lead">Термины PCIe, NVMe и нашего проекта в одном месте. В скобках — английский оригинал, как он встречается в спецификациях и документации Xilinx.</p>
+
+<h2 id="pcie">PCI Express</h2>
+<table>
+<caption>Таблица Г.1. Термины PCIe</caption>
+<tr><th style="width:28%">Термин</th><th>Значение</th></tr>
+<tr><td><b>Root Complex (RC)</b></td><td>Корневой узел иерархии PCIe, представляющий сторону процессора/памяти. В нашем проекте — FPGA.</td></tr>
+<tr><td><b>Root Port (RP)</b></td><td>Порт Root Complex, к которому подключён линк. Имеет собственное конфигурационное пространство типа 1 (мост).</td></tr>
+<tr><td><b>Endpoint (EP)</b></td><td>Оконечное устройство (SSD). Имеет конфигурационное пространство типа 0.</td></tr>
+<tr><td><b>Lane, Link</b></td><td>Lane — одна дифференциальная пара на приём и одна на передачу. Link — набор lane'ов (x1, x4, x8…) между двумя портами.</td></tr>
+<tr><td><b>Gen1 / Gen2 / Gen3</b></td><td>Поколения скорости: 2,5 / 5 / 8 GT/s на lane. Kintex-7 поддерживает Gen1 и Gen2.</td></tr>
+<tr><td><b>GT/s (гигатрансфер в секунду)</b></td><td>Символов в секунду на линии. Из-за кодирования 8b/10b в Gen1/Gen2 полезных бит на 20 % меньше.</td></tr>
+<tr><td><b>LTSSM</b></td><td>Link Training and Status State Machine — автомат обучения линка (Detect → Polling → Configuration → L0, Recovery).</td></tr>
+<tr><td><b>L0</b></td><td>Рабочее состояние линка. В pcie_7x: <code>pl_ltssm_state = 0x16</code>.</td></tr>
+<tr><td><b>PERST#</b></td><td>Fundamental reset — сигнал сброса, который Root Complex подаёт устройству. У нас его формирует FPGA.</td></tr>
+<tr><td><b>REFCLK</b></td><td>Опорный тактовый сигнал 100 МГц. В нашей схеме общий для FPGA и SSD (common clock).</td></tr>
+<tr><td><b>TLP</b></td><td>Transaction Layer Packet — пакет уровня транзакций: заголовок 3 или 4 DW + необязательные данные.</td></tr>
+<tr><td><b>DLLP</b></td><td>Data Link Layer Packet — служебный пакет канального уровня (ACK/NAK, кредиты потока). Внутри блока pcie_7x, пользователю не виден.</td></tr>
+<tr><td><b>DW (dword)</b></td><td>Двойное слово, 4 байта. Единица длины TLP (поле Length) и выравнивания адресов.</td></tr>
+<tr><td><b>MRd / MWr</b></td><td>Memory Read / Memory Write — запрос чтения/записи памяти. 32 — заголовок 3 DW (адрес &lt; 4 ГБ), 64 — 4 DW.</td></tr>
+<tr><td><b>CfgRd0 / CfgWr0</b></td><td>Configuration Read/Write Type 0 — доступ к конфигурационному пространству устройства непосредственно за портом.</td></tr>
+<tr><td><b>Cpl / CplD</b></td><td>Completion (без данных) / Completion with Data — ответ на непосланный (non-posted) запрос.</td></tr>
+<tr><td><b>Posted / Non-posted</b></td><td>Posted (MWr, Msg) — не требует ответа. Non-posted (MRd, Cfg) — требует Completion.</td></tr>
+<tr><td><b>Requester / Completer</b></td><td>Тот, кто послал запрос / тот, кто отвечает. При записи на SSD накопитель — requester, FPGA — completer.</td></tr>
+<tr><td><b>Requester ID, Completer ID</b></td><td>16-битные идентификаторы Bus:Device.Function отправителя запроса и ответчика.</td></tr>
+<tr><td><b>Tag</b></td><td>Номер запроса (5 или 8 бит), по которому requester сопоставляет completion с запросом.</td></tr>
+<tr><td><b>Byte Count (BC)</b></td><td>В CplD: сколько байт осталось передать, включая этот пакет. 0 означает 4096.</td></tr>
+<tr><td><b>Lower Address (LA)</b></td><td>В CplD: младшие 7 бит адреса первого байта данных этого пакета.</td></tr>
+<tr><td><b>MPS</b></td><td>Max Payload Size — максимальный размер данных в одном TLP (128/256/512… байт). Программируется в Device Control у обеих сторон.</td></tr>
+<tr><td><b>MRRS</b></td><td>Max Read Request Size — максимальный размер одного запроса чтения.</td></tr>
+<tr><td><b>RCB</b></td><td>Read Completion Boundary — граница (64 или 128 Б), по которой разрешено дробить ответ на чтение.</td></tr>
+<tr><td><b>BAR</b></td><td>Base Address Register — регистр, через который хост назначает устройству окно адресов. У NVMe BAR0 содержит регистры контроллера.</td></tr>
+<tr><td><b>BDF</b></td><td>Bus:Device.Function — адрес устройства в конфигурационном пространстве. SSD у нас 01:00.0.</td></tr>
+<tr><td><b>Enumeration</b></td><td>Перечисление: обход конфигурационного пространства, назначение номеров шин и адресов BAR.</td></tr>
+<tr><td><b>BME, MSE</b></td><td>Bus Master Enable, Memory Space Enable — биты регистра Command. Без BME устройство не может само обращаться к памяти хоста.</td></tr>
+<tr><td><b>CRS</b></td><td>Configuration Request Retry Status — ответ «я ещё не готов», допустимый до 1 с после сброса.</td></tr>
+<tr><td><b>UR / CA</b></td><td>Unsupported Request / Completer Abort — статусы ошибок в Completion.</td></tr>
+<tr><td><b>Flow control credits</b></td><td>Кредиты потока: приёмник заранее сообщает, сколько заголовков/данных он может принять. Управляются блоком pcie_7x.</td></tr>
+<tr><td><b>Straddling</b></td><td>В 128-битном режиме pcie_7x: окончание одного TLP и начало следующего в одном такте шины.</td></tr>
+<tr><td><b>cfg_mgmt</b></td><td>Порт блока pcie_7x для доступа к собственному конфигурационному пространству Root Port.</td></tr>
+</table>
+
+<h2 id="nvme">NVMe</h2>
+<table>
+<caption>Таблица Г.2. Термины NVMe</caption>
+<tr><th style="width:28%">Термин</th><th>Значение</th></tr>
+<tr><td><b>Controller (контроллер)</b></td><td>Логика накопителя, выполняющая команды NVMe. Регистры контроллера находятся в BAR0.</td></tr>
+<tr><td><b>Namespace (NSID)</b></td><td>Логический том на накопителе. Мы используем NSID = 1.</td></tr>
+<tr><td><b>LBA</b></td><td>Logical Block Address — номер логического блока (512 или 4096 Б, поле LBADS).</td></tr>
+<tr><td><b>SQ / CQ</b></td><td>Submission Queue / Completion Queue — кольцевые очереди команд (64 Б записи) и завершений (16 Б записи) в памяти хоста.</td></tr>
+<tr><td><b>SQE / CQE</b></td><td>Submission/Completion Queue Entry — одна запись соответствующей очереди.</td></tr>
+<tr><td><b>Admin queue, I/O queue</b></td><td>Очереди с QID 0 (административные команды) и QID ≥ 1 (команды ввода-вывода).</td></tr>
+<tr><td><b>Doorbell</b></td><td>Регистр в BAR0, в который хост пишет новое значение tail (SQ) или head (CQ).</td></tr>
+<tr><td><b>Head / Tail</b></td><td>Указатели кольцевой очереди: производитель двигает tail, потребитель — head.</td></tr>
+<tr><td><b>Phase Tag (P)</b></td><td>Бит в CQE, инвертируемый при каждом обороте очереди; позволяет хосту отличить новые записи от старых без счётчика.</td></tr>
+<tr><td><b>CID</b></td><td>Command Identifier — номер команды, уникальный среди незавершённых команд очереди.</td></tr>
+<tr><td><b>PRP</b></td><td>Physical Region Page — указатель на страницу памяти с данными. PRP1, PRP2 и список PRP описывают буфер команды.</td></tr>
+<tr><td><b>PRP list</b></td><td>Массив 8-байтовых PRP-указателей на одной странице памяти; используется для переносов больше двух страниц.</td></tr>
+<tr><td><b>MPS (NVMe)</b></td><td>Memory Page Size в регистре CC — размер страницы хоста (у нас 4 КиБ). Не путать с MPS PCIe.</td></tr>
+<tr><td><b>CAP, CC, CSTS</b></td><td>Capabilities, Configuration, Status — главные регистры контроллера.</td></tr>
+<tr><td><b>AQA, ASQ, ACQ</b></td><td>Размеры и базовые адреса административных очередей.</td></tr>
+<tr><td><b>Identify</b></td><td>Команда, возвращающая 4 КиБ описания контроллера (CNS=1) или namespace (CNS=0).</td></tr>
+<tr><td><b>MDTS</b></td><td>Maximum Data Transfer Size — максимальный размер одной команды, в степенях двойки от размера страницы.</td></tr>
+<tr><td><b>Flush</b></td><td>Команда, сбрасывающая энергозависимый кэш записи на носитель.</td></tr>
+<tr><td><b>Shutdown (SHN/SHST)</b></td><td>Процедура штатного выключения контроллера перед снятием питания.</td></tr>
+<tr><td><b>SLC-кэш</b></td><td>Область TLC/QLC-памяти, временно работающая в однобитном режиме для быстрой записи; после её заполнения скорость падает.</td></tr>
+<tr><td><b>GC</b></td><td>Garbage collection — фоновая перезапись блоков NAND, вызывающая всплески латентности.</td></tr>
+<tr><td><b>HMB</b></td><td>Host Memory Buffer — память хоста, которую запрашивают накопители без DRAM. Мы её не предоставляем.</td></tr>
+</table>
+
+<h2 id="proj">Термины проекта</h2>
+<table>
+<caption>Таблица Г.3. Внутренние понятия</caption>
+<tr><th style="width:28%">Термин</th><th>Значение</th></tr>
+<tr><td><b>tlp_axis</b></td><td>Внутренний формат потока TLP: 128 бит, заголовок в первом такте, данные с второго такта, байты в порядке памяти (глава 4).</td></tr>
+<tr><td><b>Слот (slot)</b></td><td>Участок кольца данных размером в одну команду (128 КиБ). Номер слота равен CID команды.</td></tr>
+<tr><td><b>Кольцо данных (data ring)</b></td><td>BRAM-буфер из N слотов, куда поступает входной поток и откуда SSD читает данные.</td></tr>
+<tr><td><b>Синтез PRP</b></td><td>Вычисление содержимого списка PRP «на лету» из адреса запроса вместо хранения в памяти.</td></tr>
+<tr><td><b>Sequencer</b></td><td>Верхний автомат запуска: линк → перечисление → настройка RP → инициализация NVMe → работа → останов.</td></tr>
+</table>
+
+<div class="pager"><a href="08_lab.html">← Глава 8</a><a href="index.html">К оглавлению →</a></div>
+<footer>Учебный проект «NVMe-хост на голой Kintex-7». Исходники: <a href="https://github.com/alexander-hdl/NVME">github.com/alexander-hdl/NVME</a>.</footer>
+</main>
+</div>
+</body>
+</html>
