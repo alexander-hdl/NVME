@@ -43,7 +43,7 @@ def pts(points) -> str:
 
 def text(x, y, s, size=12, anchor="start", fill=FG, extra="") -> str:
     return (f'<text x="{f(x)}" y="{f(y)}" font-size="{size}" text-anchor="{anchor}" '
-            f'fill="{fill}"{extra}>{escape(str(s))}</text>')
+            f'fill="{fill}" stroke="none"{extra}>{escape(str(s))}</text>')
 
 
 # ---------------------------------------------------------------- разбор wave
