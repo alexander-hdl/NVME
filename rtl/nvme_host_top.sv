@@ -3,7 +3,7 @@
 // ARCHITECTURE.md section 5.18.
 //
 //   sys_clk_p/n --IBUFDS_GTE2--> pcie_7x ---- user_clk (125 MHz) ----> nvme_host_core
-//                     |ODIV2--BUFG--> link_clk (free running) --> link_bringup
+//   free_clk_p/n --IBUFDS--BUFG--> link_clk (free running) --> link_bringup
 //                                       |-> sys_rst_n (pcie_7x)   |-> pcie_perst_n (SSD)
 //
 // Clock domains
@@ -15,8 +15,10 @@
 //                reset synchroniser (async assert, sync release) on data_clk, asserted by
 //                the board reset OR the core reset so both sides of the async FIFO restart.
 //
-// LINK_CLK_HZ must be the real frequency of IBUFDS_GTE2.ODIV2 (100 MHz here;
-// verify against UG476 - if the tool reports 50 MHz set LINK_CLK_HZ = 50_000_000).
+// LINK_CLK_HZ must be the real frequency of the free_clk_p/n board oscillator
+// (KC705 SYSCLK = 200 MHz).  It cannot come from IBUFDS_GTE2.ODIV2: the pcie_7x IP already
+// feeds a BUFG from IBUFDS_GTE2.O and ODIV2 shares that output path (route_design fails with
+// "Route 35-54 IBUFDS_GTE2.O->BUFGCTRL.I0 unroutable" when both are used).
 // SIM_FAST shortens all "millisecond" timers (microsecond ticks).
 // =============================================================================
 module nvme_host_top
@@ -26,12 +28,14 @@ module nvme_host_top
   parameter int unsigned SLOT_BYTES         = SLOT_BYTES_DEF,
   parameter bit          SIM_FAST           = 1'b0,
   parameter int unsigned REQ_TIMEOUT_CYCLES = 1_250_000,
-  parameter int unsigned LINK_CLK_HZ        = 100_000_000,
+  parameter int unsigned LINK_CLK_HZ        = 200_000_000,
   parameter logic [63:0] START_LBA          = 64'd0
 ) (
   // ---- board ----
   input  logic         sys_clk_p,            // 100 MHz PCIe reference clock (shared with the SSD)
   input  logic         sys_clk_n,
+  input  logic         free_clk_p,           // free-running board oscillator (KC705 SYSCLK 200 MHz), runs link_bringup
+  input  logic         free_clk_n,
   input  logic         board_rst_n,          // board reset, active low
   output logic         pcie_perst_n,         // to the M.2 PERST#
   output logic [3:0]   pci_exp_txp,
@@ -68,7 +72,7 @@ module nvme_host_top
   // ===========================================================================
   // pcie_7x + reference clock
   // ===========================================================================
-  logic         refclk_odiv2, link_clk;
+  logic         free_clk, link_clk;
   logic         sys_rst_n, perst_n_i;
   logic         user_clk, user_reset, user_lnk_up;
 
@@ -90,7 +94,7 @@ module nvme_host_top
   logic [1:0]   pl_sel_lnk_width;
 
   pcie7x_wrapper u_pcie (
-    .sys_clk_p(sys_clk_p), .sys_clk_n(sys_clk_n), .sys_rst_n(sys_rst_n), .refclk_odiv2(refclk_odiv2),
+    .sys_clk_p(sys_clk_p), .sys_clk_n(sys_clk_n), .sys_rst_n(sys_rst_n),
     .pci_exp_txp(pci_exp_txp), .pci_exp_txn(pci_exp_txn), .pci_exp_rxp(pci_exp_rxp), .pci_exp_rxn(pci_exp_rxn),
     .user_clk_out(user_clk), .user_reset_out(user_reset), .user_lnk_up(user_lnk_up),
     .m_axis_rx_tdata(m_axis_rx_tdata), .m_axis_rx_tkeep(m_axis_rx_tkeep), .m_axis_rx_tlast(m_axis_rx_tlast),
@@ -111,7 +115,8 @@ module nvme_host_top
   // ===========================================================================
   // Link bring-up on the free-running refclk-derived clock
   // ===========================================================================
-  BUFG u_link_clk_bufg (.I(refclk_odiv2), .O(link_clk));
+  IBUFDS u_free_clk_ibuf (.I(free_clk_p), .IB(free_clk_n), .O(free_clk));
+  BUFG   u_link_clk_bufg (.I(free_clk), .O(link_clk));
 
   // board reset -> link_clk domain (async assert, synchronous release)
   (* ASYNC_REG = "TRUE" *) logic [1:0] link_rst_sync;

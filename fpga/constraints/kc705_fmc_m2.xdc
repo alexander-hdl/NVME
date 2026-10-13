@@ -14,21 +14,23 @@
 # 100 MHz PCIe reference clock from the adapter -> FMC HPC GBTCLK0_M2C
 create_clock -name sys_clk -period 10.000 [get_ports sys_clk_p]
 
-# user data clock (set by whoever produces the stream): TODO set the real period
-# create_clock -name data_clk -period 5.000 [get_ports data_clk]
+# free-running board oscillator for link_bringup / PERST# timing: KC705 SYSCLK, 200 MHz LVDS
+# (pcie_7x_0 uses IBUFDS_GTE2.O -> BUFG internally, so IBUFDS_GTE2.ODIV2 cannot be used for this)
+create_clock -name free_clk -period 5.000 [get_ports free_clk_p]
+
+# user data clock (set by whoever produces the stream).
+# TODO: set the real period.  8.000 ns (125 MHz) is a PLACEHOLDER so that the async FIFO in
+# data_ring is timed at all; without a clock the data_clk domain is unconstrained.
+create_clock -name data_clk -period 8.000 [get_ports data_clk]
 
 # ---------------------------------------------------------------------------
-# Clock-domain crossings
-#   user_clk (pcie_7x, 125 MHz)  <->  link_clk (refclk ODIV2 via BUFG)  <->  data_clk (user)
-# Crossings: 2-FF synchronisers (ASYNC_REG) and reset synchronisers in nvme_host_top,
-# plus the gray-coded async FIFO in data_ring.  Once the clock names of the generated
-# IP are known replace this template by set_clock_groups -asynchronous, e.g.
-#   set_clock_groups -asynchronous \
-#     -group [get_clocks -include_generated_clocks sys_clk] \
-#     -group [get_clocks -of_objects [get_pins <pcie user_clk_out net>]] \
-#     -group [get_clocks data_clk]
+# Clock-domain crossings: see kc705_fmc_m2_cdc.xdc (implementation only, because the
+# clocks of the pcie_7x_0 IP do not exist while synth_design runs it as a black box).
+#   user_clk (pcie_7x userclk2, 125 MHz) <-> link_clk (free_clk 200 MHz via BUFG) <-> data_clk (user)
+# Crossings: 2-FF synchronisers (ASYNC_REG) and reset synchronisers in nvme_host_top and
+# link_bringup, plus the gray-coded async FIFO in data_ring.
 # ---------------------------------------------------------------------------
-# Until the groups are in place at least cut the pure synchroniser inputs:
+# Pure synchroniser inputs:
 set_false_path -to [get_cells -hier -filter {ASYNC_REG == TRUE}]
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,11 @@ set_false_path -to [get_cells -hier -filter {ASYNC_REG == TRUE}]
 set_property PACKAGE_PIN C8 [get_ports sys_clk_p]
 set_property PACKAGE_PIN C7 [get_ports sys_clk_n]
 
+# --- free-running 200 MHz board clock (KC705 SYSCLK_P/N, bank 33)  [TODO verify against UG810] ---
+set_property PACKAGE_PIN AD12 [get_ports free_clk_p]
+set_property PACKAGE_PIN AD11 [get_ports free_clk_n]
+set_property IOSTANDARD LVDS  [get_ports {free_clk_p free_clk_n}]
+
 # --- PERST# to the M.2 slot (FMC LA pin on the adapter; KC705 package pin C25)  [TODO verify] ---
 set_property PACKAGE_PIN C25     [get_ports pcie_perst_n]
 set_property IOSTANDARD LVCMOS25 [get_ports pcie_perst_n]     ;# VADJ = 2.5 V on the KC705 HPC
@@ -45,13 +52,14 @@ set_property DRIVE 8             [get_ports pcie_perst_n]
 set_property SLEW SLOW           [get_ports pcie_perst_n]
 
 # --- GTX lanes: FMC HPC DP0..DP3 -> GTXE2_CHANNEL_X0Y12 .. X0Y15 (quad 118)  [TODO verify] ---
-# The package pins of the GTX lanes follow from the LOC.  The IP's own XDC normally
-# places the GTs when the lane assignment is chosen in the IP GUI.  If a manual LOC is
-# required (the hierarchy path depends on the generated IP):
-# set_property LOC GTXE2_CHANNEL_X0Y12 [get_cells {u_pcie/u_pcie_7x/inst/inst/gt_top_i/pipe_wrapper_i/pipe_lane[0].gt_wrapper_i/gtx_channel.gtxe2_channel_i}]
-# set_property LOC GTXE2_CHANNEL_X0Y13 [get_cells {u_pcie/u_pcie_7x/inst/inst/gt_top_i/pipe_wrapper_i/pipe_lane[1].gt_wrapper_i/gtx_channel.gtxe2_channel_i}]
-# set_property LOC GTXE2_CHANNEL_X0Y14 [get_cells {u_pcie/u_pcie_7x/inst/inst/gt_top_i/pipe_wrapper_i/pipe_lane[2].gt_wrapper_i/gtx_channel.gtxe2_channel_i}]
-# set_property LOC GTXE2_CHANNEL_X0Y15 [get_cells {u_pcie/u_pcie_7x/inst/inst/gt_top_i/pipe_wrapper_i/pipe_lane[3].gt_wrapper_i/gtx_channel.gtxe2_channel_i}]
+# The package pins of the GTX lanes follow from the LOC.  The IP's own XDC places the GTs at
+# X0Y7..X0Y4 (quad 116, the default for PCIE_X0Y0); for the FMC HPC the lanes are moved to quad 118
+# here.  These LOCs are applied after the IP's XDC and override it.
+# Hierarchy path verified against the generated pcie_7x_0 (u_pcie = pcie7x_wrapper, u_pcie_7x = pcie_7x_0).
+set_property LOC GTXE2_CHANNEL_X0Y12 [get_cells {u_pcie/u_pcie_7x/inst/inst/gt_top_i/pipe_wrapper_i/pipe_lane[0].gt_wrapper_i/gtx_channel.gtxe2_channel_i}]
+set_property LOC GTXE2_CHANNEL_X0Y13 [get_cells {u_pcie/u_pcie_7x/inst/inst/gt_top_i/pipe_wrapper_i/pipe_lane[1].gt_wrapper_i/gtx_channel.gtxe2_channel_i}]
+set_property LOC GTXE2_CHANNEL_X0Y14 [get_cells {u_pcie/u_pcie_7x/inst/inst/gt_top_i/pipe_wrapper_i/pipe_lane[2].gt_wrapper_i/gtx_channel.gtxe2_channel_i}]
+set_property LOC GTXE2_CHANNEL_X0Y15 [get_cells {u_pcie/u_pcie_7x/inst/inst/gt_top_i/pipe_wrapper_i/pipe_lane[3].gt_wrapper_i/gtx_channel.gtxe2_channel_i}]
 # pci_exp_txp/txn/rxp/rxn[3:0] are GT pins: no PACKAGE_PIN / IOSTANDARD needed.
 # Lane order / polarity on the adapter: see the adapter schematic (the core handles
 # lane reversal and polarity inversion automatically).

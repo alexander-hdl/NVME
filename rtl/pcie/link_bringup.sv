@@ -51,8 +51,8 @@
 // =============================================================================
 module link_bringup #(
   // CLK_HZ must be the real frequency of `clk`.  In nvme_host_top `clk` is the
-  // IBUFDS_GTE2 ODIV2 output (refclk / 2) -> 50 MHz for the 100 MHz PCIe refclk
-  // (Vivado derives `refclk_odiv2` with a 20 ns period).
+  // free-running board oscillator (free_clk_p/n -> IBUFDS -> BUFG; KC705 SYSCLK = 200 MHz),
+  // not IBUFDS_GTE2.ODIV2 (unroutable together with the IP's O->BUFG, see pcie7x_wrapper).
   parameter int unsigned CLK_HZ         = 50_000_000,
   parameter int unsigned PERST_HOLD_MS  = 100,
   parameter int unsigned POST_PERST_MS  = 100,

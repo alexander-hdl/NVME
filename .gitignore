@@ -15,3 +15,12 @@ sim/work/
 *.vcd
 *.fst
 __pycache__/
+# IP output products if an IP is ever created in place under fpga/ip (only the .xci is tracked)
+fpga/ip/**/source/
+fpga/ip/**/doc/
+fpga/ip/**/*.veo
+fpga/ip/**/*.vho
+fpga/ip/**/*.xml
+fpga/ip/**/*.txt
+fpga/ip/**/*_ooc.xdc
+fpga/ip/**/*_stub.*
