@@ -24,6 +24,14 @@
 //   address bits above the slot size, so the read mux is a plain N_SLOTS:1
 //   mux steered by the (2-cycle delayed) slot index. SLOT_BYTES must be a power
 //   of two (>= 4096) and N_SLOTS >= 2.
+// * Input acceptance (no silent drops).  s_data_tready is LOW whenever the ring cannot
+//   store the beat: while data_rst is active, while the user_clk-domain reset `rst`
+//   is active (synchronised inside axis_fifo_async), and while `accept_enable`
+//   (user_clk domain, driven by the core from the sequencer's `running`) is low.
+//   `accept_enable` is 2-FF synchronised into data_clk; its gate acts on BOTH tvalid
+//   and tready of the FIFO, so a handshake ("tvalid && tready") always means the beat
+//   was stored.  A source that waits for tready therefore loses nothing before the
+//   write engine is enabled, during a link retrain or after the stop request.
 // * Read port: rd_addr is the region-relative byte address (DATA_BASE already
 //   subtracted) of a 16-byte beat; rd_data is valid exactly 2 cycles after rd_en.
 //
@@ -49,6 +57,7 @@ module data_ring
   // user_clk domain
   input  logic         clk,
   input  logic         rst,
+  input  logic         accept_enable = 1'b1,   // user_clk domain; 0 = s_data_tready held low
   output logic [N_SLOTS-1:0]       slot_full,
   input  logic [N_SLOTS-1:0]       slot_free,
   output logic [$clog2(N_SLOTS):0] slots_used,
@@ -66,9 +75,10 @@ module data_ring
   localparam int unsigned SLOT_W         = $clog2(N_SLOTS);
   localparam logic [15:0] BE_ALL         = 16'hFFFF;
 
-  // elaboration-time sanity check
-  if ((SLOT_BYTES & (SLOT_BYTES - 1)) != 0 || SLOT_BYTES < 4096 || N_SLOTS < 2) begin : g_param_check
-    $fatal(1, "data_ring: SLOT_BYTES must be a power of two >= 4096 and N_SLOTS >= 2");
+  // elaboration-time sanity check.  SLOT_BYTES <= 2 MiB: prp_synth serves ONE 4 KiB PRP list
+  // page per slot (512 entries + PRP1 = 513 pages = 2 MiB + 4 KiB max); a chained PRP list is not supported.
+  if ((SLOT_BYTES & (SLOT_BYTES - 1)) != 0 || SLOT_BYTES < 4096 || SLOT_BYTES > 2*1024*1024 || N_SLOTS < 2) begin : g_param_check
+    $fatal(1, "data_ring: SLOT_BYTES must be a power of two in [4096, 2 MiB] and N_SLOTS >= 2");
   end
 
   // ---------------------------------------------------------------------------
@@ -77,9 +87,20 @@ module data_ring
   logic [127:0] f_tdata;
   logic         f_tvalid, f_tready;
 
+  // accept_enable (user_clk) -> data_clk, power-up value "not accepting"
+  (* ASYNC_REG = "TRUE" *) logic acc_s1_q = 1'b0, acc_s2_q = 1'b0;
+  always_ff @(posedge data_clk) begin
+    acc_s1_q <= accept_enable;
+    acc_s2_q <= acc_s1_q;
+  end
+
+  logic s_f_tready, s_f_tvalid;
+  assign s_f_tvalid    = s_data_tvalid & acc_s2_q & ~data_rst;
+  assign s_data_tready = s_f_tready    & acc_s2_q & ~data_rst;
+
   axis_fifo_async #(.W(128), .DEPTH(FIFO_DEPTH)) u_fifo (
     .s_clk(data_clk), .s_rst(data_rst),
-    .s_tdata(s_data_tdata), .s_tvalid(s_data_tvalid), .s_tready(s_data_tready),
+    .s_tdata(s_data_tdata), .s_tvalid(s_f_tvalid), .s_tready(s_f_tready),
     .m_clk(clk), .m_rst(rst),
     .m_tdata(f_tdata), .m_tvalid(f_tvalid), .m_tready(f_tready));
 
@@ -128,6 +149,14 @@ module data_ring
 
   assign rd_slot = rd_addr[BEAT_W+4 +: SLOT_W];
 
+  // Read-address fan-out.  rd_addr / rd_en would otherwise drive EVERY slot RAM
+  // (N_SLOTS * SLOT_BYTES/4096 RAMB36 = 256 for the default 8 x 128 KiB).  Each slot gets its
+  // OWN register copy of the beat address and of its enable (u_ram sees only that copy, so
+  // the fan-out is SLOT_BYTES/4096 = 32 RAMB36 per register; dont_touch stops Vivado from
+  // merging the copies back into one).  The copy is the first of the two read stages, so
+  // the read latency stays exactly 2 cycles: stage 1 = address copy register, stage 2 =
+  // the RAM's read latch (sdp_ram with OUT_REG = 0, no output register); the slot mux is
+  // steered by the 2-cycle delayed slot index below.
   always_ff @(posedge clk) begin
     rd_slot_d1 <= rd_slot;   rd_slot_d2 <= rd_slot_d1;
     rd_ok_d1   <= (rd_addr[31:BEAT_W+4] < 32'(N_SLOTS));
@@ -135,12 +164,19 @@ module data_ring
   end
 
   for (genvar k = 0; k < N_SLOTS; k++) begin : g_slot
-    sdp_ram #(.DEPTH(BEATS_PER_SLOT), .W(128)) u_ram (
+    (* dont_touch = "true", max_fanout = 32 *) logic [BEAT_W-1:0] rd_addr_cp_q;
+    (* dont_touch = "true", max_fanout = 32 *) logic              rd_en_cp_q;
+
+    always_ff @(posedge clk) begin
+      rd_addr_cp_q <= rd_addr[4 +: BEAT_W];
+      rd_en_cp_q   <= rd_en && (rd_slot == SLOT_W'(k));
+    end
+
+    sdp_ram #(.DEPTH(BEATS_PER_SLOT), .W(128), .OUT_REG(0)) u_ram (
       .clk(clk),
       .wr_en(wr_fire && (wr_slot == SLOT_W'(k))), .wr_be(BE_ALL),
       .wr_addr(wr_beat), .wr_data(f_tdata),
-      .rd_en(rd_en && (rd_slot == SLOT_W'(k))),
-      .rd_addr(rd_addr[4 +: BEAT_W]),
+      .rd_en(rd_en_cp_q), .rd_addr(rd_addr_cp_q),
       .rd_data(slot_rd[k]));
   end
 
@@ -149,7 +185,8 @@ module data_ring
   // ---------------------------------------------------------------------------
   // Statistics
   // ---------------------------------------------------------------------------
-  logic stall_lvl_d, stall_s1, stall_s2;
+  logic stall_lvl_d;
+  (* ASYNC_REG = "TRUE" *) logic stall_s1, stall_s2;      // 2-FF synchroniser into clk
 
   always_ff @(posedge data_clk) begin
     if (data_rst) stall_lvl_d <= 1'b0;

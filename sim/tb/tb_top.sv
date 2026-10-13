@@ -93,6 +93,8 @@ module tb_top;
   wire  [15:0]  stat_last_status, stat_unexpected_cpl;
   wire  [3:0]   stat_lbads;
   wire  [7:0]   stat_mdts;
+  wire  [7:0]   status_flags;
+  wire  [63:0]  stat_first_error_lba;
 
   // ---------------------------------------------------------------------------
   // Models
@@ -145,7 +147,8 @@ module tb_top;
     .stat_max_latency(stat_max_latency), .stat_last_status(stat_last_status), .stat_next_lba(stat_next_lba),
     .stat_beats_in(stat_beats_in), .stat_stall_cycles(stat_stall_cycles),
     .stat_sq_full_stall_cycles(stat_sq_full_stall_cycles), .stat_unexpected_cpl(stat_unexpected_cpl),
-    .stat_lbads(stat_lbads), .stat_nsze(stat_nsze), .stat_mdts(stat_mdts));
+    .stat_lbads(stat_lbads), .stat_nsze(stat_nsze), .stat_mdts(stat_mdts),
+    .status_flags(status_flags), .stat_first_error_lba(stat_first_error_lba));
 
   // ---------------------------------------------------------------------------
   // Error bookkeeping
@@ -287,6 +290,11 @@ module tb_top;
     if (stat_cmd_errors != (inject ? 1 : 0))
       tb_err($sformatf("T-3: stat_cmd_errors = %0d, expected %0d", stat_cmd_errors, inject ? 1 : 0));
     if (status_error != 0) tb_err($sformatf("T-3: status_error = %02h (detail %02h)", status_error, status_error_detail));
+    // status_flags: [6] io_error only with +inject_err, everything else 0 (no timeout, no drop, no link flag)
+    if (status_flags !== (inject ? 8'h40 : 8'h00))
+      tb_err($sformatf("T-3: status_flags = %02h, expected %02h", status_flags, inject ? 8'h40 : 8'h00));
+    if (inject && stat_first_error_lba !== 64'(10 * (SLOT_BYTES / 512)))
+      tb_err($sformatf("T-3: stat_first_error_lba = %0d, expected %0d (SLBA of the 11th Write)", stat_first_error_lba, 10 * (SLOT_BYTES / 512)));
 
     // ---- T-4 sequencer states ----
     exp_states = {4'd0, 4'd1, 4'd2, 4'd3, 4'd4, 4'd5, 4'd6, 4'd7, 4'd8, 4'd9};

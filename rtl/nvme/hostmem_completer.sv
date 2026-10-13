@@ -81,6 +81,7 @@ module hostmem_completer
   input  logic         s_mrd_tvalid,
   output logic         s_mrd_tready,
   output logic         np_backpressure,      // request FIFO has < 2 free entries
+  output logic [$clog2(16):0] np_count,       // request FIFO occupancy (MRd queued here), 0..16 = REQ_DEPTH
   // completions (tlp_axis)
   output logic [127:0] m_cpl_tdata,
   output logic [15:0]  m_cpl_tkeep,
@@ -203,7 +204,7 @@ module hostmem_completer
     .s_tvalid(s_mrd_tvalid), .s_tready(s_mrd_tready),
     .m_tdata(reqf_tdata), .m_tkeep(), .m_tlast(), .m_tuser(),
     .m_tvalid(reqf_valid), .m_tready(reqf_pop),
-    .count(), .almost_full(reqf_afull));
+    .count(np_count), .almost_full(reqf_afull));
 
   assign np_backpressure = reqf_afull;     // free <= 2 (superset of "free < 2")
 

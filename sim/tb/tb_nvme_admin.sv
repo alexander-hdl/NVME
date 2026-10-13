@@ -11,7 +11,10 @@
 //   * fills ident_ram with realistic (and deliberately noisy) Identify data,
 //   * posts the CQE into acq_ram as two 8-byte halves with the phase bit last,
 //   * checks doorbell values (SQ tail = last+1, CQ head = number of CQEs).
-// Scenarios: see the "tests" section at the end (T1..T10).
+// Scenarios: see the "tests" section at the end (T1..T14).
+//   T11 MDTS smaller than SLOT_BYTES -> F_MDTS (0x14); T12 MDTS = 0 / larger / SQES 0x76 / CQES 0x54
+//   are accepted; T13 SQES required size 7 or CQES maximum 3 are rejected (nibble-wise check);
+//   T14 EN=0 but RDY=1 at power-up: CC.EN must not be set before CSTS.RDY has fallen.
 //
 // REAL_RAMS=0 (default, test tb_nvme_admin): behavioural RAMs.
 // REAL_RAMS=1 (test tb_admin_rams, wrapper in tb_admin_rams.sv): the real hostmem_rams
@@ -111,6 +114,10 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   int          cfg_flbas     = 0;     // FLBAS (format index)
   int          cfg_ms        = 0;     // metadata size of the selected LBAF
   int          cfg_lbads     = 9;     // LBADS of the selected LBAF
+  int          cfg_mdts      = 5;     // MDTS of Identify Controller (5 -> 128 KiB = the default SLOT_BYTES)
+  int          cfg_sqes      = 8'h66; // SQES byte (when cfg_bad_qes = 0)
+  int          cfg_cqes      = 8'h44; // CQES byte
+  bit          cfg_rdy_stale = 0;     // power-up with CC.EN = 0 but CSTS.RDY = 1 (reset still running)
 
   localparam logic [63:0] NSZE_VALUE = 64'h0000_0000_7470_0000;
 
@@ -232,9 +239,9 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   endtask
   task automatic ident_fill_ctrl();
     ident_noise();
-    ident_set_byte(77, 8'd5);                      // MDTS
-    ident_set_byte(512, cfg_bad_qes ? 8'h55 : 8'h66);   // SQES
-    ident_set_byte(513, 8'h44);                    // CQES
+    ident_set_byte(77, 8'(cfg_mdts));              // MDTS
+    ident_set_byte(512, cfg_bad_qes ? 8'h55 : 8'(cfg_sqes));   // SQES
+    ident_set_byte(513, 8'(cfg_cqes));             // CQES
     ident_set_byte(525, 8'h01);                    // VWC
     ident_set_byte(78, 8'h00);                     // neighbours of the fields
     ident_set_byte(76, 8'h00);
@@ -305,7 +312,7 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     if (rst) begin
       mstate      <= M_IDLE;
       cc_r        <= cfg_init_en ? 32'h0046_0001 : 32'h0;
-      rdy_r       <= cfg_init_en;
+      rdy_r       <= cfg_init_en | cfg_rdy_stale;
       cfs_r       <= 1'b0;
       shst_r      <= 2'b00;
       rdy_ticks   <= 0;
@@ -387,6 +394,7 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
                     check(asq_lo_r == ASQ_BASE && acq_lo_r == ACQ_BASE, "ASQ/ACQ not programmed before CC.EN");
                     check(clear_seen && !clr_busy_eff, "CQs not cleared before CC.EN");
                     check(m_wdata == CC_ENABLE, "CC enable value");
+                    check(!rdy_r, "CC.EN set to 1 while CSTS.RDY is still 1");
                     if (cfg_cfs) cfs_r <= 1'b1;
                   end
                   if (m_wdata[0] == 1'b0 && cc_r[0]) begin end
@@ -559,6 +567,7 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     cfg_dstrd = 0; cfg_css = 1; cfg_init_en = 0; cfg_rdy_never = 0; cfg_cfs = 0;
     cfg_err_cmd = -1; cfg_drop_cmd = -1; cfg_bad_qes = 0; cfg_shn_never = 0;
     cfg_flbas = 0; cfg_ms = 0; cfg_lbads = 9;
+    cfg_mdts = 5; cfg_sqes = 8'h66; cfg_cqes = 8'h44; cfg_rdy_stale = 0;
   endtask
 
   task automatic expect_fail(input string name, input logic [7:0] code);
@@ -686,6 +695,75 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     pulse_start_init();
     wait_init(2000000);
     expect_fail("T10", 8'h41);
+
+    // ---- T11: MDTS too small for SLOT_BYTES (128 KiB): MDTS=4 -> 64 KiB ----
+    $display("T11: MDTS smaller than SLOT_BYTES");
+    reset_knobs(); cfg_mdts = 4;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    expect_fail("T11", 8'h14);
+    check(mdts == 8'd4, "T11: mdts output");
+
+    // ---- T12: MDTS 0 (no limit), MDTS 6, SQES 0x76 / CQES 0x54 (wider maximum) are fine ----
+    $display("T12: MDTS 0 / 6, SQES 0x76, CQES 0x54 accepted");
+    reset_knobs(); cfg_mdts = 0; cfg_sqes = 8'h76; cfg_cqes = 8'h54;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done && !init_fail, "T12a: init_done (MDTS 0, SQES 0x76, CQES 0x54)");
+    reset_knobs(); cfg_mdts = 6;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done && !init_fail, "T12b: init_done (MDTS 6)");
+
+    // ---- T13: SQES required size 7 / CQES maximum 3 are rejected ----
+    $display("T13: SQES/CQES nibble check");
+    reset_knobs(); cfg_sqes = 8'h67;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    expect_fail("T13a (SQES 0x67)", 8'h10);
+    reset_knobs(); cfg_cqes = 8'h33;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    expect_fail("T13b (CQES 0x33)", 8'h10);
+    reset_knobs(); cfg_sqes = 8'h56;              // maximum 5 < 6
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    expect_fail("T13c (SQES 0x56)", 8'h10);
+
+    // ---- T14: EN = 0 but RDY = 1 at power-up ----
+    $display("T14: wait for CSTS.RDY==0 even though CC.EN is already 0");
+    reset_knobs(); cfg_rdy_stale = 1;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done && !init_fail, "T14: init_done");
+    check_init_log(1'b0);
+
+    // ---- T15: init_done / init_fail drop in the cycle start_init is presented ----
+    $display("T15: done/fail flags drop with the start edge");
+    reset_knobs(); cfg_mdts = 4;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_fail, "T15: precondition init_fail");
+    begin
+      bit saw_fail_in_start_cycle;
+      saw_fail_in_start_cycle = 1'b0;
+      @(posedge clk);
+      start_init <= 1'b1;
+      @(negedge clk);                       // start_init is visible in this cycle, the FSM has not taken it yet
+      saw_fail_in_start_cycle = init_fail || init_done;
+      @(posedge clk);
+      start_init <= 1'b0;
+      check(!saw_fail_in_start_cycle, "T15: init_fail/init_done still high in the cycle of start_init");
+    end
+    repeat (5) @(posedge clk);
 
     // ---- done ----
     repeat (20) @(posedge clk);

@@ -17,6 +17,13 @@
 //   H3 (SCEN 3) 1 slot x 4 KiB: slot release race (slot_full still high after the CQE).
 //   H2 (SCEN 2) 4 slots x 8 KiB (PRP2 = 2nd data page), 4 KiB LBAs, 64-bit SLBA, nsze
 //               allows only 3 commands: LBA range guard.
+//   H4 (SCEN 4) I/O timeout (M4): the SSD model never completes the 6th Write.  After IO_TMO_MS
+//               "ms" (tick_ms = every 100 clk) io_timeout is set sticky, no further command is
+//               submitted, the slot is NOT freed, a Flush request is answered at once with
+//               flush_done + flush_skipped and no Flush SQE; `restart` then returns the engine
+//               to its initial state (flags cleared, next_lba reloaded, queue pointers 0).
+// First-error reporting (M6): every harness compares io_error / first_error_lba with the first
+// failed Write seen by the SSD model (H0 injects errors).
 // =============================================================================
 `timescale 1ns/1ps
 
@@ -32,7 +39,9 @@ module we_harness
   parameter int LAT_MAX    = 150,
   parameter int ERR_EVERY  = 0,                          // every n-th command completes with an error (0 = never)
   parameter logic [63:0] START_LBA = 64'h0,
-  parameter logic [63:0] NSZE      = 64'h0000_0000_7470_0000
+  parameter logic [63:0] NSZE      = 64'h0000_0000_7470_0000,
+  parameter int IO_TMO_MS  = 0,                          // engine I/O timeout in tick_ms units (0 = off)
+  parameter int DROP_NTH   = -1                          // the SSD model never completes data command #n
 ) (
   input  logic clk,
   output logic done,
@@ -68,10 +77,18 @@ module we_harness
   logic [31:0]  cmd_errors, max_latency_cycles, sq_full_stall_cycles;
   logic [15:0]  last_status;
   logic         sq_full_stall, slots_idle, lba_range_err, doorbell_err;
+  logic         io_timeout, flush_skipped, io_error, restart = 1'b0;
+  logic [63:0]  first_error_lba;
+  logic         tick_ms = 1'b0;
+  int           tick_div = 0;
+  always_ff @(posedge clk) begin                      // 1 "ms" = 100 clk (only when the timeout is used)
+    tick_div <= (tick_div == 99) ? 0 : tick_div + 1;
+    tick_ms  <= (IO_TMO_MS != 0) && (tick_div == 99);
+  end
   logic [6:0]   sq_tail, cq_head;
 
-  nvme_write_engine #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES)) dut (
-    .clk(clk), .rst(rst), .tick_ms(1'b0),
+  nvme_write_engine #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .IO_TIMEOUT_MS(IO_TMO_MS)) dut (
+    .clk(clk), .rst(rst), .tick_ms(tick_ms), .restart(restart),
     .enable(enable), .start_lba(start_lba), .lbads(lbads_s), .nsze(nsze_s), .dstrd(dstrd_s),
     .slot_full(slot_full), .slot_free(slot_free),
     .iosq_wr_en(iosq_wr_en), .iosq_wr_addr(iosq_wr_addr), .iosq_wr_data(iosq_wr_data),
@@ -83,7 +100,8 @@ module we_harness
     .last_status(last_status), .max_latency_cycles(max_latency_cycles),
     .sq_full_stall(sq_full_stall), .sq_full_stall_cycles(sq_full_stall_cycles),
     .sq_tail(sq_tail), .cq_head(cq_head), .slots_idle(slots_idle),
-    .lba_range_err(lba_range_err), .doorbell_err(doorbell_err));
+    .lba_range_err(lba_range_err), .doorbell_err(doorbell_err),
+    .io_timeout(io_timeout), .flush_skipped(flush_skipped), .io_error(io_error), .first_error_lba(first_error_lba));
 
   // ---- error bookkeeping ----
   initial errors = 0;
@@ -165,6 +183,9 @@ module we_harness
   // in-flight table
   int  ifl_n = 0;
   int  ifl_slot [0:N_SLOTS+1];
+  logic [63:0] ifl_lba [0:N_SLOTS+1];
+  logic [63:0] first_err_slba_m = 64'h0;
+  bit          first_err_seen_m = 1'b0;
   int  ifl_due  [0:N_SLOTS+1];
   bit  ifl_flush[0:N_SLOTS+1];
   bit  slot_inflight [0:N_SLOTS-1];
@@ -267,9 +288,14 @@ module we_harness
                 slot_inflight[kk] = 1;
                 db_cycle[kk] = cyc;
                 check(slot_full[kk], $sformatf("slot %0d submitted while not full", kk));
-                ifl_slot[ifl_n] = kk;
-                ifl_due[ifl_n]  = cyc + LAT_MIN + ($urandom % (LAT_MAX - LAT_MIN + 1));
-                ifl_flush[ifl_n] = 0; ifl_n++;
+                if (DROP_NTH >= 0 && n_sqe == DROP_NTH) begin
+                  // the SSD "loses" this command: no CQE, ever
+                end else begin
+                  ifl_slot[ifl_n] = kk;
+                  ifl_lba[ifl_n]  = {got[32*11 +: 32], got[32*10 +: 32]};
+                  ifl_due[ifl_n]  = cyc + LAT_MIN + ($urandom % (LAT_MAX - LAT_MIN + 1));
+                  ifl_flush[ifl_n] = 0; ifl_n++;
+                end
               end
               n_sqe++;
               if (ifl_n > max_inflight) max_inflight = ifl_n;
@@ -330,11 +356,15 @@ module we_harness
             ll = cyc - db_cycle[kk];
             slot_inflight[kk] = 0;
             if (ll > tb_max_lat_lo) tb_max_lat_lo = ll;
-            if (cqw_beat[127:113] != 15'h0) begin n_err++; last_err_status = cqw_beat[127:113]; end
+            if (cqw_beat[127:113] != 15'h0) begin
+              n_err++; last_err_status = cqw_beat[127:113];
+              if (!first_err_seen_m) begin first_err_seen_m = 1'b1; first_err_slba_m = ifl_lba[cqw_ifl_pick]; end
+            end
             else n_ok++;
           end
           for (int i = cqw_ifl_pick; i < ifl_n - 1; i++) begin
             ifl_slot[i] = ifl_slot[i+1]; ifl_due[i] = ifl_due[i+1]; ifl_flush[i] = ifl_flush[i+1];
+            ifl_lba[i] = ifl_lba[i+1];
           end
           ifl_n--;
           if (cq_tail_m == IO_QSIZE - 1) begin cq_tail_m = 0; cq_ph_m = ~cq_ph_m; end
@@ -414,6 +444,42 @@ module we_harness
         t = 0; while (n_ok + n_err < N_CMDS && t < 3000000) begin @(posedge clk); t++; end
         check(t < 3000000, "H3: watchdog");
       end
+      4: begin   // I/O timeout, skipped Flush, restart
+        t = 0; while (!io_timeout && t < 40000) begin @(posedge clk); t++; end
+        check(io_timeout, "H4: io_timeout never set");
+        wait_cycles(200);
+        check(n_sqe == DROP_NTH + N_SLOTS, $sformatf("H4: %0d commands submitted, expected %0d (blocked behind the lost one)", n_sqe, DROP_NTH + N_SLOTS));
+        check(n_ok == DROP_NTH + N_SLOTS - 1, $sformatf("H4: %0d completions", n_ok));
+        snap = n_sqe;
+        wait_cycles(600);
+        check(n_sqe == snap, "H4: a command was submitted after io_timeout");
+        check(!slots_idle, "H4: slots_idle although a command is outstanding");
+        check(!flush_skipped && !flush_done, "H4: flush flags before the request");
+        flush_req = 1'b1;
+        t = 0; while (!flush_done && t < 100) begin @(posedge clk); t++; end
+        check(flush_done, "H4: flush_done not given at once with a hung command");
+        check(flush_skipped, "H4: flush_skipped not set");
+        wait_cycles(50);
+        check(n_flush_sqe == 0, "H4: a Flush SQE was submitted behind a hung command");
+        flush_req = 1'b0;
+        wait_cycles(5);
+        check(!flush_done, "H4: flush_done must drop with flush_req");
+        check(flush_skipped && io_timeout, "H4: sticky flags");
+        check(!io_error, "H4: io_error without a failed Write");
+        // restart: back to the initial state (next_slot keeps following the ring)
+        enable = 1'b0;
+        wait_cycles(5);
+        restart = 1'b1; wait_cycles(1); restart = 1'b0;
+        wait_cycles(4);
+        check(!io_timeout && !flush_skipped && !io_error && !lba_range_err, "H4: flags not cleared by restart");
+        check(slots_idle, "H4: outstanding not cleared by restart");
+        check(next_lba == START_LBA, "H4: next_lba not reloaded by restart");
+        check(sq_tail == 7'd0 && cq_head == 7'd0, "H4: queue pointers not reset by restart");
+        check(bytes_done == 64'd0 && cmds_done == 64'd0, "H4: statistics not cleared by restart");
+        $display("H4: io_timeout after %0d ms, Flush skipped, restart OK (sqe=%0d ok=%0d)", IO_TMO_MS, n_sqe, n_ok);
+        done = 1'b1;
+        wait (1'b0);
+      end
       default: ;
     endcase
 
@@ -442,6 +508,10 @@ module we_harness
     check(cq_consumed_m == cq_tail_m, "CQ head doorbell did not catch up with the posted CQEs");
     check(cq_head == 7'(cq_tail_m) && sq_tail == 7'(sq_head_m), "head/tail debug outputs");
     check(slots_idle, "slots_idle must be 1 at the end");
+    check(io_error == (n_err > 0), $sformatf("io_error %0b but %0d failed Writes", io_error, n_err));
+    if (n_err > 0) check(first_error_lba == first_err_slba_m,
+                         $sformatf("first_error_lba %h expected %h", first_error_lba, first_err_slba_m));
+    check(!io_timeout && !flush_skipped, "unexpected io_timeout / flush_skipped");
     check(SCEN == 2 || !lba_range_err, "unexpected lba_range_err");
     if (SCEN == 0) check(n_flush_sqe == 2, $sformatf("H0: flush SQEs %0d expected 2", n_flush_sqe));
     else           check(n_flush_sqe == 1, $sformatf("flush SQEs %0d expected 1", n_flush_sqe));
@@ -457,8 +527,8 @@ module tb_write_engine;
   logic clk = 1'b0;
   always #4 clk = ~clk;
 
-  logic [3:0] done;
-  int e0, e1, e2, e3;
+  logic [4:0] done;
+  int e0, e1, e2, e3, e4;
 
   we_harness #(.SCEN(0), .N_SLOTS(4),  .SLOT_BYTES(131072), .LBADS(9),  .N_CMDS(600),
                .LAT_MIN(20),  .LAT_MAX(150), .ERR_EVERY(17)) h0 (.clk(clk), .done(done[0]), .errors(e0));
@@ -472,11 +542,15 @@ module tb_write_engine;
   we_harness #(.SCEN(3), .N_SLOTS(1),  .SLOT_BYTES(4096),   .LBADS(9),  .N_CMDS(80),
                .LAT_MIN(5),  .LAT_MAX(30), .ERR_EVERY(0)) h3 (.clk(clk), .done(done[3]), .errors(e3));
 
+  we_harness #(.SCEN(4), .N_SLOTS(4),  .SLOT_BYTES(4096),   .LBADS(9),  .N_CMDS(12),
+               .LAT_MIN(10),  .LAT_MAX(30), .ERR_EVERY(0), .IO_TMO_MS(3), .DROP_NTH(5))
+               h4 (.clk(clk), .done(done[4]), .errors(e4));
+
   initial begin
     wait (&done);
     repeat (10) @(posedge clk);
-    if (e0 + e1 + e2 + e3 == 0) $display("TEST PASSED");
-    else $fatal(1, "TEST FAILED: %0d errors", e0 + e1 + e2 + e3);
+    if (e0 + e1 + e2 + e3 + e4 == 0) $display("TEST PASSED");
+    else $fatal(1, "TEST FAILED: %0d errors", e0 + e1 + e2 + e3 + e4);
     $finish;
   end
   initial begin

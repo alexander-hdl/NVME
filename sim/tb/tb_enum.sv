@@ -124,7 +124,7 @@ module tb_enum;
     .m_req_tvalid(m_req_tvalid), .m_req_tuser(m_req_tuser), .m_req_tready(m_req_tready),
     .s_cpl_tdata(s_cpl_tdata), .s_cpl_tkeep(s_cpl_tkeep), .s_cpl_tlast(s_cpl_tlast),
     .s_cpl_tvalid(s_cpl_tvalid), .s_cpl_tuser(s_cpl_tuser), .s_cpl_tready(s_cpl_tready),
-    .requester_id(REQ_ID), .unexpected_cpl_cnt(unexpected_cpl_cnt)
+    .requester_id(REQ_ID), .ext_tag_en(ext_tag_en), .unexpected_cpl_cnt(unexpected_cpl_cnt)
   );
 
   // ---------------------------------------------------------------------------
@@ -143,7 +143,11 @@ module tb_enum;
   logic [31:0] cfg [0:63];
   int          crs_left;
   int          cfg_count;        // config requests seen
-  logic [7:0]  exp_tag;          // next expected non-posted tag
+  logic [7:0]  exp_tag;          // number of non-posted requests so far (8-bit count)
+  // Tags are 5 bits (tag[7:5] = 0) unless Extended Tag Enable was programmed (ext_tag_en from pcie_enum)
+  function automatic logic [7:0] exp_tag_now();
+    return ext_tag_en ? exp_tag : (exp_tag & 8'h1F);
+  endfunction
   int          n_inj;            // unexpected completions injected
   logic [15:0] silent_reqid;
   logic [7:0]  silent_tag;
@@ -310,7 +314,7 @@ module tb_enum;
       if (h0[23:0] !== 24'h00_0001) err($sformatf("config TLP H0 low bits wrong: 0x%08h", h0));
       if (req_lbe(h1) !== 4'h0) err("config TLP last BE must be 0");
       if (req_reqid(h1) !== REQ_ID) err("config TLP requester ID wrong");
-      if (req_tag(h1) !== exp_tag) err($sformatf("config TLP tag %0d, expected %0d", req_tag(h1), exp_tag));
+      if (req_tag(h1) !== exp_tag_now()) err($sformatf("config TLP tag %0d, expected %0d", req_tag(h1), exp_tag_now()));
       if (h2[15:12] !== 4'h0 || h2[1:0] !== 2'b00) err("config TLP H2 reserved bits not zero");
       if (is_wr !== has_pl) err("config write/read payload presence mismatch");
       exp_tag = exp_tag + 8'd1;
@@ -339,7 +343,7 @@ module tb_enum;
       end
 
     end else if (ft == FT_MRD32) begin
-      if (req_tag(h1) !== exp_tag) err($sformatf("MRd tag %0d, expected %0d", req_tag(h1), exp_tag));
+      if (req_tag(h1) !== exp_tag_now()) err($sformatf("MRd tag %0d, expected %0d", req_tag(h1), exp_tag_now()));
       exp_tag = exp_tag + 8'd1;
       if (tlp_len_dw(h0) !== 10'd1) err("MRd length must be 1 DW");
       if (h2[31:30] != 2'b11 || h2[1:0] != 2'b00) err("MRd address outside BAR0 / unaligned");

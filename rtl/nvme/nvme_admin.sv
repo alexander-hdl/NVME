@@ -42,8 +42,21 @@
 //   poll CSTS.SHST==10b every ms (10 s timeout -> still shutdown_done, with
 //   shutdown_timeout=1).
 //
-// Level outputs: init_done / init_fail / shutdown_done stay set until the next
-// start_init / start_shutdown.  start_* are sampled in S_IDLE only (pulse is fine).
+// Level outputs: init_done / init_fail / shutdown_done / shutdown_timeout stay set until the
+// next start_init / start_shutdown.  start_* are sampled in S_IDLE only (pulse is fine).  The
+// outputs drop in the very cycle in which the matching start is accepted (combinational mask
+// on the registered flag), so the sequencer never sees the flags of the previous run in the
+// cycle of its own start pulse.
+//
+// Checks after Identify Controller (fail_step codes below):
+//   F_IDENT_QES  SQES / CQES: required size [3:0] must not exceed 6 (64 B SQE) / 4 (16 B CQE)
+//                and the maximum [7:4] must not be below it, i.e. SQES[3:0] <= 6 <= SQES[7:4]
+//                and CQES[3:0] <= 4 <= CQES[7:4] (NVMe 1.4 fig. 252/253 - the host picks
+//                IOSQES=6 / IOCQES=4 in CC).
+//   F_MDTS       MDTS != 0 and SLOT_BYTES > 4096 << MDTS (CAP.MPSMIN = 0 is enforced, so the
+//                unit is 4 KiB): one Write per ring slot would exceed the controller's maximum
+//                transfer size and every command would fail with Invalid Field.
+// Elaboration: SLOT_BYTES must be <= 2 MiB (one PRP list page per slot, prp_synth).
 //
 // RAM timing contract: a read issued with *_rd_en in cycle t returns data
 // that is valid during cycle t+2.
@@ -53,7 +66,8 @@ module nvme_admin
 #(
   parameter int unsigned RDY_TIMEOUT_MS_MAX  = 128_000,  // upper cap of (CAP.TO+1)*500 ms (TO max = 255)
   parameter int unsigned ADMIN_TIMEOUT_MS    = 1_000,    // wait for one admin CQE
-  parameter int unsigned SHUTDOWN_TIMEOUT_MS = 10_000    // wait for CSTS.SHST == 10b
+  parameter int unsigned SHUTDOWN_TIMEOUT_MS = 10_000,   // wait for CSTS.SHST == 10b
+  parameter int unsigned SLOT_BYTES          = SLOT_BYTES_DEF // bytes per Write command (MDTS check)
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -61,12 +75,12 @@ module nvme_admin
 
   // ---- control / status ----
   input  logic        start_init,
-  output logic        init_done,
-  output logic        init_fail,
+  output logic        init_done,         // level, drops in the cycle start_init is accepted
+  output logic        init_fail,         // level, drops in the cycle start_init is accepted
   output logic [7:0]  fail_step,         // see F_* codes below
   output logic [15:0] cqe_status_last,   // {1'b0, DW3[31:17]} of the most recent CQE
   input  logic        start_shutdown,
-  output logic        shutdown_done,
+  output logic        shutdown_done,     // level, drops in the cycle start_shutdown is accepted
   output logic        shutdown_timeout,  // shutdown_done reached without SHST==10b (or a bus error)
 
   // ---- results of Identify / CAP ----
@@ -119,6 +133,11 @@ module nvme_admin
 
   localparam int unsigned ASQ_W = $clog2(ADMIN_QSIZE);   // entry index width (5)
 
+  // elaboration-time check: a slot is described by ONE PRP list page (<= 2 MiB, prp_synth.sv)
+  if (SLOT_BYTES > 2*1024*1024 || SLOT_BYTES < 512) begin : g_slot_check
+    $error("nvme_admin: SLOT_BYTES (%0d) must be in [512, 2 MiB]", SLOT_BYTES);
+  end
+
   // fail_step codes
   localparam logic [7:0] F_NONE       = 8'h00;
   localparam logic [7:0] F_CAP_LO     = 8'h01;  // BAR0 access error: CAP low
@@ -138,6 +157,7 @@ module nvme_admin
   localparam logic [7:0] F_NS_MS      = 8'h11;  // namespace format has metadata (MS != 0)
   localparam logic [7:0] F_NS_LBADS   = 8'h12;  // LBADS out of the 512 B .. 32 KiB range
   localparam logic [7:0] F_CQE_CID    = 8'h13;  // CQE.CID does not match the submitted command
+  localparam logic [7:0] F_MDTS       = 8'h14;  // MDTS != 0 and SLOT_BYTES > 4096 << MDTS
   localparam logic [7:0] F_CMD_STATUS = 8'h20;  // | CID[4:0]: CQE status != 0
   localparam logic [7:0] F_CMD_TMO    = 8'h40;  // | CID[4:0]: no CQE within ADMIN_TIMEOUT_MS
 
@@ -150,7 +170,7 @@ module nvme_admin
   localparam logic [7:0] IDN_BEAT_FLBAS= 8'd1;    // bytes 16..31   (FLBAS = byte 26)
   localparam int unsigned IDN_OFS_FLBAS= 10;
   localparam logic [7:0] IDN_BEAT_LBAF = 8'd8;    // bytes 128..    (LBAF[n] = 128 + 4n)
-  localparam logic [7:0] SQES_EXPECT   = 8'h66;
+  localparam logic [7:0] SQES_EXPECT   = 8'h66;    // only the exponents are used: 6 (64 B SQE), 4 (16 B CQE)
   localparam logic [7:0] CQES_EXPECT   = 8'h44;
 
   // Admin command kinds
@@ -256,6 +276,18 @@ module nvme_admin
     return s;
   endfunction
 
+  // SQES/CQES nibble check: [3:0] = required size (must be <= ours), [7:4] = maximum (must be >= ours)
+  function automatic bit qes_ok(input logic [7:0] v, input logic [3:0] want);
+    return (v[3:0] <= want) && (v[7:4] >= want);
+  endfunction
+
+  // MDTS (units of the minimum page size 4 KiB, 0 = no limit): true if one slot exceeds it
+  function automatic bit mdts_too_small(input logic [7:0] m);
+    if (m == 8'd0)        return 1'b0;
+    else if (m >= 8'd21)  return 1'b0;                     // 4 KiB << 21 = 8 GiB > any SLOT_BYTES
+    else                  return (64'(SLOT_BYTES) > (64'd4096 << m));
+  endfunction
+
   logic [511:0] sqe_v;
   assign sqe_v = build_sqe(cmd_kind, cid);
 
@@ -324,6 +356,16 @@ module nvme_admin
   assign dbg_acq_head = 8'(acq_head);
 
   // ---------------------------------------------------------------------------
+  // registered flags and their start-edge masks
+  logic init_done_r, init_fail_r, shutdown_done_r, shutdown_timeout_r;
+  wire  st_init_evt = (state == S_IDLE) && start_init;
+  wire  st_shn_evt  = (state == S_IDLE) && !start_init && start_shutdown;
+  assign init_done        = init_done_r        & ~st_init_evt;
+  assign init_fail        = init_fail_r        & ~st_init_evt;
+  assign shutdown_done    = shutdown_done_r    & ~st_shn_evt;
+  assign shutdown_timeout = shutdown_timeout_r & ~st_shn_evt;
+
+  // ---------------------------------------------------------------------------
   // Tasks (called only from the always_ff below)
   // ---------------------------------------------------------------------------
   task automatic mm_rd(input logic [15:0] off, input logic [7:0] step, input state_t nxt);
@@ -348,10 +390,10 @@ module nvme_admin
   // ends the sequence early, flagged by shutdown_timeout.
   task automatic do_fail(input logic [7:0] code);
     if (in_shutdown) begin
-      shutdown_done    <= 1'b1;
-      shutdown_timeout <= 1'b1;
+      shutdown_done_r    <= 1'b1;
+      shutdown_timeout_r <= 1'b1;
     end else begin
-      init_fail <= 1'b1;
+      init_fail_r <= 1'b1;
       fail_step <= code;
     end
     state <= S_IDLE;
@@ -371,12 +413,12 @@ module nvme_admin
   always_ff @(posedge clk) begin
     if (rst) begin
       state            <= S_IDLE;
-      init_done        <= 1'b0;
-      init_fail        <= 1'b0;
+      init_done_r        <= 1'b0;
+      init_fail_r        <= 1'b0;
       fail_step        <= F_NONE;
       cqe_status_last  <= 16'h0;
-      shutdown_done    <= 1'b0;
-      shutdown_timeout <= 1'b0;
+      shutdown_done_r    <= 1'b0;
+      shutdown_timeout_r <= 1'b0;
       lbads            <= 4'd0;
       nsze             <= 64'd0;
       mdts             <= 8'd0;
@@ -414,11 +456,11 @@ module nvme_admin
         // ---------------------------------------------------------------
         S_IDLE: begin
           if (start_init) begin
-            init_done        <= 1'b0;
-            init_fail        <= 1'b0;
+            init_done_r        <= 1'b0;
+            init_fail_r        <= 1'b0;
             fail_step        <= F_NONE;
-            shutdown_done    <= 1'b0;
-            shutdown_timeout <= 1'b0;
+            shutdown_done_r    <= 1'b0;
+            shutdown_timeout_r <= 1'b0;
             in_shutdown      <= 1'b0;
             asq_tail         <= '0;
             acq_head         <= '0;
@@ -427,15 +469,15 @@ module nvme_admin
             cmd_seq          <= 3'd0;
             mm_rd(NVME_CAP_LO, F_CAP_LO, S_CAP_LO_DONE);
           end else if (start_shutdown) begin
-            shutdown_done    <= 1'b0;
-            shutdown_timeout <= 1'b0;
+            shutdown_done_r    <= 1'b0;
+            shutdown_timeout_r <= 1'b0;
             in_shutdown      <= 1'b1;
             cmd_seq          <= 3'd0;
-            if (init_done) begin
+            if (init_done_r) begin
               state <= S_CMD_START;
             end else begin               // never initialised: nothing to shut down
-              shutdown_done    <= 1'b1;
-              shutdown_timeout <= 1'b1;
+              shutdown_done_r    <= 1'b1;
+              shutdown_timeout_r <= 1'b1;
             end
           end
         end
@@ -490,8 +532,8 @@ module nvme_admin
           if (mm_rdata[0]) begin                        // controller still enabled -> disable it first
             mm_wr(BAR0_ADDR + 32'(NVME_CC), 32'h0, F_CC_DISABLE, S_CC_DIS_DONE);
           end else begin
-            state <= S_CLEAR_PULSE;
-          end
+            state <= S_CC_DIS_DONE;                     // EN already 0, but RDY may still be 1 (reset
+          end                                           // in progress): always wait for CSTS.RDY == 0
         end
         S_CC_DIS_DONE: begin
           poll_mode  <= POLL_RDY0;
@@ -518,7 +560,7 @@ module nvme_admin
             end
             default: begin   // POLL_SHST
               if (mm_rdata[3:2] == 2'b10) begin
-                shutdown_done <= 1'b1;
+                shutdown_done_r <= 1'b1;
                 state         <= S_IDLE;
               end else begin
                 state <= S_POLL_WAIT;
@@ -532,8 +574,8 @@ module nvme_admin
               POLL_RDY0: do_fail(F_RDY0_TO);
               POLL_RDY1: do_fail(F_RDY1_TO);
               default: begin
-                shutdown_done    <= 1'b1;
-                shutdown_timeout <= 1'b1;
+                shutdown_done_r    <= 1'b1;
+                shutdown_timeout_r <= 1'b1;
                 state            <= S_IDLE;
               end
             endcase
@@ -636,10 +678,12 @@ module nvme_admin
                 mdts    <= ident_rd_data[8*IDC_OFS_MDTS +: 8];
                 ex_addr <= IDC_BEAT_QES;
                 ex_step <= 2'd1;
+                if (mdts_too_small(ident_rd_data[8*IDC_OFS_MDTS +: 8])) do_fail(F_MDTS);
               end
               default: begin
                 vwc <= ident_rd_data[8*IDC_OFS_VWC];
-                if (ident_rd_data[7:0] != SQES_EXPECT || ident_rd_data[15:8] != CQES_EXPECT) do_fail(F_IDENT_QES);
+                if (!qes_ok(ident_rd_data[7:0], SQES_EXPECT[3:0]) || !qes_ok(ident_rd_data[15:8], CQES_EXPECT[3:0]))
+                  do_fail(F_IDENT_QES);
                 else state <= S_CMD_FINISH;
               end
             endcase
@@ -670,7 +714,7 @@ module nvme_admin
           cmd_seq <= cmd_seq + 1'b1;
           if (!in_shutdown) begin
             if (cmd_seq == 3'(INIT_CMDS-1)) begin
-              init_done <= 1'b1;
+              init_done_r <= 1'b1;
               state     <= S_IDLE;
             end else begin
               state <= S_CMD_START;

@@ -40,6 +40,7 @@ module tb_rx_adapt;
 
   pcie7x_rx_adapt dut (.*);
 
+  logic [4:0]   np_ext_count = 5'd0;      // completer request FIFO occupancy (driven by the np test)
   initial np_backpressure = 1'b0;
 
   // ---------------------------------------------------------------- TLP records

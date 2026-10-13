@@ -21,9 +21,31 @@
 //  host_sequencer: link -> enum -> Root Port cfg -> NVMe init -> run -> drain
 //     -> flush -> shutdown (see host_sequencer.sv).
 //
-// Inputs ctrl_start / ctrl_stop / link_* must already be synchronous to user_clk
-// (nvme_host_top synchronises them).  Stop semantics: stop the data stream first,
-// then assert ctrl_stop; a partially filled ring slot is never written to the SSD.
+// Inputs ctrl_start / ctrl_stop / link_ready / link_gen2 / link_width must already be
+// synchronous to user_clk (nvme_host_top synchronises them).  Stop semantics: stop the data
+// stream first, then assert ctrl_stop; a partially filled ring slot is never written to the SSD.
+//
+// link_lost / link_fail are the STICKY flags of link_bringup (link_clk domain, cleared only by
+// the board reset).  They are asynchronous to user_clk and are synchronised HERE (2-FF,
+// ASYNC_REG, no reset on purpose: user_reset must not wipe them).  link_lost keeps the
+// sequencer in IDLE with E_LINK_LOST after a link drop (the IP's user_reset would otherwise
+// erase the error and the still-high ctrl_start would restart the recording over its own data);
+// link_fail gives E_LINK_TIMEOUT.  Both default to 0 when left unconnected.
+//
+// Data path.  s_data_tready is held low while the core is in reset, while data_rst is
+// active and until the sequencer is in RUN (accept_enable = running) - see data_ring.
+// The write engine is restarted (pointers, flags, statistics) on every init_start, so
+// DONE/ERROR -> IDLE -> start runs the whole flow again without a reset.
+//
+// status_flags[7:0] (all sticky until reset / the next init_start where noted):
+//   [0] shutdown_timeout  SHST=10b not seen (or a bus error) during the NVMe shutdown
+//   [1] doorbell_err      a doorbell MWr was not completed with SC
+//   [2] io_timeout        a Write / the Flush did not complete within IO_TIMEOUT_MS
+//   [3] flush_skipped     the Flush was not executed (hung command after io_timeout)
+//   [4] link_fail         link never came up (link_bringup retries exhausted)
+//   [5] link_lost         the link dropped after link-up (survives user_reset)
+//   [6] io_error          a Write completed with status != 0 (stat_first_error_lba = its SLBA)
+//   [7] rx_drop           a received TLP was dropped (demux: Msg/IO/unknown/poisoned, writer: unmapped MWr)
 // =============================================================================
 module nvme_host_core
   import nvme_host_pkg::*;
@@ -33,6 +55,7 @@ module nvme_host_core
   parameter bit          SIM_FAST           = 1'b0,
   parameter int unsigned REQ_TIMEOUT_CYCLES = 1_250_000,        // 10 ms @ 125 MHz
   parameter int unsigned CLK_HZ             = 125_000_000,
+  parameter int unsigned IO_TIMEOUT_MS      = 30000,            // write engine: per-command timeout (0 = off)
   parameter logic [63:0] START_LBA          = 64'd0               // first LBA written
 ) (
   input  logic         user_clk,
@@ -70,6 +93,9 @@ module nvme_host_core
   input  logic         link_ready,
   input  logic         link_gen2,
   input  logic [1:0]   link_width,
+  // sticky link_bringup flags, link_clk domain (synchronised inside; unconnected = 0)
+  input  logic         link_lost = 1'b0,
+  input  logic         link_fail = 1'b0,
 
   // ---- user data stream (data_clk domain; full 16-byte beats only) ----
   input  logic         data_clk,
@@ -95,6 +121,7 @@ module nvme_host_core
   output logic [3:0]   status_seq_state,
   output logic         status_lba_range_err,
   output logic         status_shutdown_timeout,
+  output logic [7:0]   status_flags,             // see the bit map in the header
   output logic [63:0]  stat_bytes_done,
   output logic [63:0]  stat_cmds_done,
   output logic [31:0]  stat_cmd_errors,
@@ -107,7 +134,8 @@ module nvme_host_core
   output logic [15:0]  stat_unexpected_cpl,
   output logic [3:0]   stat_lbads,
   output logic [63:0]  stat_nsze,
-  output logic [7:0]   stat_mdts
+  output logic [7:0]   stat_mdts,
+  output logic [63:0]  stat_first_error_lba      // SLBA of the first failed Write (status_flags[6])
 );
 
   // ===========================================================================
@@ -138,13 +166,14 @@ module nvme_host_core
   logic [127:0] tx_tdata;  logic [15:0] tx_tkeep;  logic tx_tlast;  logic [1:0] tx_tuser;  logic tx_tvalid;  logic tx_tready;
 
   logic np_backpressure;
+  logic [4:0] np_count;
   logic demux_drop_inc, writer_drop_inc;
 
   pcie7x_rx_adapt u_rx_adapt (
     .clk(user_clk), .rst(user_rst),
     .m_axis_rx_tdata(m_axis_rx_tdata), .m_axis_rx_tkeep(m_axis_rx_tkeep), .m_axis_rx_tlast(m_axis_rx_tlast),
     .m_axis_rx_tvalid(m_axis_rx_tvalid), .m_axis_rx_tready(m_axis_rx_tready), .m_axis_rx_tuser(m_axis_rx_tuser),
-    .rx_np_ok(rx_np_ok), .np_backpressure(np_backpressure),
+    .rx_np_ok(rx_np_ok), .np_backpressure(np_backpressure), .np_ext_count(np_count),
     .m_tlp_tdata(rx_tdata), .m_tlp_tkeep(rx_tkeep), .m_tlp_tlast(rx_tlast), .m_tlp_tuser(rx_tuser),
     .m_tlp_tvalid(rx_tvalid), .m_tlp_tready(rx_tready));
 
@@ -218,6 +247,7 @@ module nvme_host_core
   assign p0_req_be    = en_req_valid ? en_req_be    : ad_req_be;
 
   logic [15:0] unexpected_cpl_cnt;
+  logic        ext_tag_en;                 // from pcie_enum (also programmed into the Root Port by rp_cfg_init)
 
   rp_requester u_requester (
     .clk(user_clk), .rst(user_rst),
@@ -229,7 +259,7 @@ module nvme_host_core
     .m_req_tuser(rq_tuser), .m_req_tready(rq_tready),
     .s_cpl_tdata(cpl_tdata), .s_cpl_tkeep(cpl_tkeep), .s_cpl_tlast(cpl_tlast), .s_cpl_tvalid(cpl_tvalid),
     .s_cpl_tuser(cpl_tuser), .s_cpl_tready(cpl_tready),
-    .requester_id(RP_ID), .unexpected_cpl_cnt(unexpected_cpl_cnt));
+    .requester_id(RP_ID), .ext_tag_en(ext_tag_en), .unexpected_cpl_cnt(unexpected_cpl_cnt));
 
   req_mux u_req_mux (
     .clk(user_clk), .rst(user_rst),
@@ -253,13 +283,13 @@ module nvme_host_core
   logic         cpl_rd_en_data;
   logic [127:0] data_rd_data;
   logic [2:0]   mps_code;
-  logic         ext_tag_en;
+  logic         seq_running;                // sequencer is in RUN (data_ring accept_enable)
 
   hostmem_completer #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES)) u_completer (
     .clk(user_clk), .rst(user_rst),
     .s_mrd_tdata(mrd_tdata), .s_mrd_tkeep(mrd_tkeep), .s_mrd_tlast(mrd_tlast), .s_mrd_tuser(mrd_tuser),
     .s_mrd_tvalid(mrd_tvalid), .s_mrd_tready(mrd_tready),
-    .np_backpressure(np_backpressure),
+    .np_backpressure(np_backpressure), .np_count(np_count),
     .m_cpl_tdata(cc_tdata), .m_cpl_tkeep(cc_tkeep), .m_cpl_tlast(cc_tlast), .m_cpl_tuser(cc_tuser),
     .m_cpl_tvalid(cc_tvalid), .m_cpl_tready(cc_tready),
     .mps_code(mps_code), .completer_id(RP_ID),
@@ -306,7 +336,7 @@ module nvme_host_core
   data_ring #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES)) u_data_ring (
     .data_clk(data_clk), .data_rst(data_rst),
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
-    .clk(user_clk), .rst(user_rst),
+    .clk(user_clk), .rst(user_rst), .accept_enable(seq_running),
     .slot_full(slot_full), .slot_free(slot_free), .slots_used(slots_used),
     .input_stalled(ring_input_stalled), .beats_in(stat_beats_in), .stall_cycles(stat_stall_cycles),
     .rd_en(cpl_rd_en_data), .rd_addr(cpl_rd_addr), .rd_data(data_rd_data));
@@ -318,13 +348,25 @@ module nvme_host_core
   logic        enum_done, enum_fail, rpcfg_done, init_done, init_fail, flush_done, shutdown_done;
   logic [7:0]  enum_fail_step, init_fail_step;
   logic        all_slots_free, slots_idle;
-  logic        seq_running, seq_done;
+  logic        seq_done;
   logic [7:0]  seq_error_code, seq_error_detail;
+  logic        io_timeout, flush_skipped, io_error, doorbell_err;
+
+  // sticky link flags: link_clk -> user_clk (no reset: user_reset must not clear them)
+  (* ASYNC_REG = "TRUE" *) logic [1:0] link_lost_sync = 2'b00, link_fail_sync = 2'b00;
+  always_ff @(posedge user_clk) begin
+    link_lost_sync <= {link_lost_sync[0], link_lost};
+    link_fail_sync <= {link_fail_sync[0], link_fail};
+  end
+  logic link_lost_uc, link_fail_uc;
+  assign link_lost_uc = link_lost_sync[1];
+  assign link_fail_uc = link_fail_sync[1];
 
   host_sequencer u_sequencer (
     .clk(user_clk), .rst(user_rst),
     .start(ctrl_start), .stop(ctrl_stop),
-    .link_ready(link_ready),
+    .link_ready(link_ready), .link_lost(link_lost_uc), .link_fail(link_fail_uc),
+    .io_timeout(io_timeout), .lba_range_err(status_lba_range_err),
     .enum_done(enum_done), .enum_fail(enum_fail), .enum_fail_step(enum_fail_step),
     .rpcfg_done(rpcfg_done),
     .init_done(init_done), .init_fail(init_fail), .init_fail_step(init_fail_step),
@@ -368,7 +410,7 @@ module nvme_host_core
   logic        shutdown_timeout;
   logic [7:0]  dbg_asq_tail, dbg_acq_head;
 
-  nvme_admin u_admin (
+  nvme_admin #(.SLOT_BYTES(SLOT_BYTES)) u_admin (
     .clk(user_clk), .rst(user_rst), .tick_ms(tick_ms),
     .start_init(seq_init_start), .init_done(init_done), .init_fail(init_fail), .fail_step(init_fail_step),
     .cqe_status_last(admin_cqe_status),
@@ -384,10 +426,10 @@ module nvme_host_core
     .ident_rd_en(ident_rd_en), .ident_rd_addr(ident_rd_addr), .ident_rd_data(ident_rd_data));
 
   logic [6:0] sq_tail, cq_head;
-  logic       sq_full_stall, doorbell_err;
+  logic       sq_full_stall;
 
-  nvme_write_engine #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES)) u_write_engine (
-    .clk(user_clk), .rst(user_rst), .tick_ms(tick_ms),
+  nvme_write_engine #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .IO_TIMEOUT_MS(IO_TIMEOUT_MS)) u_write_engine (
+    .clk(user_clk), .rst(user_rst), .tick_ms(tick_ms), .restart(seq_init_start),
     .enable(seq_we_enable), .start_lba(START_LBA), .lbads(lbads), .nsze(nsze), .dstrd(dstrd),
     .slot_full(slot_full), .slot_free(slot_free),
     .iosq_wr_en(iosq_wr_en), .iosq_wr_addr(iosq_wr_addr), .iosq_wr_data(iosq_wr_data),
@@ -401,7 +443,9 @@ module nvme_host_core
     .max_latency_cycles(stat_max_latency), .sq_full_stall(sq_full_stall),
     .sq_full_stall_cycles(stat_sq_full_stall_cycles),
     .sq_tail(sq_tail), .cq_head(cq_head), .slots_idle(slots_idle),
-    .lba_range_err(status_lba_range_err), .doorbell_err(doorbell_err));
+    .lba_range_err(status_lba_range_err), .doorbell_err(doorbell_err),
+    .io_timeout(io_timeout), .flush_skipped(flush_skipped), .io_error(io_error),
+    .first_error_lba(stat_first_error_lba));
 
   // ===========================================================================
   // Status
@@ -412,6 +456,15 @@ module nvme_host_core
     else if (enum_done)   enum_ok_q <= 1'b1;
     else if (seq_enum_start) enum_ok_q <= 1'b0;
   end
+
+  logic rx_drop_q;
+  always_ff @(posedge user_clk) begin
+    if (user_rst)                            rx_drop_q <= 1'b0;
+    else if (demux_drop_inc || writer_drop_inc) rx_drop_q <= 1'b1;
+  end
+
+  assign status_flags = {rx_drop_q, io_error, link_lost_uc, link_fail_uc,
+                         flush_skipped, io_timeout, doorbell_err, shutdown_timeout};
 
   assign status_link_up          = link_ready;
   assign status_gen2             = link_gen2;

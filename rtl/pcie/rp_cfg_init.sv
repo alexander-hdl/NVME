@@ -15,7 +15,9 @@
 //                                                 other bits (incl. MRRS) preserved
 //
 // start is edge-sensitive (a rising edge begins a run); done goes high when the
-// sequence has finished and stays high until the next run starts.
+// sequence has finished and stays high until the next run starts.  It drops in the very
+// cycle of the start edge (done = done_r & ~start_evt), so a sequencer never sees the
+// done flag of the previous run in the cycle in which it issues start.
 // mps_code / ext_tag_en are sampled when the modified DevCtl value is built.
 // =============================================================================
 module rp_cfg_init
@@ -25,7 +27,7 @@ module rp_cfg_init
   input  logic        rst,
 
   input  logic        start,
-  output logic        done,
+  output logic        done,       // level; cleared in the SAME cycle as the start edge (comb. mask)
   input  logic [2:0]  mps_code,
   input  logic        ext_tag_en,
 
@@ -109,18 +111,22 @@ module rp_cfg_init
     endcase
   end
 
+  logic done_r;
+  wire  start_evt = start && !start_q && (state == S_IDLE || state == S_DONE);
+  assign done = done_r & ~start_evt;
+
   always_ff @(posedge clk) begin
     if (rst) begin
       state       <= S_IDLE;
       start_q     <= 1'b0;
-      done        <= 1'b0;
+      done_r        <= 1'b0;
       devctl_rd_q <= '0;
     end else begin
       start_q <= start;
       case (state)
         S_IDLE, S_DONE: begin
           if (start && !start_q) begin
-            done  <= 1'b0;
+            done_r  <= 1'b0;
             state <= S_WR_CMD;
           end
         end
@@ -139,7 +145,7 @@ module rp_cfg_init
 
         S_WR_DEV:  if (cfg_mgmt_rd_wr_done) state <= S_GAP_DEV;
         S_GAP_DEV: begin
-          done  <= 1'b1;
+          done_r  <= 1'b1;
           state <= S_DONE;
         end
 

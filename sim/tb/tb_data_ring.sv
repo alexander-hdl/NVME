@@ -16,6 +16,14 @@
 //          whole slot back and compare with the stream, free it after a random
 //          delay; source valid probability < 1 (so FIFO empties too).
 // Finish   every accepted beat is accounted for (beats_in) and no data is lost.
+//
+// Acceptance checks (review M5): "tvalid && tready" must always mean "the beat is stored".
+//   Phase 0  source valid during data_rst, then with both resets released but accept_enable = 0:
+//            s_data_tready must be 0 at every edge, nothing is accepted, beats_in stays 0.
+//   Phase 4  user-clock reset `rst` asserted mid-stream (data_rst low): s_data_tready must be low
+//            from the 4th data_clk edge on (synchroniser latency) until it is released; then
+//            accept_enable dropped: tready low again from the 4th edge on and no beat accepted.
+//   A monitor counts any edge with tready high while data_rst is active.
 // =============================================================================
 module tb_data_ring;
   import nvme_host_pkg::*;
@@ -41,11 +49,13 @@ module tb_data_ring;
   logic         rd_en = 1'b0;
   logic [31:0]  rd_addr = 32'd0;
   logic [127:0] rd_data;
+  logic         accept_enable = 1'b0;
+  bit           force_valid = 1'b0;      // present tvalid even during data_rst (Phase 0)
 
   data_ring #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .FIFO_DEPTH(FIFO_DEPTH)) dut (
     .data_clk(data_clk), .data_rst(data_rst),
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
-    .clk(clk), .rst(rst),
+    .clk(clk), .rst(rst), .accept_enable(accept_enable),
     .slot_full(slot_full), .slot_free(slot_free), .slots_used(slots_used),
     .input_stalled(input_stalled), .beats_in(beats_in), .stall_cycles(stall_cycles),
     .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data));
@@ -73,7 +83,7 @@ module tb_data_ring;
 
   always @(posedge data_clk) begin
     if (data_rst) begin
-      s_data_tvalid <= 1'b0; prod_idx <= 0; accepted <= 0;
+      s_data_tvalid <= force_valid; prod_idx <= 0; accepted <= 0;
     end else begin
       if (s_data_tvalid && s_data_tready) begin
         prod_idx <= prod_idx + 1;
@@ -83,6 +93,18 @@ module tb_data_ring;
         s_data_tvalid <= prod_run && ($urandom_range(0, 99) < valid_prob);
       end
     end
+  end
+
+  // ---------------- acceptance monitor ----------------
+  int viol_rst = 0, viol_syn = 0, viol_acc = 0;
+  int rst_age = 0, acc_off_age = 0;
+  bit mon_en = 1'b1;
+  always @(posedge data_clk) if (mon_en) begin
+    if (data_rst && s_data_tready !== 1'b0) viol_rst++;
+    rst_age     = rst ? rst_age + 1 : 0;
+    acc_off_age = accept_enable ? 0 : acc_off_age + 1;
+    if (rst_age >= 4 && s_data_tready !== 1'b0) viol_syn++;
+    if (acc_off_age >= 4 && s_data_tready !== 1'b0) viol_acc++;
   end
 
   // ---------------- read helper ----------------
@@ -134,8 +156,23 @@ module tb_data_ring;
 
   initial begin
     for (int k = 0; k < N_SLOTS; k++) lap_of[k] = 0;
+    // ================= Phase 0: no acceptance in reset / while disabled =================
+    force_valid = 1'b1;
+    repeat (40) @(posedge data_clk);                      // data_rst and rst active, source presents data
+    if (s_data_tready !== 1'b0) fail("Phase 0: s_data_tready high during reset");
+    @(posedge clk);
+    rst <= 1'b0; data_rst <= 1'b0; prod_run = 1;          // resets released, accept_enable still 0
+    repeat (200) @(posedge data_clk);
+    if (s_data_tready !== 1'b0) fail("Phase 0: s_data_tready high while accept_enable = 0");
+    if (s_data_tvalid !== 1'b1) fail("Phase 0: source not presenting data");
+    if (accepted != 0 || beats_in !== 64'd0) fail($sformatf("Phase 0: beat accepted while disabled (accepted %0d, beats_in %0d)", accepted, beats_in));
+    $display("Phase 0: tready stays low in reset and while accept_enable=0 (accepted=%0d)", accepted);
+    force_valid = 1'b0; prod_run = 0;
     repeat (5) @(posedge clk);
-    rst <= 1'b0; data_rst <= 1'b0;
+    // synchronised release: the source restarts from the pattern origin at the first free slot
+    data_rst <= 1'b1; repeat (4) @(posedge clk); data_rst <= 1'b0;
+    repeat (5) @(posedge clk);
+    accept_enable = 1'b1;
     repeat (5) @(posedge clk);
 
     // ================= Phase 1: fill, no frees =================
@@ -215,6 +252,39 @@ module tb_data_ring;
     for (int k = 0; k < N_SLOTS; k++) if (slot_full[k]) free_slot(k);
     repeat (6000) @(posedge clk);
     if (beats_in !== accepted) fail($sformatf("beats_in %0d != accepted %0d", beats_in, accepted));
+    if (viol_rst != 0) fail("acceptance monitor: tready high during data_rst");
+    // ================= Phase 4: user-clock reset and accept_enable =================
+    begin
+      longint unsigned acc0;
+      int t;
+      // free everything, run the source again from the current state
+      for (int k = 0; k < N_SLOTS; k++) if (slot_full[k]) free_slot(k);
+      valid_prob = 100; prod_run = 1;
+      t = 0; while (accepted < 20 && t < 2000) begin @(posedge clk); t++; end
+      if (accepted < 20) fail("Phase 4: source did not run");
+      @(posedge clk); rst <= 1'b1;                        // user_reset (IP link drop), data_rst stays low
+      repeat (40) @(posedge data_clk);
+      if (s_data_tready !== 1'b0) fail("Phase 4: s_data_tready high while rst is active");
+      acc0 = accepted;
+      repeat (60) @(posedge data_clk);
+      if (accepted != acc0) fail("Phase 4: a beat was accepted while rst was active");
+      @(posedge clk); rst <= 1'b0;
+      t = 0; while (accepted == acc0 && t < 400) begin @(posedge clk); t++; end
+      if (accepted == acc0) fail("Phase 4: tready never came back after rst");
+      repeat (50) @(posedge clk);
+      // accept_enable low: acceptance stops
+      accept_enable = 1'b0;
+      repeat (10) @(posedge data_clk);
+      acc0 = accepted;
+      repeat (200) @(posedge data_clk);
+      if (s_data_tready !== 1'b0) fail("Phase 4: tready high with accept_enable = 0");
+      if (accepted != acc0) fail("Phase 4: beat accepted with accept_enable = 0");
+      $display("Phase 4: rst and accept_enable hold tready low (viol_rst=%0d viol_syn=%0d viol_acc=%0d)", viol_rst, viol_syn, viol_acc);
+      prod_run = 0;
+      mon_en = 1'b0;
+    end
+    if (viol_rst != 0 || viol_syn != 0 || viol_acc != 0)
+      fail($sformatf("acceptance monitor: viol_rst=%0d viol_syn=%0d viol_acc=%0d", viol_rst, viol_syn, viol_acc));
     $display("SUMMARY: accepted=%0d beats_in=%0d reads_checked=%0d stall_cycles=%0d errors=%0d",
              accepted, beats_in, reads_checked, stall_cycles, errors);
     if (errors != 0) $fatal(1, "TEST FAILED");

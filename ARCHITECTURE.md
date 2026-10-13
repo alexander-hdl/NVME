@@ -1,6 +1,6 @@
 # NVMe host on bare Kintex-7 — architecture specification
 
-Status: v1.0 (design contract for implementation). Owner: project architect.
+Status: v1.1 (design contract; v1.1 = RTL-review fixes M1-M6 / m1-m12, see research/04_rtl_review.md). Owner: project architect.
 Language: SystemVerilog-2012 (synthesizable subset accepted by Vivado 2022.2 and xsim).
 Target: Xilinx Kintex-7 (XC7K325T-2 reference), `pcie_7x` v3.3 integrated block, **Root Port, Gen2 x4,
 AXI-Stream 128-bit @ 125 MHz** (`user_clk`). Goal: sustained sequential NVMe write at the PCIe Gen2 x4
@@ -117,13 +117,18 @@ module axis_fifo_sync #(parameter W = 128, parameter UW = 2, parameter DEPTH = 1
   output [W-1:0] m_tdata, output [W/8-1:0] m_tkeep, output m_tlast, output [UW-1:0] m_tuser, output m_tvalid, input m_tready,
   output [$clog2(DEPTH):0] count, output almost_full /* count >= DEPTH-2 */);
 
-// Asynchronous FIFO (gray pointers, 2-FF synchronisers), data only. DEPTH power of 2.
+// Asynchronous FIFO (gray pointers, 2-FF ASYNC_REG synchronisers), data only. DEPTH power of 2.
+// Reset: each side's reset is also synchronised (2 FF) into the other domain and held there, so a reset
+// of EITHER domain clears both pointers and the FIFO stays held until both domains are out of reset.
+// s_tready is LOW while the write side is held in reset (s_rst | synchronised m_rst | one settle cycle)
+// and m_tvalid is low while the read side is held: "tvalid && tready" always means "the beat is stored".
 module axis_fifo_async #(parameter W = 128, parameter DEPTH = 512) (
   input s_clk, input s_rst, input [W-1:0] s_tdata, input s_tvalid, output s_tready,
   input m_clk, input m_rst, output [W-1:0] m_tdata, output m_tvalid, input m_tready);
 
 // Simple dual-port RAM, byte-enable write, 2-cycle read latency (BRAM output register + pipeline register).
-module sdp_ram #(parameter DEPTH = 256, parameter W = 128) (
+// OUT_REG = 0 (used by data_ring only) drops the output register: rd_data valid 1 cycle after rd_en.
+module sdp_ram #(parameter DEPTH = 256, parameter W = 128, parameter bit OUT_REG = 1) (
   input clk,
   input wr_en, input [W/8-1:0] wr_be, input [$clog2(DEPTH)-1:0] wr_addr, input [W-1:0] wr_data,
   input rd_en, input [$clog2(DEPTH)-1:0] rd_addr, output [W-1:0] rd_data /* valid 2 cycles after rd_en */);
@@ -147,12 +152,17 @@ for 3DW headers. `hostmem_completer` = memory beats → `dw_shift(left, addr[3:2
 `hostmem_writer` = payload → `dw_shift(right, addr[3:2])` → byte-enable write beats.
 
 Clocking: one domain `user_clk` (125 MHz) for everything except the user data input (`data_clk`, any frequency,
-crossed inside `data_ring` by an async FIFO) and the free-running 100 MHz-derived `init_clk` used only by `link_bringup`
-timers before `user_clk` is stable (the pcie_7x `user_clk_out` is present once the MMCM locks; `link_bringup` runs on
-`sys_clk`-derived clock to be safe).
+crossed inside `data_ring` by an async FIFO) and the free-running `link_clk` used only by `link_bringup`
+timers before `user_clk` is stable (the pcie_7x `user_clk_out` is present once the MMCM locks). `link_clk` is the
+IBUFDS_GTE2 `ODIV2` output through a BUFG = **refclk / 2 = 50 MHz** for the 100 MHz PCIe reference clock (Vivado derives
+`refclk_odiv2` with a 20 ns period); `link_bringup`'s `CLK_HZ` default is 50_000_000 and the top passes `LINK_CLK_HZ = 50_000_000`.
+Re-check on hardware, the PERST# timing depends on it.
 
 Reset: `user_reset` from the core (synchronous, active high) → all `nvme_host_core` logic. `link_bringup` has its own
-reset from the board.
+reset from the board. The core's `user_reset` is asserted by the IP on **every PERST# cycle** (link drop, retrain) and wipes
+the whole host core; therefore information that must survive a link drop (`link_lost`, `link_fail`) lives in `link_bringup`
+(link_clk domain, cleared only by the board reset) and is synchronised into the core (see §5.12, §5.17). Every 2-FF
+synchroniser in `rtl/` carries `(* ASYNC_REG = "TRUE" *)`.
 
 ---
 
@@ -166,8 +176,9 @@ All modules: `input logic clk, input logic rst` (rst synchronous, active high).
 // core side (PG054 128-bit RX)
 input  [127:0] m_axis_rx_tdata;  input [15:0] m_axis_rx_tkeep;  input m_axis_rx_tlast;  // tlast unused in 128b mode
 input          m_axis_rx_tvalid; output       m_axis_rx_tready; input [21:0] m_axis_rx_tuser;
-output         rx_np_ok;         // 1 unless the internal MRd queue is nearly full (see completer)
+output         rx_np_ok;         // registered; 1 unless the end-to-end MRd queue is nearly full (see below)
 input          np_backpressure;  // from completer: request FIFO almost full
+input  [4:0]   np_ext_count;     // from completer: request FIFO occupancy (MRd queued there), 0..16
 // internal
 output tlp_axis m_tlp (tdata, tkeep, tlast, tvalid, tuser[1:0]); input m_tlp_tready;
 ```
@@ -179,7 +190,15 @@ byte-swapped (`bswap32`). `tuser[0] = tuser_core[1]` (err_fwd), `tuser[1] = tuse
 Length: for data TLPs use `Length` from H0 to compute the last beat's `tkeep`; do not rely on core `tkeep`.
 Throughput: must accept one core beat per cycle when the sink is ready, except that a straddled beat may take 2 output
 beats (internal elastic buffer ≥ 4 beats). `m_axis_rx_tready` may be deasserted (core allows it).
-`rx_np_ok = ~np_backpressure`.
+**Core-side register slice (M1).** The core input first passes through an `axis_skid` (128 data + 22 tuser bits), so
+`m_axis_rx_tready` is a register output (`~skid_valid`) instead of a ~19-level combinational function of the splitter and of
+the downstream FIFOs (which then also continued into the IP's `rx_null_gen`). It costs one cycle of latency and no bandwidth;
+`tb_rx_adapt` still requires a saturated output (1 core beat/cycle for non-straddled traffic). The splitter uses 2/3-bit lane
+numbers and counts (no 32-bit `int`; the 11-bit payload remainder is compared through its upper bits only).
+**`rx_np_ok` (m5).** `np_cnt` = number of MRd headers in the adapter's header FIFO (+1 when an MRd header is pushed, −1 when it
+leaves). `rx_np_ok <= !np_backpressure && (np_cnt + np_ext_count < HDR_FIFO_DEPTH + NP_EXT_DEPTH − 2)` (8 + 16 − 2 = 22): the
+core is told to bypass non-posted TLPs when the end-to-end queue is two entries short of full. Posted/completion headers are not counted
+(`tb_rx_np`).
 
 ### 5.2 `pcie7x_tx_adapt`
 ```
@@ -216,7 +235,8 @@ won the previous round, let the requester go once (prevents doorbell starvation)
 ### 5.5 `hostmem_completer`
 ```
 input tlp_axis s_mrd; output s_mrd_tready;         // MRd headers only (header-only packets)
-output np_backpressure;                           // request FIFO has < 2 free entries
+output np_backpressure;                           // request FIFO has < 2 free entries (almost full)
+output [4:0] np_count;                            // request FIFO occupancy 0..16 (feeds rx_np_ok in pcie7x_rx_adapt)
 output tlp_axis m_cpl; input m_cpl_tready;         // CplD / Cpl(UR)
 input  [2:0] mps_code;                             // 0=128,1=256,2=512 (programmed value)
 input  [15:0] completer_id;                        // 16'h0000 (RP bus 0 dev 0 fn 0)
@@ -281,11 +301,19 @@ latency like the RAMs.
 // user data input (data_clk domain)
 input data_clk, data_rst; input [127:0] s_data_tdata; input s_data_tvalid; output s_data_tready; (tkeep ignored: full beats only; tlast ignored)
 // user_clk domain
+input  accept_enable;   // driven by the core from the sequencer's `running` (default 1); synchronised into data_clk
 output [N_SLOTS-1:0] slot_full;  input [N_SLOTS-1:0] slot_free;  // free = pulse per slot after its CQE
 output [$clog2(N_SLOTS):0] slots_used;  output logic input_stalled; // tready low on input (stat)
 // completer read port
 input  [ADDR_W-1:0] rd_addr; input rd_en; output [127:0] rd_data;  (2-cycle latency, region-relative beat address)
 ```
+**`s_data_tready` is the only valid handshake (M5).** It is 0 whenever `data_rst` is active, whenever the user_clk reset `rst` is
+active (the async FIFO holds both domains in reset, see §4b), and whenever `accept_enable` is low (before the write engine is
+enabled, in DRAIN/FLUSH/SHUTDOWN, after an error). The enable gates BOTH tvalid and tready of the FIFO, so a handshake always
+means the beat was stored; a source that obeys tready never loses data before RUN, during a link retrain or after stop.
+Read side (m9): rd_addr / rd_en are registered once per slot (`dont_touch`, `max_fanout = 32`, ≤ SLOT_BYTES/4096 RAMB36 per register)
+and the slot RAMs use `sdp_ram OUT_REG = 0`: the copy is the first of the two read stages, the RAM latch the second, so the
+2-cycle latency contract is unchanged.
 Behaviour: async FIFO (depth 512 beats) → sequential write pointer over the BRAM ring (`N_SLOTS·SLOT_BYTES/16`
 beats). Slot k becomes `slot_full[k]=1` when its last beat is written. Writing into a slot that is still full
 (not yet freed) is blocked → FIFO fills → `s_data_tready=0`. `slot_free[k]` clears the flag. Stats: total beats in,
@@ -300,16 +328,18 @@ input  [31:0] req_addr;   // MRd/MWr: byte address (DW aligned). Cfg: {bus[7:0],
 input  [31:0] req_wdata;  // little-endian value
 input  [3:0]  req_be;     // first BE
 output rsp_valid;         // one pulse per command (MWr: immediately after send, status SC)
-output [2:0]  rsp_status; // 0=SC, 1=UR, 2=CRS, 3=CA, 4=TIMEOUT, 5=UNEXPECTED(len/tag)
+output [2:0]  rsp_status; // 0=SC, 1=UR, 2=CRS, 3=CA, 4=TIMEOUT, 5=UNEXPECTED (right tag, wrong shape: length/poison)
 output [31:0] rsp_rdata;
 input  [31:0] timeout_cycles;  // parameterizable; default 10 ms @125 MHz = 1_250_000; sims use small values
 // streams
 output tlp_axis m_req; input m_req_tready;      // to tx arbiter
 input  tlp_axis s_cpl; output s_cpl_tready;     // from rx demux (Cpl/CplD)
 input  [15:0] requester_id;                     // 16'h0000
+input  ext_tag_en;                              // from pcie_enum: 1 = Extended Tag Enable programmed, 8-bit tags allowed
 ```
-One outstanding non-posted request at a time; tag increments per request (8-bit). Unexpected completions (tag
-mismatch, late) are consumed and counted. For CfgRd/MRd the CplD payload DW is already little-endian (adapter).
+One outstanding non-posted request at a time; the tag increments per request and is **5 bits (tag[7:5] = 0) unless `ext_tag_en`**
+(PCIe: the upper bits must be 0 while ETE = 0; one request in flight, so 5 bits are plenty). Unexpected completions (tag
+mismatch, late) are consumed and counted in `unexpected_cpl_cnt` (they do not produce status 5). For CfgRd/MRd the CplD payload DW is already little-endian (adapter).
 
 ### 5.11 `req_mux`
 Two command ports with the `rp_requester` command-port signature, fixed priority to port 0 (admin) but port 1
@@ -317,22 +347,32 @@ Two command ports with the `rp_requester` command-port signature, fixed priority
 
 ### 5.12 `link_bringup`
 ```
-input  clk (free-running, e.g. 100 MHz from refclk via BUFG or the board clock), rst;
+input  clk (free-running; in nvme_host_top = IBUFDS_GTE2 ODIV2 -> BUFG = refclk/2 = 50 MHz), rst (board reset, synchronous release);
 input  user_lnk_up, [5:0] pl_ltssm_state, pl_sel_lnk_rate, [1:0] pl_sel_lnk_width, pl_link_gen2_cap, pl_link_partner_gen2_supported;
-output perst_n;          // to SSD
+output perst_n;          // to SSD, ACTIVE LOW (an active-high reset input, e.g. Opsero FMC M.2 adapters, needs ONE inverter in front of the pin)
 output sys_rst_n;        // to pcie_7x
-output link_ready;       // link up and ≥100 ms elapsed since PERST# release
+output link_ready;       // link up and >=100 ms elapsed since link-up (+ Gen2 wait)
 output link_gen2;        // 1 if 5 GT/s was reached (informational)
 output [1:0] link_width;
-parameter PERST_HOLD_MS = 100, POST_PERST_MS = 100, GEN2_WAIT_MS = 100; parameter CLK_HZ = 100_000_000;
+output link_lost;        // STICKY: link dropped after READY (cleared by rst only)          -> nvme_host_core.link_lost
+output link_fail;        // STICKY: link-up timeout, LINK_RETRY_MAX retries exhausted        -> nvme_host_core.link_fail
+output [1:0] link_retries; // PERST# re-runs caused by link-up timeouts
+parameter CLK_HZ = 50_000_000, PERST_HOLD_MS = 100, POST_PERST_MS = 100, GEN2_WAIT_MS = 100,
+          LINK_TIMEOUT_MS = 2000, LINK_RETRY_MAX = 3 (<= 3), SIM_FAST = 0;
 ```
 FSM: `HOLD` (perst_n=0, sys_rst_n=0 for PERST_HOLD_MS) → `RELEASE` (sys_rst_n=1, then perst_n=1) → `WAIT_LNK`
 (user_lnk_up) → `WAIT_100MS` → `WAIT_GEN2` (until `pl_sel_lnk_rate && ltssm==6'h16`, or GEN2_WAIT_MS elapsed) →
-`READY`. If `user_lnk_up` drops in READY: `link_ready=0` and go back to HOLD (full retrain with PERST#).
+`READY`. If `user_lnk_up` drops in READY: `link_ready=0`, **`link_lost` is set (sticky)** and a full retrain with PERST# follows (HOLD).
+A drop before READY restarts the same way but does not set `link_lost` (no data run can have started).
+**Link-up timeout (m6):** `WAIT_LNK` waits at most LINK_TIMEOUT_MS; on timeout the PERST# cycle is re-run (HOLD) and `link_retries` counts,
+up to LINK_RETRY_MAX retries (= LINK_RETRY_MAX + 1 attempts); the next timeout enters `FAIL`: `perst_n = sys_rst_n = 0`, `link_fail = 1`
+until `rst`. Reaching READY clears the retry count. `link_lost`, `link_fail`, `link_retries` are link_clk-domain signals that are valid
+while the core is still held in reset; the top should bring them to LEDs / a VIO. The core receives `link_lost` / `link_fail` through its
+`link_lost` / `link_fail` inputs (2-FF ASYNC_REG synchronisers inside the core that user_reset does not clear).
 
 ### 5.13 `rp_cfg_init`
 ```
-input start; output done; input [2:0] mps_code; input ext_tag_en;
+input start; output done; input [2:0] mps_code; input ext_tag_en;   // done drops in the SAME cycle as the start edge
 // pcie_7x cfg_mgmt port
 output [31:0] cfg_mgmt_di; output [3:0] cfg_mgmt_byte_en; output [9:0] cfg_mgmt_dwaddr; output cfg_mgmt_wr_en, cfg_mgmt_rd_en;
 input  [31:0] cfg_mgmt_do; input cfg_mgmt_rd_wr_done; output cfg_mgmt_wr_readonly = 0, cfg_mgmt_wr_rw1c_as_rw = 0;
@@ -343,7 +383,7 @@ Sequence: WR dwaddr 0x001 = 0x0000_0006 (BE 0001); WR dwaddr 0x006 = 0x0001_0100
 ### 5.14 `pcie_enum`
 Uses a `rp_requester` command port. `input start; output done, fail; output [7:0] fail_step; output [2:0] mps_code;
 output ext_tag_en; output [31:0] vid_did; output [31:0] bar0_size_mask;` Steps (BDF 01:00.0, CRS retry with 1 ms
-delay up to `CRS_RETRY_MAX`=1000; UR/timeout → fail):
+delay up to `CRS_RETRY_MAX`=1000; UR/timeout → fail). `done`/`fail` latch until the next start but are masked (`done & ~start_evt`) in the cycle of the start edge, so a sequencer never samples the previous run's flags:
 1. CfgRd 0x00 → `vid_did` (≠ 0xFFFF_FFFF).
 2. CfgRd 0x08 → class; record `class_ok = (val[31:8]==24'h010802)` (warning only).
 3. CfgWr 0x10 = 0xFFFF_FFFF; CfgRd 0x10 → `bar0_size_mask`; CfgWr 0x14 = 0xFFFF_FFFF; CfgRd 0x14.
@@ -356,19 +396,21 @@ delay up to `CRS_RETRY_MAX`=1000; UR/timeout → fail):
 ### 5.15 `nvme_admin`
 Uses a requester command port (port 0 of `req_mux`), writes SQEs into `asq_ram`, polls `acq_ram`, reads `ident_ram`.
 ```
+parameter SLOT_BYTES = SLOT_BYTES_DEF;         // MDTS check; elaboration error if > 2 MiB
 input start_init; output init_done, init_fail; output [7:0] fail_step; output [15:0] cqe_status_last;
+// init_done/init_fail/shutdown_done/shutdown_timeout latch until the next start_* but drop in the cycle the start is accepted (comb. mask)
 input start_shutdown; output shutdown_done;   // Delete SQ1 → Delete CQ1 → CC.SHN=01 → wait SHST==10
 output [3:0] lbads; output [63:0] nsze; output [7:0] mdts; output [3:0] dstrd; output vwc;
 input  clear_done; output clear_cqs;            // CQ zero-fill before CC.EN
 output [15:0] asq_tail/acq_head (debug)
 ```
-Init FSM (values from research/02 §12): read CAP lo/hi (check MPSMIN=0, CSS[37]); read CC; if EN → write 0, poll
-RDY=0; `clear_cqs`; write AQA=0x001F001F, ASQ lo=0x1000_0000 hi=0, ACQ lo=0x1000_1000 hi=0; write CC=0x00460000;
+Init FSM (values from research/02 §12): read CAP lo/hi (check MPSMIN=0, CSS[37]); read CC; if EN → write 0; **always** poll
+RDY=0 (also when EN already reads 0: RDY may lag a reset in progress); `clear_cqs`; write AQA=0x001F001F, ASQ lo=0x1000_0000 hi=0, ACQ lo=0x1000_1000 hi=0; write CC=0x00460000;
 write CC=0x00460001; poll CSTS until RDY=1 (CFS=1 → fail; timeout `(TO+1)·500 ms`); admin commands by sub-FSM
 `admin_cmd(sqe[15:0] DWs)`: write 4 beats to `asq_ram[tail]`, MWr `SQ0TDBL` (0x1000) = tail+1, poll `acq_ram[head]`
 until `DW3[16]==phase`, check `DW3[31:17]==0` (else fail with `cqe_status_last`), head++ (wrap → phase^=1), MWr
 `CQ0HDBL` (0x1000 + (4<<dstrd)) = head. Commands: Identify Controller (CID 0, CNS 1, PRP1 0x1000_2000); extract
-MDTS (byte 77), SQES/CQES (512/513 must be 0x66/0x44), VWC (525); Identify Namespace (NSID 1, CNS 0); extract NSZE
+MDTS (byte 77; **if MDTS != 0 and SLOT_BYTES > 4096 << MDTS → init_fail F_MDTS 0x14**), SQES/CQES (512/513, nibble-wise: required `[3:0]` ≤ 6/4 ≤ maximum `[7:4]`, else F_IDENT_QES 0x10), VWC (525); Identify Namespace (NSID 1, CNS 0); extract NSZE
 (bytes 0–7), FLBAS (26), LBAF[FLBAS&0xF] at 128+4·n → LBADS=[23:16], MS=[15:0] must be 0; Set Features FID 7
 (CDW10=7, CDW11=0); Create IOCQ (opc 5, PRP1 0x1000_4000, CDW10 0x003F0001, CDW11 1); Create IOSQ (opc 1, PRP1
 0x1000_3000, CDW10 0x003F0001, CDW11 0x00010001). Then `init_done`.
@@ -383,7 +425,24 @@ input  [N_SLOTS-1:0] slot_full; output [N_SLOTS-1:0] slot_free;
 input  flush_req; output flush_done;     // submit Flush when all slots are free, wait its CQE
 output [63:0] next_lba, bytes_done, cmds_done; output [31:0] cmd_errors; output [15:0] last_status;
 output [31:0] max_latency_cycles; output sq_full_stall (stat); output [6:0] sq_tail, cq_head (debug)
+parameter IO_TIMEOUT_MS = 30000;          // per-command timeout in tick_ms units (0 = off)
+input  tick_ms;                           // 1 pulse per ms (us with SIM_FAST)
+input  restart;                           // 1-cycle pulse (core: sequencer init_start): new run, see below
+output io_timeout;                        // sticky: a Write / the Flush older than IO_TIMEOUT_MS
+output flush_skipped;                     // sticky: Flush answered without being executed
+output io_error;                          // sticky: a Write completed with status != 0
+output [63:0] first_error_lba;            // SLBA of the first failed Write
 ```
+**I/O timeout (M4).** Per-slot age counters (and one for the Flush) run from SUB_COMMIT to the CQE. At IO_TIMEOUT_MS `io_timeout` sets
+(sticky); the engine frees nothing (the SSD may still read the slot), it only stops submitting. With `io_timeout` set and commands still
+outstanding a `flush_req` is answered at once with `flush_done` + `flush_skipped` (no Flush SQE). The sequencer leaves RUN/DRAIN on
+`io_timeout` / `lba_range_err` (§5.17), so DRAIN always terminates and Flush/shutdown are still performed.
+**Failed writes (M6).** The slot is still freed (data lost, counted in cmd_errors / last_status); `io_error` + `first_error_lba` tell the user which
+LBA was lost first.
+**Restart.** `restart` resets queue pointers/phase, busy/outstanding, started (next_lba reloads from start_lba), flush state, statistics and all
+sticky flags, but NOT next_slot (it must keep following the data ring's write slot). A second run without a reset therefore works after a
+clean DRAIN (all ring slots free); after `lba_range_err` / `io_timeout` slots may remain full and a user_reset is required.
+Elaboration: SLOT_BYTES ≤ 2 MiB (one PRP list page per slot).
 Submit path: `k = next_slot`; if `slot_full[k] && !busy[k] && !sq_full && enable`: write SQE into `iosq_ram[tail]`:
 DW0=`{16'(k), 8'h0, 8'h01}`, DW1=1, DW2..5=0, DW6=`DATA_BASE + k·SLOT_BYTES`, DW7=0, DW8=`PRP_BASE + k·4096`, DW9=0,
 DW10/11=`next_lba`, DW12=`(SLOT_BYTES>>lbads)-1`, DW13=`32'h40` (sequential hint), DW14/15=0. Then tail++ (mod 64),
@@ -397,10 +456,23 @@ Note the RAM read latency: after head advances, wait 2 cycles before trusting th
 ### 5.17 `host_sequencer`
 ```
 input start, stop;   // level: start begins the whole bring-up; stop requests orderly shutdown
-output [3:0] state; output [7:0] error_code; output running, done;
+input link_ready, link_lost (sticky, from link_bringup), link_fail (sticky), io_timeout, lba_range_err (from the write engine), ...
+output [3:0] state; output [7:0] error_code, error_detail; output running, done;
 ```
 States: IDLE → LINK (wait link_ready) → ENUM → RPCFG → ADMIN_INIT → RUN (write_engine enable) → DRAIN (stop: wait
-all slots free, flush) → SHUTDOWN (nvme_admin shutdown) → DONE. Any fail → ERROR (error_code = step id).
+all slots free, flush) → FLUSH → SHUTDOWN (nvme_admin shutdown) → DONE. Any fail → ERROR.
+error_code: 01 E_LINK_LOST, 02 E_ENUM (detail = enum fail_step), 03 E_ADMIN (detail = admin fail_step, e.g. 0x14 F_MDTS), 04 E_IO_TIMEOUT,
+05 E_LBA_RANGE, 06 E_LINK_TIMEOUT (04/05 detail = state where detected).
+* **Entry cycle (M2).** The completion inputs of a stage are ignored in the cycle of its start pulse (the submodule has not seen the pulse yet and
+  may still show the previous run's level); the submodules also mask done/fail combinationally in that cycle. DONE/ERROR → (start low) IDLE → (start
+  high) LINK runs the whole flow again without a reset (`tb_host_sequencer` S7 with stale-level mocks, including a retry after init_fail).
+* **Link loss (M3).** A link drop in an active state → ERROR / E_LINK_LOST. The IP then resets the core (user_reset) and `error_code` would vanish
+  and the still-high `start` would restart the recording at START_LBA over the data already on the SSD. Therefore `link_lost` (sticky in
+  link_bringup, cleared only by the board reset) keeps the sequencer in IDLE, reporting E_LINK_LOST, for as long as it is set.
+* **DRAIN terminates (M4).** `io_timeout` (RUN or DRAIN) or `lba_range_err` → record E_IO_TIMEOUT / E_LBA_RANGE and go to FLUSH (the engine
+  skips the Flush if commands are hung) → SHUTDOWN (never waits for ring slots) → DONE. DONE means "SSD shut down in an orderly way";
+  `error_code != 0` in DONE means the run itself was incomplete.
+* ERROR performs no shutdown (the SSD may still be enabled) - documented limitation (m12).
 
 ### 5.18 `nvme_host_top` ports
 ```
@@ -414,6 +486,16 @@ output status_link_up, status_gen2, status_enum_done, status_nvme_ready, status_
 output [7:0] status_error; output [63:0] stat_bytes_done; output [31:0] stat_cmd_errors; output [31:0] stat_max_latency;
 output user_clk_out (125 MHz, for user's convenience)
 ```
+**`nvme_host_core` additions (v1.1)** - to be wired in `nvme_host_top` (the top currently leaves them open / defaulted):
+```
+input  link_lost = 0, link_fail = 0;   // sticky link_bringup flags (link_clk domain; synchronised inside the core)
+output [7:0] status_flags;             // [0] shutdown_timeout  [1] doorbell_err  [2] io_timeout  [3] flush_skipped
+                                       // [4] link_fail         [5] link_lost     [6] io_error (stat_first_error_lba valid)
+                                       // [7] rx_drop (a TLP was dropped by tlp_rx_demux / hostmem_writer)
+output [63:0] stat_first_error_lba;    // SLBA of the first failed Write
+parameter IO_TIMEOUT_MS = 30000;
+```
+The top should additionally export `link_bringup`'s `link_lost`, `link_fail`, `link_retries` (link_clk domain, valid while the core is in reset).
 
 ---
 
@@ -422,7 +504,7 @@ output user_clk_out (125 MHz, for user's convenience)
 | Name | Default | Meaning |
 |---|---|---|
 | `N_SLOTS` | 8 | ring slots (= max queue depth) |
-| `SLOT_BYTES` | 131072 | bytes per command (must be ≤ 2^MDTS pages, multiple of 4096) |
+| `SLOT_BYTES` | 131072 | bytes per command: a **power of two, 4 KiB ≤ SLOT_BYTES ≤ 2 MiB** (data_ring `$fatal`; one PRP list page per slot) and ≤ 4096 << MDTS (nvme_admin checks MDTS, F_MDTS) |
 | `MPS_CAP_CODE` | 1 (256 B) | our maximum MPS; must equal the pcie_7x GUI "Max Payload Size" |
 | `MRRS_CODE` | 2 (512 B) | programmed into the SSD |
 | `EXT_TAG_ALLOW` | 1 | enable extended tags if SSD supports |
@@ -432,6 +514,9 @@ output user_clk_out (125 MHz, for user's convenience)
 | `IO_QSIZE` | 64 | I/O queue entries |
 | `REQ_TIMEOUT_CYCLES` | 1_250_000 | 10 ms at 125 MHz; testbench overrides via parameter |
 | `SIM_FAST` | 0 | shrinks millisecond timers to microseconds in simulation |
+| `IO_TIMEOUT_MS` | 30000 | write engine: per-command (and Flush) timeout |
+| `LINK_CLK_HZ` / `CLK_HZ` of link_bringup | 50_000_000 | frequency of the IBUFDS_GTE2 ODIV2 clock (refclk / 2) |
+| `LINK_TIMEOUT_MS`, `LINK_RETRY_MAX` | 2000, 3 | link-up timeout and PERST# re-runs before `link_fail` |
 
 ---
 
@@ -452,6 +537,10 @@ output user_clk_out (125 MHz, for user's convenience)
   pushes the expected stream), post CQEs (sometimes two per MWr, sometimes split 8+8 with P last), Flush, status
   injection for error tests. Writes to the LBA space are checked for sequential coverage.
 - Scoreboard: every byte streamed in must land at LBA `start_lba + offset/512` exactly once.
+
+New in v1.1: `tb_rx_np` (end-to-end MRd accounting), second-run / link_lost / link_fail / DRAIN-termination scenarios in `tb_host_sequencer`,
+link-up timeout + sticky flags in `tb_link_bringup`, acceptance rules (reset / accept_enable) in `tb_data_ring`, I/O timeout, skipped Flush, restart and
+first_error_lba in `tb_write_engine`, MDTS / SQES / CQES / RDY=0 checks in `tb_nvme_admin`, 5-bit tags in `tb_enum`.
 
 `sim/tb/`: `tb_rx_adapt`, `tb_tx_adapt`, `tb_completer`, `tb_writer`, `tb_data_ring`, `tb_requester`, `tb_top`
 (full flow: link → enum → init → stream 4 MiB → stop → shutdown; prints achieved beats/cycle on the TX bus as the

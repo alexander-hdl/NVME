@@ -18,7 +18,9 @@
 //
 // Rules implemented
 //   * one NON-POSTED request outstanding at a time (CfgRd, CfgWr, MRd);
-//   * the 8-bit tag increments once per non-posted request;
+//   * the tag increments once per non-posted request; it is 5 bits wide (upper three
+//     bits 0) unless `ext_tag_en` = 1: PCIe requires tag[7:5] = 0 while the Root Port's
+//     Extended Tag Enable is 0 (rp_cfg_init sets ETE only when the SSD supports it);
 //   * a completion matches when it is a Cpl/CplD, ReqID == requester_id and
 //     Tag == tag of the request in flight;
 //   * anything else arriving on s_cpl (wrong tag, late after a timeout, ...)
@@ -70,6 +72,7 @@ module rp_requester
   output logic         s_cpl_tready,
 
   input  logic [15:0]  requester_id,
+  input  logic         ext_tag_en,          // 1: 8-bit tags allowed (Extended Tag Enable programmed)
   output logic [15:0]  unexpected_cpl_cnt
 );
 
@@ -109,6 +112,7 @@ module rp_requester
   logic [31:0]   wdata_q;          // payload DW
   logic [7:0]    tag_q;            // tag for the NEXT non-posted request
   logic [7:0]    exp_tag_q;        // tag of the request in flight
+  wire  [7:0]    tag_use = ext_tag_en ? tag_q : {3'b000, tag_q[4:0]};   // tag[7:5] = 0 without ETE
   logic [31:0]   to_cnt;           // timeout down-counter
   logic [2:0]    rsp_status_q;
   logic [31:0]   rsp_rdata_q;
@@ -236,15 +240,15 @@ module rp_requester
             wdata_q <= req_wdata;
             case (req_op)
               OP_CFGRD0: hdr_q <= hdr_cfg0(1'b0, req_addr[31:16], req_addr[11:2],
-                                           requester_id, tag_q, req_be);
+                                           requester_id, tag_use, req_be);
               OP_CFGWR0: hdr_q <= hdr_cfg0(1'b1, req_addr[31:16], req_addr[11:2],
-                                           requester_id, tag_q, req_be);
-              OP_MRD32:  hdr_q <= hdr_mrd32(req_addr, ONE_DW, requester_id, tag_q, req_be, 4'h0);
-              default:   hdr_q <= hdr_mwr32(req_addr, ONE_DW, requester_id, tag_q, req_be, 4'h0);
+                                           requester_id, tag_use, req_be);
+              OP_MRD32:  hdr_q <= hdr_mrd32(req_addr, ONE_DW, requester_id, tag_use, req_be, 4'h0);
+              default:   hdr_q <= hdr_mwr32(req_addr, ONE_DW, requester_id, tag_use, req_be, 4'h0);
             endcase
             if (req_op != OP_MWR32) begin        // non-posted: this tag is now in use
-              exp_tag_q <= tag_q;
-              tag_q     <= tag_q + 8'd1;
+              exp_tag_q <= tag_use;
+              tag_q     <= ext_tag_en ? (tag_q + 8'd1) : {3'b000, tag_q[4:0] + 5'd1};
             end
             state <= S_HDR;
           end

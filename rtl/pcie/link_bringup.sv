@@ -22,18 +22,44 @@
 //             ltssm==L0), or GEN2_WAIT_MS elapsed. Skipped at once when either
 //             side is not Gen2 capable (nothing to wait for).
 //   READY     link_ready=1. If user_lnk_up drops: link_ready=0 and a complete
-//             PERST# cycle is done again (HOLD).
-//   If the link drops in WAIT_POST / WAIT_GEN2 the same restart happens.
+//             PERST# cycle is done again (HOLD).  The drop also sets the STICKY flag
+//             link_lost (see below).
+//   If the link drops in WAIT_POST / WAIT_GEN2 the same restart happens (no link_lost:
+//   no data run can have started before READY).
+//   FAIL      reached when WAIT_LNK times out (user_lnk_up not seen within LINK_TIMEOUT_MS
+//             after PERST# release) LINK_RETRY_MAX times in a row: each timeout before
+//             that re-runs the whole PERST# cycle (HOLD) and counts one retry in
+//             link_retries.  FAIL keeps perst_n = sys_rst_n = 0 (SSD and core stay in
+//             reset) and link_fail = 1 until `rst`.
+//
+// Sticky flags (link_clk domain, cleared ONLY by `rst`, i.e. the board reset - NOT by the
+// pcie_7x user_reset_out, which wipes everything in nvme_host_core on every PERST# cycle):
+//   link_lost   the link dropped after READY.  The IP resets the whole host core during
+//               the PERST# cycle, so the core cannot remember it; this flag survives.
+//               The integrator synchronises it into user_clk (nvme_host_core input
+//               `link_lost`, 2-FF inside the core): host_sequencer then refuses to leave
+//               IDLE and reports E_LINK_LOST, so a recording that was interrupted is never
+//               silently restarted from START_LBA (which would overwrite recorded data).
+//   link_fail   the link never came up (see FAIL).  Reported as E_LINK_TIMEOUT.
+//   link_retries  number of PERST# re-runs caused by link-up timeouts (2 bits: LINK_RETRY_MAX <= 3;
+//               up to LINK_RETRY_MAX + 1 attempts in total: the first one plus the retries).
+// These three are also meant for LEDs / a VIO / ILA in the link_clk domain: they are valid
+// while the core is still held in reset (user_clk dead, every other status pin frozen).
 //
 // SIM_FAST=1: the "millisecond" tick becomes a microsecond tick, so the
 // default 100 ms timers last 100 us in simulation.
 // =============================================================================
 module link_bringup #(
-  parameter int unsigned CLK_HZ        = 100_000_000,
-  parameter int unsigned PERST_HOLD_MS = 100,
-  parameter int unsigned POST_PERST_MS = 100,
-  parameter int unsigned GEN2_WAIT_MS  = 100,
-  parameter bit          SIM_FAST      = 1'b0
+  // CLK_HZ must be the real frequency of `clk`.  In nvme_host_top `clk` is the
+  // IBUFDS_GTE2 ODIV2 output (refclk / 2) -> 50 MHz for the 100 MHz PCIe refclk
+  // (Vivado derives `refclk_odiv2` with a 20 ns period).
+  parameter int unsigned CLK_HZ         = 50_000_000,
+  parameter int unsigned PERST_HOLD_MS  = 100,
+  parameter int unsigned POST_PERST_MS  = 100,
+  parameter int unsigned GEN2_WAIT_MS   = 100,
+  parameter int unsigned LINK_TIMEOUT_MS = 2000,    // WAIT_LNK: user_lnk_up must rise within this time
+  parameter int unsigned LINK_RETRY_MAX  = 3,       // PERST# re-runs after a timeout before link_fail
+  parameter bit          SIM_FAST       = 1'b0
 ) (
   input  logic       clk,                 // free-running
   input  logic       rst,                 // synchronous, active high
@@ -45,11 +71,19 @@ module link_bringup #(
   input  logic       pl_link_gen2_cap,
   input  logic       pl_link_partner_gen2_supported,
 
-  output logic       perst_n,             // to the SSD
+  // PERST# polarity: perst_n is ACTIVE LOW and goes straight to the M.2 PERST# pin.
+  // A board whose reset input is active high (Opsero FMC M.2 adapters take an
+  // active-high reset on the FMC connector) needs ONE inverter between this output and
+  // the pin (e.g. `assign pcie_perst = ~perst_n;` at the top level, or an OBUF with
+  // an inverted LUT) - the logic here does not change.
+  output logic       perst_n,             // to the SSD (active low)
   output logic       sys_rst_n,           // to pcie_7x
   output logic       link_ready,
   output logic       link_gen2,
-  output logic [1:0] link_width
+  output logic [1:0] link_width,
+  output logic       link_lost,           // sticky: link dropped after READY (cleared by rst only)
+  output logic       link_fail,           // sticky: link-up timeout, retries exhausted (cleared by rst only)
+  output logic [1:0] link_retries         // PERST# re-runs caused by link-up timeouts
 );
 
   // ---------------------------------------------------------------------------
@@ -72,7 +106,8 @@ module link_bringup #(
     S_WAIT_LNK,
     S_WAIT_POST,
     S_WAIT_GEN2,
-    S_READY
+    S_READY,
+    S_FAIL
   } state_t;
 
   state_t state;
@@ -80,12 +115,12 @@ module link_bringup #(
   // ---------------------------------------------------------------------------
   // Input synchronisers (core status is in the user_clk domain)
   // ---------------------------------------------------------------------------
-  logic        lnk_up_s1,  lnk_up_s;
-  logic [5:0]  ltssm_s1,   ltssm_s;
-  logic        rate_s1,    rate_s;
-  logic [1:0]  width_s1,   width_s;
-  logic        cap_s1,     cap_s;
-  logic        peer_s1,    peer_s;
+  (* ASYNC_REG = "TRUE" *) logic        lnk_up_s1,  lnk_up_s;
+  (* ASYNC_REG = "TRUE" *) logic [5:0]  ltssm_s1,   ltssm_s;
+  (* ASYNC_REG = "TRUE" *) logic        rate_s1,    rate_s;
+  (* ASYNC_REG = "TRUE" *) logic [1:0]  width_s1,   width_s;
+  (* ASYNC_REG = "TRUE" *) logic        cap_s1,     cap_s;
+  (* ASYNC_REG = "TRUE" *) logic        peer_s1,    peer_s;
 
   always_ff @(posedge clk) begin
     lnk_up_s1 <= user_lnk_up;                    lnk_up_s <= lnk_up_s1;
@@ -132,6 +167,7 @@ module link_bringup #(
   // FSM
   // ---------------------------------------------------------------------------
   state_t next_state;
+  logic [1:0] retry_cnt;
 
   always_comb begin
     next_state = state;
@@ -140,12 +176,15 @@ module link_bringup #(
       S_REL_SYS:    if (gap_cnt == 8'(SYS_TO_PERST_CLKS))     next_state = S_REL_PERST;
       S_REL_PERST:                                             next_state = S_WAIT_LNK;
       S_WAIT_LNK:   if (lnk_up_s)                              next_state = S_WAIT_POST;
+                    else if (ms_cnt >= LINK_TIMEOUT_MS)
+                      next_state = (retry_cnt >= 2'(LINK_RETRY_MAX)) ? S_FAIL : S_HOLD;
       S_WAIT_POST:  if (!lnk_up_s)                             next_state = S_HOLD;
                     else if (ms_cnt >= POST_PERST_MS)          next_state = S_WAIT_GEN2;
       S_WAIT_GEN2:  if (!lnk_up_s)                             next_state = S_HOLD;
                     else if (gen2_stable || !both_gen2_capable ||
                              ms_cnt >= GEN2_WAIT_MS)           next_state = S_READY;
       S_READY:      if (!lnk_up_s)                             next_state = S_HOLD;
+      S_FAIL:                                                  next_state = S_FAIL;
       default:                                                 next_state = S_HOLD;
     endcase
   end
@@ -161,8 +200,19 @@ module link_bringup #(
       link_ready <= 1'b0;
       link_gen2  <= 1'b0;
       link_width <= 2'b00;
+      link_lost  <= 1'b0;
+      link_fail  <= 1'b0;
+      retry_cnt  <= 2'd0;
     end else begin
       state <= next_state;
+
+      // sticky flags (only `rst` clears them)
+      if (state == S_READY && next_state == S_HOLD) link_lost <= 1'b1;
+      if (next_state == S_FAIL)                     link_fail <= 1'b1;
+      // retry bookkeeping: count a link-up timeout that restarts the PERST# cycle;
+      // a link that reached READY starts a new retry budget
+      if (state == S_WAIT_LNK && next_state == S_HOLD) retry_cnt <= retry_cnt + 2'd1;
+      else if (next_state == S_READY)                  retry_cnt <= 2'd0;
 
       // small counter used only for the sys_rst_n -> perst_n gap
       if (state == S_REL_SYS) gap_cnt <= gap_cnt + 8'd1;
@@ -172,7 +222,7 @@ module link_bringup #(
       // same cycle as the state register
       perst_n    <= (next_state == S_WAIT_LNK) || (next_state == S_WAIT_POST) ||
                     (next_state == S_WAIT_GEN2) || (next_state == S_READY);
-      sys_rst_n  <= (next_state != S_HOLD);
+      sys_rst_n  <= (next_state != S_HOLD) && (next_state != S_FAIL);
       link_ready <= (next_state == S_READY);
 
       if (next_state == S_READY) begin
@@ -184,5 +234,7 @@ module link_bringup #(
       end
     end
   end
+
+  assign link_retries = retry_cnt;
 
 endmodule

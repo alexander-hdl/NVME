@@ -27,7 +27,9 @@
 //     (step 5), and exhausting CRS retries.
 //
 // start is edge-sensitive. done / fail are levels that stay set until the next
-// start. The command port follows the rp_requester signature.
+// start; they drop in the very cycle in which the start edge is presented
+// (done = done_r & ~start_evt), so a sequencer that samples them in the cycle of its own
+// start pulse never sees the flags of the previous run. The command port follows the rp_requester signature.
 // =============================================================================
 module pcie_enum
   import nvme_host_pkg::SSD_BDF, nvme_host_pkg::CFG_VID_DID, nvme_host_pkg::CFG_COMMAND,
@@ -46,7 +48,7 @@ module pcie_enum
   input  logic        rst,
 
   input  logic        start,
-  output logic        done,
+  output logic        done,             // level; cleared in the SAME cycle as the start edge (comb. mask)
   output logic        fail,
   output logic [7:0]  fail_step,
 
@@ -224,13 +226,19 @@ module pcie_enum
   // ---------------------------------------------------------------------------
   // Sequencer
   // ---------------------------------------------------------------------------
+  // done / fail registers and their start-edge mask
+  logic done_r, fail_r;
+  wire  start_evt = start && !start_q && (m_q == M_IDLE || m_q == M_DONE || m_q == M_FAIL);
+  assign done = done_r & ~start_evt;
+  assign fail = fail_r & ~start_evt;
+
   always_ff @(posedge clk) begin
     if (rst) begin
       m_q            <= M_IDLE;
       ph_q           <= P_ISSUE;
       start_q        <= 1'b0;
-      done           <= 1'b0;
-      fail           <= 1'b0;
+      done_r           <= 1'b0;
+      fail_r           <= 1'b0;
       fail_step      <= 8'h00;
       mps_code       <= 3'd0;
       ext_tag_en     <= 1'b0;
@@ -252,8 +260,8 @@ module pcie_enum
         // ------------------------------------------------------------------
         M_IDLE, M_DONE, M_FAIL: begin
           if (start && !start_q) begin
-            done          <= 1'b0;
-            fail          <= 1'b0;
+            done_r          <= 1'b0;
+            fail_r          <= 1'b0;
             fail_step     <= 8'h00;
             class_ok      <= 1'b0;
             crs_retry_cnt <= '0;
@@ -276,7 +284,7 @@ module pcie_enum
                 crs_delay_cnt <= CRS_RETRY_DELAY_CYCLES;
                 ph_q          <= P_CRS_WAIT;
               end else begin                       // UR / CA / TIMEOUT / UNEXPECTED / CRS exhausted
-                fail      <= 1'b1;
+                fail_r      <= 1'b1;
                 fail_step <= step_of(m_q);
                 m_q       <= M_FAIL;
               end
@@ -297,7 +305,7 @@ module pcie_enum
                 M_VID: begin
                   vid_did <= rdata_q;
                   if (rdata_q[15:0] == VID_INVALID) begin
-                    fail <= 1'b1; fail_step <= step_of(m_q); m_q <= M_FAIL;
+                    fail_r <= 1'b1; fail_step <= step_of(m_q); m_q <= M_FAIL;
                   end
                 end
 
@@ -309,7 +317,7 @@ module pcie_enum
                   ptr_q    <= rdata_q[7:0] & CAP_PTR_ALIGN;
                   walk_cnt <= 8'h00;
                   if (!cap_ptr_ok(rdata_q[7:0] & CAP_PTR_ALIGN)) begin
-                    fail <= 1'b1; fail_step <= step_of(m_q); m_q <= M_FAIL;
+                    fail_r <= 1'b1; fail_step <= step_of(m_q); m_q <= M_FAIL;
                   end
                 end
 
@@ -323,7 +331,7 @@ module pcie_enum
                     m_q      <= M_CAP_WALK;
                     if (!cap_ptr_ok(rdata_q[15:8] & CAP_PTR_ALIGN) ||
                         (int'(walk_cnt) + 1 >= CAP_WALK_MAX)) begin
-                      fail <= 1'b1; fail_step <= step_of(m_q); m_q <= M_FAIL;
+                      fail_r <= 1'b1; fail_step <= step_of(m_q); m_q <= M_FAIL;
                     end
                   end
                 end
@@ -336,7 +344,7 @@ module pcie_enum
 
                 M_DEVCTL_R: wdata_q <= {16'h0000, devctl_new};
 
-                M_CMD_W: done <= 1'b1;
+                M_CMD_W: done_r <= 1'b1;
 
                 default: ;
               endcase

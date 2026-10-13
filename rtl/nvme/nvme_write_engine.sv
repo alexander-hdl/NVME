@@ -56,17 +56,36 @@
 //   ready but the SQ has no room.
 //
 // Start/stop: next_lba is loaded from start_lba while enable has never been
-// asserted.  The engine supports one run per reset.
+// asserted.  `restart` (1-cycle pulse, driven by the core on the sequencer's init_start)
+// resets the whole engine like `rst` EXCEPT next_slot (it must keep following the data
+// ring's write slot): queue pointers/phase, busy/outstanding, started (next_lba is
+// reloaded from start_lba), flush state, statistics and all sticky flags.  A second run
+// on the same hardware is therefore possible after a clean DRAIN (all ring slots free).
+//
+// I/O timeout (M4).  Every data command has an age counter (ms, counted with tick_ms)
+// that runs from SUB_COMMIT to its CQE; the Flush has one too.  When any age reaches
+// IO_TIMEOUT_MS (0 = disabled) the sticky flag io_timeout is set.  The engine frees
+// NOTHING (the slot may still be read by the SSD - freeing it could corrupt data); it
+// only stops submitting data commands, and the sequencer leaves RUN/DRAIN.  Flush
+// semantics: with io_timeout set and commands still outstanding, flush_req is answered
+// at once with flush_done + flush_skipped (a Flush behind a hung command would hang as
+// well).  flush_skipped is sticky.
+//
+// Error reporting (M6).  A failed Write (CQE status != 0) still frees its slot (the data
+// is lost: cmd_errors / last_status count it).  io_error is set sticky on the first one
+// and first_error_lba holds the SLBA of that command, so the user can see what was lost.
 // =============================================================================
 module nvme_write_engine
   import nvme_host_pkg::*;
 #(
   parameter int unsigned N_SLOTS    = N_SLOTS_DEF,
-  parameter int unsigned SLOT_BYTES = SLOT_BYTES_DEF
+  parameter int unsigned SLOT_BYTES = SLOT_BYTES_DEF,
+  parameter int unsigned IO_TIMEOUT_MS = 30000     // per-command timeout in tick_ms units; 0 = off
 ) (
   input  logic        clk,
   input  logic        rst,
-  input  logic        tick_ms,            // unused
+  input  logic        tick_ms,            // 1 pulse per ms (per us with SIM_FAST)
+  input  logic        restart,            // 1-cycle pulse: start a new run (see header)
 
   input  logic        enable,
   input  logic [63:0] start_lba,
@@ -110,7 +129,11 @@ module nvme_write_engine
   output logic [6:0]  cq_head,
   output logic        slots_idle,         // no command outstanding, not submitting
   output logic        lba_range_err,      // sticky: next write would exceed nsze
-  output logic        doorbell_err        // sticky: a doorbell MWr was not completed with SC
+  output logic        doorbell_err,       // sticky: a doorbell MWr was not completed with SC
+  output logic        io_timeout,         // sticky: a command / the Flush exceeded IO_TIMEOUT_MS
+  output logic        flush_skipped,      // sticky: Flush answered without being executed (io_timeout)
+  output logic        io_error,           // sticky: at least one Write completed with status != 0
+  output logic [63:0] first_error_lba     // SLBA of the first failed Write (valid when io_error)
 );
 
   // ---------------------------------------------------------------------------
@@ -124,6 +147,12 @@ module nvme_write_engine
   localparam logic [31:0] NSID_1       = 32'h0000_0001;
   localparam int unsigned SLOT_PAGES   = SLOT_BYTES / 4096;
   localparam int unsigned MAX_OUTSTANDING = IO_QSIZE - 1;             // SQ holds at most size-1 entries
+  localparam int unsigned AGE_W        = (IO_TIMEOUT_MS < 2) ? 2 : $clog2(IO_TIMEOUT_MS + 1);
+
+  // one PRP list page per slot: SLOT_BYTES <= 2 MiB (prp_synth.sv)
+  if (SLOT_BYTES > 2*1024*1024) begin : g_slot_check
+    $error("nvme_write_engine: SLOT_BYTES (%0d) > 2 MiB is not supported (single PRP list page)", SLOT_BYTES);
+  end
 
   typedef enum logic [1:0] { SUB_IDLE, SUB_WR, SUB_COMMIT } sub_state_t;
   typedef enum logic [1:0] { DB_IDLE, DB_REQ, DB_RSP } db_state_t;
@@ -164,6 +193,11 @@ module nvme_write_engine
   logic [31:0]         cyc;
   logic [31:0]         t_start [N_SLOTS];
 
+  // I/O timeout ages (ms since SUB_COMMIT) and per-slot SLBA (for first_error_lba)
+  logic [AGE_W-1:0]    age [N_SLOTS];
+  logic [AGE_W-1:0]    flush_age;
+  logic [63:0]         slot_lba [N_SLOTS];
+
   // ---------------------------------------------------------------------------
   // Derived values
   // ---------------------------------------------------------------------------
@@ -178,10 +212,23 @@ module nvme_write_engine
   assign sq_blocked   = (outstanding >= 8'(MAX_OUTSTANDING));
   assign lba_overflow = ((65'(next_lba) + 65'(lba_per_slot)) > 65'(nsze)) || (lba_per_slot == 64'd0)
                         || (lba_per_slot > 64'd65536);
-  assign want_data    = enable && !flush_req && !lba_range_err && slot_full[next_slot]
+  assign want_data    = enable && !flush_req && !lba_range_err && !io_timeout && slot_full[next_slot]
                         && !busy[next_slot] && !wait_clear[next_slot];
   assign want_flush   = flush_req && !flush_sent && !flush_complete && (busy == '0)
                         && (outstanding == 8'd0);
+
+  // I/O timeout: any busy slot (or the Flush) older than IO_TIMEOUT_MS
+  logic [N_SLOTS-1:0] age_exp;
+  logic               flush_exp, timeout_now;
+  always_comb begin
+    for (int i = 0; i < N_SLOTS; i++)
+      age_exp[i] = busy[i] && (IO_TIMEOUT_MS != 0) && (age[i] >= AGE_W'(IO_TIMEOUT_MS));
+    flush_exp   = flush_sent && !flush_complete && (IO_TIMEOUT_MS != 0) && (flush_age >= AGE_W'(IO_TIMEOUT_MS));
+    timeout_now = (|age_exp) || flush_exp;
+  end
+  // Flush that cannot (or must not) be executed: a hung command is outstanding
+  logic flush_abort;
+  assign flush_abort = flush_req && !flush_complete && io_timeout && ((outstanding != 8'd0) || (busy != '0));
 
   // reaper
   logic        reap_active, reap_valid, reap_hit;
@@ -267,7 +314,7 @@ module nvme_write_engine
   assign lat = cyc - t_start[cqe_slot];
 
   always_ff @(posedge clk) begin
-    if (rst) begin
+    if (rst || restart) begin
       sub_state          <= SUB_IDLE;
       db_state           <= DB_IDLE;
       sq_tail_r          <= '0;
@@ -275,7 +322,7 @@ module nvme_write_engine
       cq_phase           <= 1'b1;
       busy               <= '0;
       wait_clear         <= '0;
-      next_slot          <= '0;
+      if (rst) next_slot <= '0;               // restart keeps following the ring's write slot
       outstanding        <= 8'd0;
       started            <= 1'b0;
       cur_flush          <= 1'b0;
@@ -306,7 +353,16 @@ module nvme_write_engine
       sq_full_stall_cycles <= 32'd0;
       lba_range_err      <= 1'b0;
       doorbell_err       <= 1'b0;
-      for (int i = 0; i < N_SLOTS; i++) t_start[i] <= 32'd0;
+      io_timeout         <= 1'b0;
+      flush_skipped      <= 1'b0;
+      io_error           <= 1'b0;
+      first_error_lba    <= 64'd0;
+      flush_age          <= '0;
+      for (int i = 0; i < N_SLOTS; i++) begin
+        t_start[i]  <= 32'd0;
+        age[i]      <= '0;
+        slot_lba[i] <= 64'd0;
+      end
     end else begin
       cyc       <= cyc + 1'b1;
       slot_free <= '0;
@@ -321,6 +377,23 @@ module nvme_write_engine
       if (!flush_req) begin
         flush_sent     <= 1'b0;
         flush_complete <= 1'b0;
+      end
+
+      // ------------------------------------------------------------------
+      // I/O timeout ages
+      // ------------------------------------------------------------------
+      for (int i = 0; i < N_SLOTS; i++) begin
+        if (!busy[i])                                                age[i] <= '0;
+        else if (tick_ms && age[i] != AGE_W'(IO_TIMEOUT_MS))         age[i] <= age[i] + 1'b1;
+      end
+      if (!(flush_sent && !flush_complete))                          flush_age <= '0;
+      else if (tick_ms && flush_age != AGE_W'(IO_TIMEOUT_MS))        flush_age <= flush_age + 1'b1;
+      if (timeout_now) io_timeout <= 1'b1;
+
+      // Flush that must be skipped because of a hung command
+      if (flush_abort) begin
+        flush_complete <= 1'b1;
+        flush_skipped  <= 1'b1;
       end
 
       // ------------------------------------------------------------------
@@ -353,6 +426,7 @@ module nvme_write_engine
           sq_tail_r   <= (sq_tail_r == QW'(IO_QSIZE-1)) ? '0 : sq_tail_r + 1'b1;
           if (!cur_flush) begin
             busy[cur_slot]       <= 1'b1;
+            slot_lba[cur_slot]   <= cur_lba;
             next_lba             <= next_lba + lba_per_slot;
             next_slot            <= (next_slot == last_slot_idx) ? '0 : next_slot + 1'b1;
           end
@@ -374,6 +448,10 @@ module nvme_write_engine
           cmd_errors <= cmd_errors + 1'b1;               // CQE for a command we did not submit
         end else begin
           if (cqe_status != 15'd0) cmd_errors <= cmd_errors + 1'b1;
+          if (cqe_status != 15'd0 && !cqe_is_flush && !io_error) begin
+            io_error        <= 1'b1;
+            first_error_lba <= slot_lba[cqe_slot];
+          end
           if (cqe_is_flush) begin
             flush_complete <= 1'b1;
           end else begin

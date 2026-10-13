@@ -16,7 +16,13 @@
 //   starting at DW0 of beat 1, payload DWs byte-swapped (memory order), tkeep
 //   DW-granular, tlast on the final beat; tuser[0]=err_fwd, tuser[1]=ecrc_err.
 //
-// Architecture (three parts)
+// Architecture (four parts)
+//   0. CORE SLICE (axis_skid, 128+22 bits): m_axis_rx_tready is the REGISTERED ready of a
+//      full-throughput register slice.  Without it tready was a ~19-level combinational
+//      function of the splitter and of the downstream FIFOs' ready (and continued into the
+//      IP's rx_null_gen), which is a likely timing failure after routing (review M1).  The
+//      slice costs one cycle of latency and no bandwidth; the PG054 rule "tready may drop at
+//      any time" is respected (the slice only ever drops it when its skid register is full).
 //   1. SPLITTER (this file's always_comb): every core beat holds at most two
 //      pieces: segment A = tail of the TLP already open, segment B = head of a
 //      new TLP (SOF).  Each piece is handled in ONE cycle:
@@ -39,10 +45,23 @@
 //   take its part, so a straddled beat is still consumed in one cycle; the
 //   "extra" output beats appear downstream (header + payload are separate beats).
 //   Throughput: one core beat per cycle for non-straddled traffic.
+//
+// rx_np_ok (review m5).  The adapter holds up to HDR_FIFO_DEPTH MRd headers in its header
+// FIFO, behind which CQE MWr / requester CplD are blocked (head-of-line), and the completer
+// queues up to NP_EXT_DEPTH more.  rx_np_ok is deasserted when the number of non-posted
+// requests queued END TO END (MRd headers in this adapter's header FIFO + `np_ext_count`
+// from the completer's request FIFO) reaches HDR_FIFO_DEPTH + NP_EXT_DEPTH - 2, so the core
+// is told to let posted/completion TLPs bypass NP TLPs early enough.  `np_backpressure`
+// (completer request FIFO almost full) still forces it low as well.  rx_np_ok is registered.
+//
+// Types.  The splitter works on 2/3-bit lane numbers and counts (no 32-bit `int`): only the
+// payload remainder pl_rem_q is wide (11 bit), and it is compared with 3-bit values through
+// its upper bits, so the comparators are a few LUTs instead of carry chains.
 // =============================================================================
 module pcie7x_rx_adapt #(
   parameter int HDR_FIFO_DEPTH = 8,
-  parameter int EOF_FIFO_DEPTH = 16
+  parameter int EOF_FIFO_DEPTH = 16,
+  parameter int NP_EXT_DEPTH   = 16        // request FIFO depth of the completer (np_ext_count range)
 ) (
   input  logic         clk,
   input  logic         rst,
@@ -54,7 +73,8 @@ module pcie7x_rx_adapt #(
   output logic         m_axis_rx_tready,
   input  logic [21:0]  m_axis_rx_tuser,
   output logic         rx_np_ok,
-  input  logic         np_backpressure,
+  input  logic         np_backpressure,    // completer request FIFO almost full
+  input  logic [$clog2(NP_EXT_DEPTH):0] np_ext_count,   // completer request FIFO occupancy (MRd queued there)
   // internal tlp_axis (source)
   output logic [127:0] m_tlp_tdata,
   output logic [15:0]  m_tlp_tkeep,
@@ -80,7 +100,17 @@ module pcie7x_rx_adapt #(
   localparam int MAX_PL_DW  = 1024;                    // Length 0 encodes 1024
   localparam int PLW        = $clog2(MAX_PL_DW) + 1;   // 11 bits
 
-  assign rx_np_ok = ~np_backpressure;
+  // ---- core-side register slice (registered m_axis_rx_tready) ------------------------
+  logic [127:0] c_tdata;
+  logic [21:0]  c_tuser;
+  logic         c_tvalid, c_tready;
+
+  axis_skid #(.W(128), .UW(22)) u_core_skid (
+    .clk(clk), .rst(rst),
+    .s_tdata(m_axis_rx_tdata), .s_tkeep(16'h0000), .s_tlast(1'b0), .s_tuser(m_axis_rx_tuser),
+    .s_tvalid(m_axis_rx_tvalid), .s_tready(m_axis_rx_tready),       // registered ready
+    .m_tdata(c_tdata), .m_tkeep(), .m_tlast(), .m_tuser(c_tuser),
+    .m_tvalid(c_tvalid), .m_tready(c_tready));
 
   // ---- beat decode ---------------------------------------------------------------
   logic        sofv, sof2, eofv;
@@ -88,13 +118,13 @@ module pcie7x_rx_adapt #(
   logic        err_in, ecrc_in;
   logic [31:0] d0, d1, d2, d3;
 
-  assign sofv    = m_axis_rx_tuser[TU_SOF];
-  assign sof2    = m_axis_rx_tuser[TU_SOF_DW2];
-  assign eofv    = m_axis_rx_tuser[TU_EOF];
-  assign eofdw   = m_axis_rx_tuser[TU_EOF_DW_H:TU_EOF_DW_L];
-  assign err_in  = m_axis_rx_tuser[TU_ERR_FWD];
-  assign ecrc_in = m_axis_rx_tuser[TU_ECRC_ERR];
-  assign {d3, d2, d1, d0} = m_axis_rx_tdata;
+  assign sofv    = c_tuser[TU_SOF];
+  assign sof2    = c_tuser[TU_SOF_DW2];
+  assign eofv    = c_tuser[TU_EOF];
+  assign eofdw   = c_tuser[TU_EOF_DW_H:TU_EOF_DW_L];
+  assign err_in  = c_tuser[TU_ERR_FWD];
+  assign ecrc_in = c_tuser[TU_ECRC_ERR];
+  assign {d3, d2, d1, d0} = c_tdata;
 
   // ---- splitter state -------------------------------------------------------------
   logic            pkt_open_q;      // a TLP has started and its EOF has not been seen
@@ -117,10 +147,23 @@ module pcie7x_rx_adapt #(
   logic hf_s_tready, ef_s_tready, dw_s_tready;
   logic fire;                       // core beat consumed this cycle
 
+  // thermometer mask: n lanes -> n low bits set (n = 0..4)
+  function automatic logic [3:0] lane_mask(input logic [2:0] n);
+    case (n)
+      3'd0:    return 4'b0000;
+      3'd1:    return 4'b0001;
+      3'd2:    return 4'b0011;
+      3'd3:    return 4'b0111;
+      default: return 4'b1111;
+    endcase
+  endfunction
+
   always_comb begin : splitter
-    int          sof_lane, a_hi, b_hi, a_first, a_n, cnt;
-    bit          eof_in_a, eof_in_b, b_is4, b_data;
-    logic [31:0] b_h0;
+    logic [1:0]     sof_lane;                 // 0 or 2
+    logic [2:0]     a_end, b_end, a_first, a_n, cnt, rem_lo;
+    logic           rem_big, rem_le_an;       // pl_rem_q >= 8 / pl_rem_q <= a_n
+    logic           eof_in_a, eof_in_b, b_is4, b_data;
+    logic [31:0]    b_h0;
     logic [PLW-1:0] b_len;
 
     pkt_open_n = pkt_open_q;
@@ -139,15 +182,20 @@ module pcie7x_rx_adapt #(
     pl_last    = 1'b0;
     pl_shift   = 2'd0;
 
-    sof_lane = sof2 ? 2 : 0;
-    // The EOF belongs to the open TLP (segment A) if it comes before the SOF lane
-    eof_in_a = pkt_open_q && eofv && (!sofv || (int'(eofdw) < sof_lane));
+    sof_lane = sof2 ? 2'd2 : 2'd0;
+    // The EOF belongs to the open TLP (segment A) if it comes before the SOF lane:
+    //   no SOF in this beat, or SOF at DW2 and the EOF DW is 0 or 1 (SOF at DW0 -> nothing before it)
+    eof_in_a = pkt_open_q && eofv && (!sofv || (sof2 && !eofdw[1]));
     eof_in_b = sofv && eofv && !eof_in_a;
-    a_hi     = eof_in_a ? int'(eofdw) : (sofv ? sof_lane - 1 : LANES - 1);
-    b_hi     = eof_in_b ? int'(eofdw) : LANES - 1;
-    a_first  = 0;
-    a_n      = 0;
-    cnt      = 0;
+    // lanes [a_first, a_end) of this beat belong to the open TLP, lanes [.., b_end) to the new one
+    a_end    = eof_in_a ? {1'b0, eofdw} + 3'd1 : (sofv ? {1'b0, sof_lane} : 3'd4);
+    b_end    = eof_in_b ? {1'b0, eofdw} + 3'd1 : 3'd4;
+    a_first  = 3'd0;
+    a_n      = 3'd0;
+    cnt      = 3'd0;
+    rem_big  = (pl_rem_q[PLW-1:3] != '0);
+    rem_lo   = pl_rem_q[2:0];
+    rem_le_an = 1'b0;
     b_h0     = sof2 ? d2 : d0;
     b_is4    = tlp_is_4dw(b_h0);
     b_data   = tlp_has_data(b_h0);
@@ -157,19 +205,20 @@ module pcie7x_rx_adapt #(
     if (pkt_open_q) begin
       if (hdr_wait_q) begin
         // H2 (and H3) are in the first lanes of this beat -> header complete
-        a_first    = tlp_is_4dw(h0_q) ? 2 : 1;
+        a_first    = tlp_is_4dw(h0_q) ? 3'd2 : 3'd1;
         hdr_push_i = 1'b1;
         hdr_word   = {tlp_is_4dw(h0_q) ? d1 : 32'h0, d0, h1_q, h0_q};
         hdr_err    = err_q;
         hdr_wait_n = 1'b0;
       end
-      a_n = a_hi - a_first + 1;
-      if (pl_rem_q != '0 && a_n > 0) begin
-        cnt       = (a_n < int'(pl_rem_q)) ? a_n : int'(pl_rem_q);
+      a_n       = (a_end > a_first) ? (a_end - a_first) : 3'd0;
+      rem_le_an = !rem_big && (rem_lo <= a_n);
+      if (pl_rem_q != '0 && a_n != 3'd0) begin
+        cnt       = rem_le_an ? rem_lo : a_n;           // min(a_n, pl_rem_q)
         pl_push_i = 1'b1;
-        pl_keep   = 4'((1 << (a_first + cnt)) - 1);   // header lanes are kept, dw_shift drops them
-        pl_last   = (cnt == int'(pl_rem_q)) || eof_in_a;
-        pl_shift  = 2'(a_first);
+        pl_keep   = lane_mask(a_first + cnt);           // header lanes are kept, dw_shift drops them
+        pl_last   = rem_le_an || eof_in_a;              // cnt == pl_rem_q
+        pl_shift  = a_first[1:0];
         pl_rem_n  = pl_rem_q - PLW'(cnt);
         hdr_has_pl = hdr_wait_q;
       end
@@ -199,7 +248,7 @@ module pcie7x_rx_adapt #(
         pl_rem_n   = '0;
         if (b_data) begin
           if (!b_is4) begin
-            if (b_hi >= LANES - 1) begin          // lane 3 carries payload DW0
+            if (b_end == 3'd4) begin              // lane 3 carries payload DW0
               pl_push_i  = 1'b1;
               pl_keep    = 4'hF;
               pl_shift   = 2'd3;
@@ -222,8 +271,8 @@ module pcie7x_rx_adapt #(
   assign rdy_all = (!hdr_push_i || hf_s_tready) &&
                    (!eof_push_i || ef_s_tready) &&
                    (!pl_push_i  || dw_s_tready);
-  assign m_axis_rx_tready = !m_axis_rx_tvalid || rdy_all;
-  assign fire             = m_axis_rx_tvalid && rdy_all;
+  assign c_tready = !c_tvalid || rdy_all;
+  assign fire     = c_tvalid && rdy_all;
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -285,7 +334,7 @@ module pcie7x_rx_adapt #(
 
   always_comb begin
     for (int i = 0; i < LANES; i++) begin
-      pl_tdata_sw[DW_W*i +: DW_W] = bswap32(m_axis_rx_tdata[DW_W*i +: DW_W]);
+      pl_tdata_sw[DW_W*i +: DW_W] = bswap32(c_tdata[DW_W*i +: DW_W]);
       pl_tkeep_ext[4*i +: 4]      = {4{pl_keep[i]}};
     end
   end
@@ -348,6 +397,27 @@ module pcie7x_rx_adapt #(
 
   always_ff @(posedge clk) begin
     if (out_fire && seq_q == SEQ_HDR) pay_err_q <= hf_tuser[0];
+  end
+
+  // ---- non-posted bookkeeping: MRd headers waiting in the header FIFO ------------------
+  localparam int NP_LIMIT = HDR_FIFO_DEPTH + NP_EXT_DEPTH - 2;
+  logic                         np_push, np_pop, np_ok_d;
+  logic [$clog2(HDR_FIFO_DEPTH):0] np_cnt_q;
+  logic [$clog2(HDR_FIFO_DEPTH+NP_EXT_DEPTH)+1:0] np_total;
+
+  assign np_push = fire && hdr_push_i && tlp_is_mrd(hdr_word[31:0]);
+  assign np_pop  = hf_tready && tlp_is_mrd(hf_tdata[31:0]);   // hf_tready = header beat leaves
+  assign np_total = np_cnt_q + np_ext_count;
+  assign np_ok_d  = !np_backpressure && (np_total < NP_LIMIT);
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      np_cnt_q <= '0;
+      rx_np_ok <= 1'b1;
+    end else begin
+      np_cnt_q <= np_cnt_q + (np_push ? 1'b1 : 1'b0) - (np_pop ? 1'b1 : 1'b0);
+      rx_np_ok <= np_ok_d;
+    end
   end
 
   // unused inputs

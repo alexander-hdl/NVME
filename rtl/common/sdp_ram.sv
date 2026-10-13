@@ -7,6 +7,9 @@
 //                     (stage 2 = BRAM output register).  rd_data therefore is
 //                     valid 2 cycles after rd_en and HOLDS its value until the
 //                     next read (both registers are enabled only by reads).
+//                     OUT_REG = 0 drops stage 2: rd_data = the RAM output latch, valid
+//                     1 cycle after rd_en (used by data_ring, which supplies the other
+//                     cycle with a per-slot address register copy).
 //   * No reset on the array -> Vivado infers block RAM (byte-write enables).
 //   * Read-during-write at the same address returns the OLD data (read-first).
 //   * The initial block zero-fills the array: gives BRAM INIT=0 in hardware and
@@ -14,7 +17,8 @@
 // =============================================================================
 module sdp_ram #(
   parameter int DEPTH = 256,
-  parameter int W     = 128
+  parameter int W     = 128,
+  parameter bit OUT_REG = 1'b1         // 1: 2-cycle read latency (default), 0: 1-cycle (no output register)
 ) (
   input  logic                       clk,
   input  logic                       wr_en,
@@ -51,6 +55,6 @@ module sdp_ram #(
     if (rd_v1_q) rd_stage2_q <= rd_stage1_q;
   end
 
-  assign rd_data = rd_stage2_q;
+  assign rd_data = OUT_REG ? rd_stage2_q : rd_stage1_q;
 
 endmodule
