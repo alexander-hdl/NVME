@@ -132,7 +132,7 @@
 </g>
 <g fill="var(--fg)">
 <text x="34" y="62">pcie_7x_0: RP, Gen2 x4, 128 бит</text>
-<text x="34" y="102">IBUFDS_GTE2 → sys_clk</text><text x="34" y="116" font-size="11" fill="var(--muted)">ODIV2 → BUFG → link_clk</text>
+<text x="34" y="102">IBUFDS_GTE2 → sys_clk</text><text x="34" y="116" font-size="11" fill="var(--muted)">SYSCLK → IBUFDS → BUFG → link_clk</text>
 <text x="34" y="154">GTX x4: GTXE2_CHANNEL_X0Y12…15</text>
 <text x="34" y="200">link_bringup → pcie_perst_n</text>
 <text x="34" y="246">nvme_host_core, data_ring (BRAM)</text>
@@ -181,7 +181,7 @@
 <tr><td>PERST#</td><td><code>pcie_perst_n</code></td><td>LA00_CC_P</td><td>C25</td><td>LVCMOS25, DRIVE 8, SLOW</td><td><b>Полярность!</b> См. предупреждение ниже</td></tr>
 <tr><td>Линии TX 0–3</td><td><code>pci_exp_txp/n[3:0]</code></td><td>DP0…DP3_C2M</td><td>GTXE2_CHANNEL_X0Y12…X0Y15</td><td>GT</td><td>LOC в XDC (по умолчанию IP ставит X0Y7…X0Y4)</td></tr>
 <tr><td>Линии RX 0–3</td><td><code>pci_exp_rxp/n[3:0]</code></td><td>DP0…DP3_M2C</td><td>те же каналы</td><td>GT</td><td>разворот и полярность ядро исправляет само</td></tr>
-<tr><td>Сброс платы</td><td><code>board_rst_n</code></td><td>—</td><td>AB7 (CPU_RESET)</td><td>LVCMOS15</td><td>кнопка активна в 1: нужен инвертор в обёртке</td></tr>
+<tr><td>Сброс платы</td><td><code>board_rst_n</code></td><td>—</td><td>AB7 (CPU_RESET)</td><td>LVCMOS15</td><td>кнопка активна в 1: в <code>kc705_top</code> порт <code>cpu_reset</code>, инвертор внутри</td></tr>
 <tr><td>Питание SSD</td><td>—</td><td>12P0V</td><td>—</td><td>—</td><td>преобразователь на адаптере, до 3 А при 3,3 В</td></tr>
 <tr><td>CLKREQ#</td><td>—</td><td>—</td><td>—</td><td>—</td><td>на адаптере к земле или не подключён</td></tr>
 </table>
@@ -211,19 +211,38 @@
 
 <h3>5.1.4. Сборка проекта</h3>
 <ol>
-<li>Создать проект: <code>vivado -mode batch -source fpga/scripts/create_project.tcl</code>. Проект появится в <code>fpga/build/nvme_host</code>, IP — в <code>fpga/ip/pcie_7x_0</code>. В проект попадают все файлы из <code>rtl/filelist.f</code>, верхний модуль — <code>nvme_host_top</code>.</li>
+<li>Создать проект: <code>vivado -mode batch -source fpga/scripts/create_project.tcl</code>. Проект появится в <code>fpga/build/nvme_host</code>, IP — в <code>fpga/ip/pcie_7x_0</code>. В проект попадают все файлы из <code>rtl/filelist.f</code>, верхний модуль — <code>kc705_top</code> (<code>-tclargs top=nvme_host_top</code> даёт голый хост).</li>
 <li>Просмотреть строки <code>WARNING</code> в логе, выполнить <code>report_property [get_ips pcie_7x_0]</code> и один раз открыть IP в GUI: Root Port, x4, 5.0 GT/s, 128 бит, 125 МГц, MPS 256.</li>
 <li>Сверить порты в <code>rtl/pcie/pcie7x_wrapper.sv</code> с файлом <code>fpga/ip/pcie_7x_0/pcie_7x_0_stub.v</code>. Все строки с пометкой <i>verify against generated pcie_7x_0 stub</i> обязательны к проверке: имена с суффиксом <code>_n</code> и без, полярность входов <code>cfg_err_*</code>, наличие <code>rx_np_req</code>.</li>
-<li>Проверить XDC: контакты из табл. 5.2, LOC каналов GTX (в IP по умолчанию линии стоят на квадре разъёма PCIe платы, X0Y7…X0Y4, а FMC HPC — другой квадр), группы тактов (<code>set_clock_groups -asynchronous</code> для <code>sys_clk</code>, <code>user_clk</code>, <code>data_clk</code>).</li>
-<li>Проверить частоту <code>link_clk</code>. Она берётся с выхода <code>ODIV2</code> буфера <code>IBUFDS_GTE2</code>; Vivado 2022.2 выводит для него опорную частоту, делённую на 2, то есть 50 МГц, и именно это значение стоит по умолчанию в параметре <code>LINK_CLK_HZ</code> модуля <code>nvme_host_top</code>. Проверьте частоту на плате (счётчик с выводом на ILA или светодиод). Если реальная частота окажется 100 МГц, все «миллисекунды» станут вдвое <b>короче</b>, и пауза после PERST# нарушит требование 100 мс. Обратная ошибка (параметр 100 МГц при реальных 50) безопасна: таймеры удвоятся.</li>
-<li>Написать обёртку платы. У <code>nvme_host_top</code> широкие шины (<code>s_data_tdata[127:0]</code>, <code>stat_*</code>), которые нельзя вывести на контакты. Обёртка содержит генератор тестовых данных, VIO для <code>ctrl_start</code>/<code>ctrl_stop</code>, инвертор кнопки сброса и, при необходимости, инвертор PERST#. Это задание лабораторной работы Л6 (<a href="08_lab.html">глава 8</a>).</li>
+<li>Проверить XDC: контакты из табл. 5.2, LOC каналов GTX (в IP по умолчанию линии стоят на квадре разъёма PCIe платы, X0Y7…X0Y4, а FMC HPC — другой квадр), группы тактов (<code>set_clock_groups -asynchronous</code> для <code>free_clk</code> и тактов ядра; отдельного <code>data_clk</code> в <code>kc705_top</code> нет, поток идёт на <code>user_clk</code>). Выводы SYSCLK, кнопок, DIP и светодиодов лежат в <code>kc705_board.xdc</code> и помечены «verify UG810».</li>
+<li>Проверить частоту <code>link_clk</code>. Она берётся не с выхода <code>ODIV2</code> буфера <code>IBUFDS_GTE2</code> (он не трассируется вместе с <code>O</code> → <code>BUFG</code> внутри ядра), а от свободно бегущего генератора платы: <code>free_clk_p/n</code> → <code>IBUFDS</code> → <code>BUFG</code>, на KC705 это SYSCLK 200 МГц. Значение 200 000 000 стоит по умолчанию в параметре <code>LINK_CLK_HZ</code> модуля <code>nvme_host_top</code>. Если взять другой генератор, укажите его частоту. Если реальная частота окажется выше параметра, все «миллисекунды» станут <b>короче</b>, и пауза после PERST# нарушит требование 100 мс. Обратная ошибка безопасна: таймеры удлинятся. Проверить можно по «сердцебиению» светодиода 7 (около 3 Гц).</li>
+<li>Плата-верхний уровень уже написана: <code>rtl/board/kc705_top.sv</code> (генератор тестовых данных, кнопки, светодиоды, инвертор CPU_RESET; см. 5.1.5). Для своей платы или своего источника данных её можно заменить, оставив те же порты <code>nvme_host_top</code>. Это же отправная точка лабораторной работы Л6 (<a href="08_lab.html">глава 8</a>).</li>
 <li>Синтез, размещение, битстрим: <code>launch_runs impl_1 -to_step write_bitstream</code>. Ресурсы ядра PCIe — около 2 тыс. LUT и FF, кольцо данных по умолчанию (8 × 128 KiB = 1 MiB) занимает около 228 блоков BRAM36 из 445.</li>
 </ol>
+
+<h3>5.1.5. Плата-верхний уровень kc705_top и проверка записи</h3>
+<p>Модуль <code>rtl/board/kc705_top.sv</code> оборачивает <code>nvme_host_top</code> и закрывает все выводы, поэтому <code>build.tcl bit</code> проходит без <code>loose_io</code>. Управление: CPU_RESET (активна в 1, внутри инвертируется) начинает новый полный цикл; GPIO_SW_C запускает запись (START), GPIO_SW_S останавливает (STOP); переключатели задают скорость и длину; светодиоды показывают стадии. Подробные таблицы портов и выводов — в <a href="04_modules.html">главе 4</a> (4.4.27) и в <code>fpga/README.md</code>.</p>
+
+<table>
+<caption>Табл. 5.10. Кнопки, переключатели и светодиоды kc705_top (контакты помечены «verify UG810» в <code>kc705_board.xdc</code>)</caption>
+<tr><th>Элемент</th><th>Контакт</th><th>Функция</th></tr>
+<tr><td>CPU_RESET</td><td>AB7</td><td>сброс платы (новый запуск)</td></tr>
+<tr><td>GPIO_SW_C / S</td><td>G12 / AB12</td><td>START / STOP</td></tr>
+<tr><td>GPIO_SW_N / E / W</td><td>AA12 / AG5 / AC6</td><td>страницы светодиодов: <code>status_flags</code> / сведения о линке / <code>status_error</code></td></tr>
+<tr><td>GPIO_DIP_SW[1:0]</td><td>W29, Y29</td><td>скорость генератора: полная, 1/2, 1/4, 1/8</td></tr>
+<tr><td>GPIO_DIP_SW[3:2]</td><td>Y28, AA28</td><td>длина: 1 GiB, 8 GiB, 64 GiB, без ограничения</td></tr>
+<tr><td>GPIO_LED_0…7</td><td>AB8, AA8, AC9, AB9, AE26, G19, E18, F16</td><td>link_up, gen2, enum_done, nvme_ready, running, done, ошибка, «сердцебиение»</td></tr>
+</table>
+
+<p><b>Тестовый шаблон.</b> Встроенный генератор в домене <code>user_clk</code> (он же <code>data_clk</code>) выдаёт 128-битный beat <code>{~n, n ^ 32'hA5A5A5A5, n*7, n}</code>, где <code>n</code> — 32-битный номер beat'а с нуля (как в <code>sim/tb/tb_top.sv</code>). Запись идёт с LBA 0, то есть beat <code>n</code> лежит по смещению <code>16·n</code> байт, а слова внутри beat'а — в порядке little-endian: <code>n</code>, <code>n*7</code>, <code>n ^ 0xA5A5A5A5</code>, <code>~n</code>. Запустите запись, дождитесь светодиода «done» (или нажмите STOP), выключите питание SSD, переставьте его в ПК (USB-адаптер или слот M.2) и проверьте:</p>
+<pre><code>dd if=/dev/nvme1n1 of=rec.img bs=1M count=1024 iflag=direct      # копия первых 1 GiB (по желанию)
+python fpga/tools/check_pattern.py rec.img --expect 1G             # или прямо с устройства: ... /dev/nvme1n1 --bytes 1G</code></pre>
+<p>Скрипт <code>fpga/tools/check_pattern.py</code> читает образ или блочное устройство, проверяет шаблон от LBA 0, сообщает число проверенных байт и первое расхождение (смещение, LBA, номер beat'а, ожидаемое и найденное слово) и возвращает код 1 при ошибке или при недоборе до <code>--expect</code>. После остановки кнопкой STOP в режиме «без ограничения» последний неполный слот кольца не записан, поэтому расхождение в конце записи ожидаемо; число проверенных байт равно размеру записи. Шаблон повторяется после 64 GiB (счётчик 32 бита).</p>
 
 <!-- ============================================================ -->
 <h2 id="s2">5.2. Сброс и обучение линка: <code>link_bringup</code></h2>
 
-<p>Первым работает модуль <code>rtl/pcie/link_bringup.sv</code>. Его особенность — тактовая частота. Вся остальная логика работает от <code>user_clk</code> (125 МГц), который выдаёт ядро pcie_7x. Но <code>user_clk</code> появляется только после того, как ядро вышло из сброса и его MMCM захватил частоту, а сброс ядра формирует как раз <code>link_bringup</code>. Чтобы разорвать этот круг, модуль тактируется <b>свободно бегущей</b> частотой <code>link_clk</code>: опорные 100 МГц, поделённые на 2 выходом <code>IBUFDS_GTE2.ODIV2</code>, через <code>BUFG</code>, то есть 50 МГц (см. <code>nvme_host_top.sv</code>, параметр <code>LINK_CLK_HZ = 50_000_000</code>).</p>
+<p>Первым работает модуль <code>rtl/pcie/link_bringup.sv</code>. Его особенность — тактовая частота. Вся остальная логика работает от <code>user_clk</code> (125 МГц), который выдаёт ядро pcie_7x. Но <code>user_clk</code> появляется только после того, как ядро вышло из сброса и его MMCM захватил частоту, а сброс ядра формирует как раз <code>link_bringup</code>. Чтобы разорвать этот круг, модуль тактируется <b>свободно бегущей</b> частотой <code>link_clk</code>: это генератор платы <code>free_clk_p/n</code> (SYSCLK KC705, 200 МГц) через <code>IBUFDS</code> и <code>BUFG</code> (см. <code>nvme_host_top.sv</code>, параметр <code>LINK_CLK_HZ = 200_000_000</code>).</p>
 
 <p>Входы состояния ядра (<code>user_lnk_up</code>, <code>pl_ltssm_state</code>, <code>pl_sel_lnk_rate</code> и другие) принадлежат домену <code>user_clk</code>. Поэтому они сначала проходят двухтриггерные синхронизаторы. Выходы <code>link_ready</code>, <code>link_gen2</code>, <code>link_width</code> регистровые; в <code>nvme_host_top</code> их ещё раз синхронизируют в домен <code>user_clk</code>.</p>
 
@@ -246,7 +265,7 @@
 
 <p>Разберём решения, которые стоят за этой таблицей.</p>
 <ul>
-<li><b>Ядро выходит из сброса раньше SSD.</b> <code>sys_rst_n</code> снимается на 16 тактов <code>link_clk</code> (320 нс при 50 МГц) раньше <code>perst_n</code>. К моменту, когда SSD начнёт Detect, приёмники GTX уже работают. Если сделать наоборот, SSD первым начнёт обучение, не найдёт партнёра и пройдёт лишний круг Detect.</li>
+<li><b>Ядро выходит из сброса раньше SSD.</b> <code>sys_rst_n</code> снимается на 16 тактов <code>link_clk</code> (80 нс при 200 МГц) раньше <code>perst_n</code>. К моменту, когда SSD начнёт Detect, приёмники GTX уже работают. Если сделать наоборот, SSD первым начнёт обучение, не найдёт партнёра и пройдёт лишний круг Detect.</li>
 <li><b>100 мс считаются от <code>user_lnk_up</code>, а не от снятия PERST#.</b> Спецификация CEM требует не менее 100 мс между снятием PERST# и первым конфигурационным запросом. Отсчёт от поднятия линка даёт больше: эти 100 мс плюс время обучения. Это консервативное прочтение правила.</li>
 <li><b>Ожидание Gen2 ограничено.</b> Если одна из сторон не умеет 5 GT/s (<code>pl_link_gen2_cap</code> или <code>pl_link_partner_gen2_supported</code> равен 0), ждать нечего, и автомат сразу переходит в READY. Если Gen2 возможен, но не наступил за 100 мс, автомат всё равно переходит в READY с <code>link_gen2 = 0</code>. Хост работает, но вдвое медленнее; это видно по <code>status_gen2</code>.</li>
 <li><b>Многобитная шина через синхронизатор.</b> <code>pl_ltssm_state</code> — шесть бит, и после синхронизатора на ней возможны промежуточные коды. Поэтому условие «Gen2 и L0» должно держаться два такта подряд (<code>gen2_stable</code>).</li>

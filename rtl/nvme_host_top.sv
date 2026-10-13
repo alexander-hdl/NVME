@@ -20,6 +20,14 @@
 // feeds a BUFG from IBUFDS_GTE2.O and ODIV2 shares that output path (route_design fails with
 // "Route 35-54 IBUFDS_GTE2.O->BUFGCTRL.I0 unroutable" when both are used).
 // SIM_FAST shortens all "millisecond" timers (microsecond ticks).
+//
+// Sticky link flags.  link_bringup's link_lost / link_fail go straight to the core inputs of the
+// same name (the core 2-FF synchronises them into user_clk, no extra synchroniser here).  The
+// core's status_flags[7:0] (bit map in nvme_host_core.sv), stat_first_error_lba (SLBA of the first
+// failed Write) and link_retries (PERST# re-runs after link-up timeouts, link_clk domain,
+// quasi-static) are exported as ports, together with the raw link_lost / link_fail (link_clk domain).  link_clk_out is the free-running link_clk for board logic
+// that must keep running while user_clk is dead (the board top kc705_top uses it for buttons/LEDs).
+// For a bitstream use the board-level top rtl/board/kc705_top.sv (all pins assigned).
 // =============================================================================
 module nvme_host_top
   import nvme_host_pkg::*;
@@ -66,6 +74,12 @@ module nvme_host_top
   output logic [63:0]  stat_cmds_done,        // extra
   output logic [31:0]  stat_cmd_errors,
   output logic [31:0]  stat_max_latency,
+  output logic [7:0]   status_flags,          // see nvme_host_core.sv: [0] shutdown_timeout .. [7] rx_drop
+  output logic [63:0]  stat_first_error_lba,  // SLBA of the first failed Write (status_flags[6])
+  output logic [1:0]   link_retries,          // link_clk domain: PERST# re-runs caused by link-up timeouts
+  output logic         link_lost,             // link_clk domain, sticky (same signal that feeds the core)
+  output logic         link_fail,             // link_clk domain, sticky; valid while user_clk is dead
+  output logic         link_clk_out,          // free-running 200 MHz link_clk (BUFG output)
   output logic         user_clk_out
 );
 
@@ -129,6 +143,11 @@ module nvme_host_top
 
   logic       link_ready_lc, link_gen2_lc;
   logic [1:0] link_width_lc;
+  logic       link_lost_lc, link_fail_lc;
+  assign link_lost = link_lost_lc;
+  assign link_fail = link_fail_lc;
+
+  assign link_clk_out = link_clk;
 
   link_bringup #(
     .CLK_HZ(LINK_CLK_HZ), .SIM_FAST(SIM_FAST)
@@ -138,7 +157,8 @@ module nvme_host_top
     .pl_sel_lnk_width(pl_sel_lnk_width), .pl_link_gen2_cap(pl_link_gen2_cap),
     .pl_link_partner_gen2_supported(pl_link_partner_gen2_supported),
     .perst_n(perst_n_i), .sys_rst_n(sys_rst_n),
-    .link_ready(link_ready_lc), .link_gen2(link_gen2_lc), .link_width(link_width_lc));
+    .link_ready(link_ready_lc), .link_gen2(link_gen2_lc), .link_width(link_width_lc),
+    .link_lost(link_lost_lc), .link_fail(link_fail_lc), .link_retries(link_retries));
 
   assign pcie_perst_n = perst_n_i;
 
@@ -192,6 +212,7 @@ module nvme_host_top
     .cfg_mgmt_rd_wr_done(cfg_mgmt_rd_wr_done), .cfg_mgmt_wr_readonly(cfg_mgmt_wr_readonly),
     .cfg_mgmt_wr_rw1c_as_rw(cfg_mgmt_wr_rw1c_as_rw),
     .link_ready(link_ready_uc), .link_gen2(link_gen2_uc), .link_width(link_width_uc),
+    .link_lost(link_lost_lc), .link_fail(link_fail_lc),     // link_clk domain, synchronised inside the core
     .data_clk(data_clk), .data_rst(data_rst_sync[1]),
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
     .ctrl_start(ctrl_start_uc), .ctrl_stop(ctrl_stop_uc),
@@ -200,9 +221,11 @@ module nvme_host_top
     .status_running(status_running), .status_done(status_done),
     .status_error(status_error), .status_error_detail(status_error_detail),
     .status_seq_state(), .status_lba_range_err(status_lba_range_err), .status_shutdown_timeout(),
+    .status_flags(status_flags),
     .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
     .stat_max_latency(stat_max_latency), .stat_last_status(), .stat_next_lba(), .stat_beats_in(),
     .stat_stall_cycles(), .stat_sq_full_stall_cycles(), .stat_unexpected_cpl(),
-    .stat_lbads(), .stat_nsze(), .stat_mdts());
+    .stat_lbads(), .stat_nsze(), .stat_mdts(),
+    .stat_first_error_lba(stat_first_error_lba));
 
 endmodule

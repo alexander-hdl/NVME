@@ -122,15 +122,15 @@
 <caption>Таблица 4.3. Домены тактирования и переходы между ними</caption>
 <tr><th>Такт</th><th>Источник</th><th>Кто работает</th><th>Сброс</th><th>Переходы</th></tr>
 <tr><td><code>user_clk</code>, 125 МГц</td><td><code>pcie_7x.user_clk_out</code> (MMCM ядра)</td><td>весь <code>nvme_host_core</code></td><td><code>user_reset_out</code> ядра, синхронный</td><td>—</td></tr>
-<tr><td><code>link_clk</code></td><td><code>IBUFDS_GTE2.ODIV2</code> опорной частоты → <code>BUFG</code></td><td><code>link_bringup</code></td><td><code>board_rst_n</code>: асинхронная установка, синхронное снятие (2 FF)</td><td>входы <code>user_lnk_up</code>, <code>pl_*</code> → 2 FF внутри <code>link_bringup</code>; выходы <code>link_ready/gen2/width</code> → 2 FF в <code>nvme_host_top</code>; липкие <code>link_lost</code>, <code>link_fail</code> → 2 FF без сброса внутри <code>nvme_host_core</code></td></tr>
+<tr><td><code>link_clk</code></td><td><code>free_clk_p/n</code> (SYSCLK 200 МГц) → <code>IBUFDS</code> → <code>BUFG</code></td><td><code>link_bringup</code></td><td><code>board_rst_n</code>: асинхронная установка, синхронное снятие (2 FF)</td><td>входы <code>user_lnk_up</code>, <code>pl_*</code> → 2 FF внутри <code>link_bringup</code>; выходы <code>link_ready/gen2/width</code> → 2 FF в <code>nvme_host_top</code>; липкие <code>link_lost</code>, <code>link_fail</code> → 2 FF без сброса внутри <code>nvme_host_core</code></td></tr>
 <tr><td><code>data_clk</code>, любой</td><td>пользователь</td><td>вход <code>data_ring</code></td><td><code>~board_rst_n | user_reset</code>, синхронное снятие в <code>data_clk</code></td><td>данные: <code>axis_fifo_async</code> (512 beat'ов, сбросы сторон взаимно синхронизированы); разрешение приёма <code>accept_enable</code> и статистика: 2 FF</td></tr>
 <tr><td>(асинхронные входы)</td><td>пользователь</td><td><code>ctrl_start</code>, <code>ctrl_stop</code></td><td>—</td><td>2 FF в <code>user_clk</code> в <code>nvme_host_top</code></td></tr>
 </table>
 
-<p>Почему <code>link_bringup</code> не может работать на <code>user_clk</code>? <code>user_clk</code> появляется только после того, как MMCM ядра захватил частоту. Но ядро выходит из сброса по сигналу <code>sys_rst_n</code>, который формирует сам <code>link_bringup</code>. Модуль, управляющий сбросом ядра, должен работать на такте, который от этого сброса не зависит. Поэтому он тактируется от опорной частоты PCIe через выход <code>ODIV2</code> буфера <code>IBUFDS_GTE2</code>.</p>
+<p>Почему <code>link_bringup</code> не может работать на <code>user_clk</code>? <code>user_clk</code> появляется только после того, как MMCM ядра захватил частоту. Но ядро выходит из сброса по сигналу <code>sys_rst_n</code>, который формирует сам <code>link_bringup</code>. Модуль, управляющий сбросом ядра, должен работать на такте, который от этого сброса не зависит. Поэтому он тактируется свободно бегущим генератором платы: <code>free_clk_p/n</code> → <code>IBUFDS</code> → <code>BUFG</code> (200 МГц у SYSCLK платы KC705).</p>
 
 <div class="box warn"><span class="t">Отличие от спецификации</span>
-<code>ARCHITECTURE.md</code> §4b называет такт <code>link_bringup</code> «init_clk 100 МГц». В RTL это <code>refclk_odiv2</code> через <code>BUFG</code>. Vivado 2022.2 выводит для него период 20 нс: <code>ODIV2</code> = опорная частота / 2 = 50 МГц. Поэтому <code>LINK_CLK_HZ</code> в <code>nvme_host_top</code> и <code>CLK_HZ</code> в <code>link_bringup</code> по умолчанию равны 50 000 000. Частоту стоит проверить на железе (ILA или частотомер): от неё зависят все миллисекундные выдержки PERST#. Ошибка вдвое не опасна, но нарушает расчёт.</div>
+<code>ARCHITECTURE.md</code> §4b называет такт <code>link_bringup</code> «init_clk 100 МГц». В RTL это отдельный генератор платы: порты <code>free_clk_p/n</code> → <code>IBUFDS</code> → <code>BUFG</code>, на KC705 — SYSCLK 200 МГц (период 5 нс в XDC). Выход <code>ODIV2</code> буфера <code>IBUFDS_GTE2</code> (опорная частота / 2 = 50 МГц, прежняя версия) использовать нельзя: ядро <code>pcie_7x</code> уже ведёт <code>IBUFDS_GTE2.O</code> на <code>BUFG</code>, а <code>O</code> → <code>BUFG</code> и <code>ODIV2</code> → <code>BUFG</code> делят один выходной тракт (<code>route_design</code> заканчивается ошибкой Route 35-54). Поэтому <code>LINK_CLK_HZ</code> в <code>nvme_host_top</code> равен 200 000 000, а <code>CLK_HZ</code> в <code>link_bringup</code> (по умолчанию 50 000 000) переопределяется. Частоту стоит проверить на железе (ILA или частотомер): от неё зависят все миллисекундные выдержки PERST#.</div>
 
 <p>Сброс устроен так. <code>user_reset_out</code> ядра — синхронный, активен единицей; он подаётся как <code>rst</code> на все модули ядра хоста. Внутри модулей сбрасываются только управляющие регистры: состояния, счётчики, <code>valid</code>-флаги. Регистры данных (<code>tdata</code> в срезах и FIFO, адреса) сброса не имеют. Это экономит трассировку и позволяет Vivado упаковывать их в блочную память и SRL. Такой код корректен, потому что данные без <code>valid</code> никто не читает. Сброс домена <code>data_clk</code> (<code>data_rst</code>) выставляется и сбросом платы, и сбросом ядра (<code>user_reset</code>), а снимается синхронно с <code>data_clk</code>. Асинхронный FIFO кольца данных вдобавок сам переносит сброс каждой стороны в другой домен (<a href="#m-axis_fifo_async">4.4.3</a>), так что сброс любой стороны очищает его целиком.</p>
 
@@ -993,7 +993,7 @@ rd_data  = {entry(i+1), entry(i)}                     (16 байт = 2 запи�
 <div class="box"><span class="t">Отличие от комментария в RTL</span>
 Шапка <code>link_bringup.sv</code> говорит «REL_PERST: perst_n = 1». По коду <code>perst_n</code> вычисляется из <code>next_state ∈ {WAIT_LNK, …}</code>, то есть поднимается на переходе REL_PERST → WAIT_LNK и виден уже в <code>WAIT_LNK</code>. На поведение это не влияет: разница один такт.</div>
 
-<p><b>Параметры:</b> <code>CLK_HZ</code> = 50 000 000 (частота <code>ODIV2</code>), <code>PERST_HOLD_MS</code> = <code>POST_PERST_MS</code> = <code>GEN2_WAIT_MS</code> = 100, <code>LINK_TIMEOUT_MS</code> = 2000, <code>LINK_RETRY_MAX</code> = 3, <code>SIM_FAST</code> = 0. <code>perst_n</code> активен нулём и идёт прямо на вывод PERST# разъёма M.2. Если переходник принимает сброс с активной единицей (так у некоторых FMC-адаптеров M.2), между выходом и выводом нужен один инвертор на верхнем уровне.</p>
+<p><b>Параметры:</b> <code>CLK_HZ</code> = 50 000 000 по умолчанию (в <code>nvme_host_top</code> передаётся 200 000 000, частота <code>free_clk</code>), <code>PERST_HOLD_MS</code> = <code>POST_PERST_MS</code> = <code>GEN2_WAIT_MS</code> = 100, <code>LINK_TIMEOUT_MS</code> = 2000, <code>LINK_RETRY_MAX</code> = 3, <code>SIM_FAST</code> = 0. <code>perst_n</code> активен нулём и идёт прямо на вывод PERST# разъёма M.2. Если переходник принимает сброс с активной единицей (так у некоторых FMC-адаптеров M.2), между выходом и выводом нужен один инвертор на верхнем уровне.</p>
 
 <table class="ports" id="tab-ports_link_bringup">
 <caption>Таблица 4.34. Порты link_bringup</caption>
@@ -1390,7 +1390,7 @@ rd_data  = {entry(i+1), entry(i)}                     (16 байт = 2 запи�
 <!-- ------------------------------------------------------------ wrapper -->
 <h3 id="m-pcie7x_wrapper">4.4.25. pcie7x_wrapper — обёртка IP-ядра</h3>
 
-<p><b>Назначение.</b> Изолировать сгенерированное ядро <code>pcie_7x_0</code> (Root Port, Gen2 x4, 128 бит, 125 МГц) от остального RTL. Обёртка содержит буфер опорной частоты <code>IBUFDS_GTE2</code>: выход <code>O</code> идёт в ядро как <code>sys_clk</code>, выход <code>ODIV2</code> выведен наружу для <code>link_clk</code>. Ещё в ней экземпляр ядра, где все неиспользуемые входы привязаны к константам. Привязки Root Port'а: <code>cfg_ds_bus/device/function_number = 0</code>, <code>cfg_pm_send_pme_to = 0</code>, <code>pl_transmit_hot_rst = 0</code>, <code>pl_directed_link_* = 0</code> (Gen2 поднимается автоматически), <code>cfg_err_* = 0</code>, <code>cfg_interrupt = 0</code>. <code>rx_np_req = 1</code>, потому что используется режим <code>rx_np_ok</code>.</p>
+<p><b>Назначение.</b> Изолировать сгенерированное ядро <code>pcie_7x_0</code> (Root Port, Gen2 x4, 128 бит, 125 МГц) от остального RTL. Обёртка содержит буфер опорной частоты <code>IBUFDS_GTE2</code>: выход <code>O</code> идёт в ядро как <code>sys_clk</code>, выход <code>ODIV2</code> остаётся неподключённым (он делит выходной тракт с <code>O</code> → <code>BUFG</code> внутри ядра, см. рамку в <a href="#s1-5">4.1.5</a>); <code>link_clk</code> берётся из отдельного генератора платы. Ещё в ней экземпляр ядра, где все неиспользуемые входы привязаны к константам. Привязки Root Port'а: <code>cfg_ds_bus/device/function_number = 0</code>, <code>cfg_pm_send_pme_to = 0</code>, <code>pl_transmit_hot_rst = 0</code>, <code>pl_directed_link_* = 0</code> (Gen2 поднимается автоматически), <code>cfg_err_* = 0</code>, <code>cfg_interrupt = 0</code>. <code>rx_np_req = 1</code>, потому что используется режим <code>rx_np_ok</code>.</p>
 
 <p>Ядро не входит в <code>rtl/filelist.f</code>: его создаёт скрипт <code>fpga/scripts/create_project.tcl</code>. Для симуляции вместо обёртки используется модель <code>sim/models/pcie7x_core_model.sv</code>. Она подключается на уровне потоков AXI-S и умеет straddling и 3DW-смещение (решение D15).</p>
 
@@ -1402,7 +1402,6 @@ rd_data  = {entry(i+1), entry(i)}                     (16 байт = 2 запи�
 <tr><th>Порт</th><th>Направление</th><th class="num">Ширина</th><th>Описание</th></tr>
 <tr><td><code>sys_clk_p</code><br><code>sys_clk_n</code></td><td>вход</td><td class="num">1, 1</td><td>опорная частота 100 МГц (общая с SSD)</td></tr>
 <tr><td><code>sys_rst_n</code></td><td>вход</td><td class="num">1</td><td>асинхронный сброс ядра, активный 0 (от link_bringup)</td></tr>
-<tr><td><code>refclk_odiv2</code></td><td>выход</td><td class="num">1</td><td>выход ODIV2 буфера — источник link_clk</td></tr>
 <tr><td><code>pci_exp_txp</code><br><code>pci_exp_txn</code></td><td>выход</td><td class="num">4, 4</td><td>передатчики четырёх линий</td></tr>
 <tr><td><code>pci_exp_rxp</code><br><code>pci_exp_rxn</code></td><td>вход</td><td class="num">4, 4</td><td>приёмники четырёх линий</td></tr>
 <tr><td><code>user_clk_out</code><br><code>user_reset_out</code></td><td>выход</td><td class="num">1, 1</td><td>такт и сброс пользовательской логики</td></tr>
@@ -1422,14 +1421,15 @@ rd_data  = {entry(i+1), entry(i)}                     (16 байт = 2 запи�
 <!-- ------------------------------------------------------------ top -->
 <h3 id="m-nvme_host_top">4.4.26. nvme_host_top — верхний уровень платы</h3>
 
-<p><b>Назначение.</b> Соединить ядро, хост и выводы ПЛИС, сделать все переходы между доменами. Внутри: <code>pcie7x_wrapper</code>; <code>BUFG</code> на <code>refclk_odiv2</code> → <code>link_clk</code>; синхронизатор сброса платы в <code>link_clk</code> (асинхронная установка, снятие через 2 FF); <code>link_bringup</code>; двухтриггерные синхронизаторы <code>link_ready</code>, <code>link_gen2</code>, <code>link_width</code> (побитно; ширина квазистатическая) и <code>ctrl_start/stop</code> в <code>user_clk</code>; синхронизатор <code>data_rst</code> в <code>data_clk</code>; <code>nvme_host_core</code>. Часть статистики ядра наружу не выведена. Липкие выходы <code>link_lost</code>, <code>link_fail</code>, <code>link_retries</code> модуля <code>link_bringup</code> в текущей версии <code>nvme_host_top</code> к ядру не подключены: одноимённые входы <code>nvme_host_core</code> получают значение по умолчанию 0, и защита от повторного старта после потери линка (<a href="#m-host_sequencer">4.4.23</a>) на верхнем уровне пока не действует.</p>
+<p><b>Назначение.</b> Соединить ядро, хост и выводы ПЛИС, сделать все переходы между доменами. Внутри: <code>pcie7x_wrapper</code>; <code>IBUFDS</code> + <code>BUFG</code> на <code>free_clk_p/n</code> → <code>link_clk</code>; синхронизатор сброса платы в <code>link_clk</code> (асинхронная установка, снятие через 2 FF); <code>link_bringup</code>; двухтриггерные синхронизаторы <code>link_ready</code>, <code>link_gen2</code>, <code>link_width</code> (побитно; ширина квазистатическая) и <code>ctrl_start/stop</code> в <code>user_clk</code>; синхронизатор <code>data_rst</code> в <code>data_clk</code>; <code>nvme_host_core</code>. Часть статистики ядра наружу не выведена. Липкие выходы <code>link_lost</code>, <code>link_fail</code> модуля <code>link_bringup</code> подключены прямо к одноимённым входам <code>nvme_host_core</code> (ядро само синхронизирует их в <code>user_clk</code>, лишнего синхронизатора на верхнем уровне нет), поэтому защита от повторного старта после потери линка (<a href="#m-host_sequencer">4.4.23</a>) на верхнем уровне действует. Те же <code>link_lost</code>, <code>link_fail</code> и <code>link_retries</code> выведены наружу портами (домен <code>link_clk</code>, значения верны и пока <code>user_clk</code> не работает), вместе с <code>status_flags</code> и <code>stat_first_error_lba</code> ядра и свободно бегущим <code>link_clk_out</code> для логики платы. Для сборки битстрима используется плата-верхний уровень <a href="#m-kc705_top">kc705_top</a> (4.4.27).</p>
 
-<p><b>Параметры:</b> те же, что у ядра, плюс <code>LINK_CLK_HZ</code> = 100 000 000 — реальная частота <code>ODIV2</code> (см. рамку в <a href="#s1-5">4.1.5</a>). По сравнению с <code>ARCHITECTURE.md</code> §5.18 добавлены выходы <code>status_error_detail</code>, <code>status_link_width</code>, <code>status_lba_range_err</code>, <code>stat_cmds_done</code>; в RTL они помечены как «extra».</p>
+<p><b>Параметры:</b> те же, что у ядра, плюс <code>LINK_CLK_HZ</code> = 200 000 000 — реальная частота генератора <code>free_clk_p/n</code> (SYSCLK KC705; см. рамку в <a href="#s1-5">4.1.5</a>). По сравнению с <code>ARCHITECTURE.md</code> §5.18 добавлены выходы <code>status_error_detail</code>, <code>status_link_width</code>, <code>status_lba_range_err</code>, <code>stat_cmds_done</code>; в RTL они помечены как «extra».</p>
 
 <table class="ports" id="tab-ports_nvme_host_top">
 <caption>Таблица 4.49. Порты nvme_host_top</caption>
 <tr><th>Порт</th><th>Направление</th><th class="num">Ширина</th><th>Описание</th></tr>
 <tr><td><code>sys_clk_p</code><br><code>sys_clk_n</code></td><td>вход</td><td class="num">1, 1</td><td>опорная частота PCIe 100 МГц (общая с SSD)</td></tr>
+<tr><td><code>free_clk_p</code><br><code>free_clk_n</code></td><td>вход</td><td class="num">1, 1</td><td>свободно бегущий генератор платы (SYSCLK KC705, 200 МГц, LVDS) → <code>link_clk</code></td></tr>
 <tr><td><code>board_rst_n</code></td><td>вход</td><td class="num">1</td><td>сброс платы, активный 0, асинхронный</td></tr>
 <tr><td><code>pcie_perst_n</code></td><td>выход</td><td class="num">1</td><td>PERST# разъёма M.2</td></tr>
 <tr><td><code>pci_exp_txp</code><br><code>pci_exp_txn</code></td><td>выход</td><td class="num">4, 4</td><td>линии передачи x4</td></tr>
@@ -1443,7 +1443,44 @@ rd_data  = {entry(i+1), entry(i)}                     (16 байт = 2 запи�
 <tr><td><code>status_error</code><br><code>status_error_detail</code></td><td>выход</td><td class="num">8, 8</td><td>код ошибки и подробность</td></tr>
 <tr><td><code>status_lba_range_err</code></td><td>выход</td><td class="num">1</td><td>достигнут конец пространства имён</td></tr>
 <tr><td><code>stat_bytes_done</code><br><code>stat_cmds_done</code><br><code>stat_cmd_errors</code><br><code>stat_max_latency</code></td><td>выход</td><td class="num">64, 64, 32, 32</td><td>статистика записи</td></tr>
+<tr><td><code>status_flags</code></td><td>выход</td><td class="num">8</td><td>липкие флаги ядра (табл. <a href="#tab-flags">4.46</a>)</td></tr>
+<tr><td><code>stat_first_error_lba</code></td><td>выход</td><td class="num">64</td><td>SLBA первого ошибочного Write (<code>status_flags[6]</code>)</td></tr>
+<tr><td><code>link_retries</code></td><td>выход</td><td class="num">2</td><td>повторы цикла PERST# после тайм-аутов подъёма линка (домен <code>link_clk</code>, квазистатический)</td></tr>
+<tr><td><code>link_lost</code><br><code>link_fail</code></td><td>выход</td><td class="num">1, 1</td><td>липкие флаги <code>link_bringup</code> (домен <code>link_clk</code>); те же сигналы идут в ядро</td></tr>
+<tr><td><code>link_clk_out</code></td><td>выход</td><td class="num">1</td><td>свободно бегущий <code>link_clk</code> (200 МГц) для логики платы</td></tr>
 <tr><td><code>user_clk_out</code></td><td>выход</td><td class="num">1</td><td>user_clk (125 МГц) для логики пользователя</td></tr>
+</table>
+
+<!-- ------------------------------------------------------------ kc705_top -->
+<h3 id="m-kc705_top">4.4.27. kc705_top — плата KC705: выводы и генератор тестовых данных</h3>
+
+<p><b>Назначение.</b> Верхний модуль проекта (<code>rtl/board/kc705_top.sv</code>): оборачивает <code>nvme_host_top</code> так, что у каждого порта есть вывод ПЛИС, и битстрим собирается без <code>loose_io</code>. Выводы заданы в <code>fpga/constraints/kc705_board.xdc</code> (SYSCLK, кнопки, переключатели, светодиоды) и <code>kc705_fmc_m2.xdc</code> (опорная частота FMC, PERST#, каналы GTX). Внутри два домена. В свободно бегущем <code>link_clk</code> работают дребезгоподавители кнопок (около 10,5 мс), защёлки START/STOP, синхронизаторы статуса и светодиоды, поэтому они живы и до первого подъёма линка. В <code>user_clk</code> работает генератор тестовых данных: его выход подан на <code>s_data_*</code> и одновременно на <code>data_clk</code> (<code>data_clk = user_clk_out</code>), так что отдельного тактового ограничения для потока нет.</p>
+
+<p><b>Генератор.</b> 128-битный источник AXI-Stream выдаёт beat за beat'ом (по 16 байт) детерминированный шаблон от 32-битного счётчика <code>n</code>: <code>{~n, n ^ 32'hA5A5A5A5, n*7, n}</code> — тот же, что в <code>sim/tb/tb_top.sv</code>. Скорость задают <code>GPIO_DIP_SW[1:0]</code> (полная, 1/2, 1/4, 1/8 тактов <code>user_clk</code>), длину — <code>GPIO_DIP_SW[3:2]</code> (1 GiB, 8 GiB, 64 GiB, без ограничения). После нажатия STOP или по достижении длины генератор перестаёт формировать новые beat'ы, ждёт 4096 тактов и только тогда выдаётся <code>ctrl_stop</code>: поток останавливается раньше стопа, как требует ядро (неполный слот кольца на SSD не пишется). Запись начинается с LBA 0, beat <code>n</code> лежит по смещению <code>16·n</code> байт; записанное проверяется на ПК скриптом <code>fpga/tools/check_pattern.py</code> (см. <a href="05_bringup.html">главу 5</a>, 5.1.5).</p>
+
+<table class="ports" id="tab-ports_kc705_top">
+<caption>Таблица 4.51. Порты kc705_top</caption>
+<tr><th>Порт</th><th>Направление</th><th class="num">Ширина</th><th>Описание</th></tr>
+<tr><td><code>sys_clk_p</code><br><code>sys_clk_n</code></td><td>вход</td><td class="num">1, 1</td><td>опорная частота PCIe 100 МГц (FMC GBTCLK0_M2C, C8/C7)</td></tr>
+<tr><td><code>free_clk_p</code><br><code>free_clk_n</code></td><td>вход</td><td class="num">1, 1</td><td>SYSCLK KC705, 200 МГц LVDS (AD12/AD11)</td></tr>
+<tr><td><code>pcie_perst_n</code></td><td>выход</td><td class="num">1</td><td>PERST# на FMC (C25)</td></tr>
+<tr><td><code>pci_exp_txp</code><br><code>pci_exp_txn</code><br><code>pci_exp_rxp</code><br><code>pci_exp_rxn</code></td><td>выход / вход</td><td class="num">4 каждый</td><td>линии GTX x4</td></tr>
+<tr><td><code>cpu_reset</code></td><td>вход</td><td class="num">1</td><td>кнопка CPU_RESET (активна в 1); внутри инвертируется в <code>board_rst_n</code></td></tr>
+<tr><td><code>gpio_sw_c</code><br><code>gpio_sw_s</code></td><td>вход</td><td class="num">1, 1</td><td>START и STOP</td></tr>
+<tr><td><code>gpio_sw_n</code><br><code>gpio_sw_e</code><br><code>gpio_sw_w</code></td><td>вход</td><td class="num">1, 1, 1</td><td>страницы светодиодов (пока кнопка нажата)</td></tr>
+<tr><td><code>gpio_dip_sw</code></td><td>вход</td><td class="num">4</td><td>[1:0] скорость генератора, [3:2] длина</td></tr>
+<tr><td><code>gpio_led</code></td><td>выход</td><td class="num">8</td><td>светодиоды GPIO_LED_0…7</td></tr>
+</table>
+
+<table id="tab-kc705_ui">
+<caption>Таблица 4.52. Органы управления и светодиоды kc705_top</caption>
+<tr><th>Элемент</th><th>Функция</th></tr>
+<tr><td>CPU_RESET</td><td>сброс платы: новый полный цикл PERST#; сбрасывает защёлки START/STOP и генератор. Это единственный способ начать новый запуск</td></tr>
+<tr><td>GPIO_SW_C / GPIO_SW_S</td><td>START (защёлка <code>ctrl_start</code>) / STOP (принимается только после START)</td></tr>
+<tr><td>GPIO_SW_N / W / E</td><td>светодиоды показывают <code>status_flags[7:0]</code> / <code>status_error[7:0]</code> / {cmd_errors≠0, lba_range_err, link_width[1:0], link_lost, link_fail, link_retries[1:0]}</td></tr>
+<tr><td>GPIO_DIP_SW[1:0]</td><td>скорость: 00 полная (2 ГБ/с), 01 1/2, 10 1/4, 11 1/8 (задать до START)</td></tr>
+<tr><td>GPIO_DIP_SW[3:2]</td><td>длина: 00 1 GiB, 01 8 GiB, 10 64 GiB, 11 до STOP или до конца пространства имён</td></tr>
+<tr><td>GPIO_LED_0…7</td><td>link_up, gen2, enum_done, nvme_ready, running, done, ошибка (любая из <code>status_error</code>, <code>status_flags[6:0]</code>, <code>link_fail</code>, <code>link_lost</code>), «сердцебиение» (бит 25 26-битного счётчика <code>link_clk</code>, около 3 Гц)</td></tr>
 </table>
 
 <!-- ============================================================ 4.5 -->

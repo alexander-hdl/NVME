@@ -1,8 +1,8 @@
 # =============================================================================
-# build.tcl - batch build of nvme_host_top (synthesis, optional implementation + bitstream)
+# build.tcl - batch build of kc705_top / nvme_host_top (synthesis, optional implementation + bitstream)
 #
 #   vivado -mode batch -source fpga/scripts/build.tcl -log fpga/build/build.log -journal fpga/build/build.jou \
-#          -tclargs <stage> [jobs=N] [recreate]
+#          -tclargs <stage> [jobs=N] [recreate] [top=kc705_top|nvme_host_top]
 #
 #   stage   synth  (default) : IP generation + out-of-context IP synthesis + synth_1,
 #                              reports in fpga/build/reports/
@@ -10,9 +10,12 @@
 #           bit              : synth + impl + write_bitstream (fpga/build/nvme_host_top.bit)
 #   jobs=N  parallel runs (default 4)
 #   recreate  : always re-run create_project.tcl (default: re-use fpga/build/nvme_host/nvme_host.xpr)
+#   top=<name>: kc705_top (default, board top, all pins assigned: a bitstream needs no loose_io) or
+#               nvme_host_top (bare host; implies recreate when the project top differs).  Bitstream name
+#               fpga/build/<top>.bit
 #   loose_io  : (bit only) demote the DRC checks NSTD-1 / UCIO-1 (unconstrained I/O standard / pin) to
-#               warnings so that a bitstream can be written while the user-side ports (data stream,
-#               control/status) still have no package pins.  Do NOT use this for a real board image.
+#               warnings so that a bitstream can be written while ports still have no package pins
+#               (only needed for top=nvme_host_top).  Do NOT use this for a real board image.
 #
 # The project is created by fpga/scripts/create_project.tcl when it does not exist yet.
 # NOTE (Vivado 2022.2 on this machine): the project flow (launch_runs) is used because the
@@ -26,16 +29,25 @@ set build_dir  [file join $repo_root fpga build]
 set xpr        [file join $build_dir nvme_host nvme_host.xpr]
 set rpt_dir    [file join $build_dir reports]
 
+# vivado.bat splits 'key=value' into 'key value': merge them back
+set argv_m {}
+foreach a $argv {
+    if {[llength $argv_m] && [lindex $argv_m end] in {top jobs}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
+}
+set argv $argv_m
+
 set stage    synth
 set jobs     4
 set recreate 0
 set loose_io 0
+set top_name kc705_top
 foreach a $argv {
     switch -glob -- $a {
         synth - impl - bit { set stage $a }
         jobs=*             { set jobs [string range $a 5 end] }
         recreate           { set recreate 1 }
         loose_io           { set loose_io 1 }
+        top=*              { set top_name [string range $a 4 end] }
         default            { puts "WARNING: ignoring unknown argument '$a'" }
     }
 }
@@ -45,6 +57,11 @@ if {$recreate || ![file exists $xpr]} {
     source [file join $script_dir create_project.tcl]
 } else {
     open_project $xpr
+    if {[get_property top [current_fileset]] ne $top_name} {
+        puts "INFO: project top is [get_property top [current_fileset]], wanted $top_name -> recreating the project"
+        close_project
+        source [file join $script_dir create_project.tcl]
+    }
 }
 
 proc check_run {run} {
@@ -75,7 +92,7 @@ report_utilization -hierarchical -file [file join $rpt_dir synth_utilization_hie
 report_timing_summary -delay_type min_max -max_paths 10 -file [file join $rpt_dir synth_timing_summary.rpt]
 report_clock_networks -file [file join $rpt_dir synth_clock_networks.rpt]
 report_methodology    -file [file join $rpt_dir synth_methodology.rpt]
-write_checkpoint -force [file join $build_dir nvme_host_top_synth.dcp]
+write_checkpoint -force [file join $build_dir ${top_name}_synth.dcp]
 puts "INFO: synthesis finished, reports in $rpt_dir"
 if {$stage eq "synth"} { exit 0 }
 
@@ -100,10 +117,10 @@ report_timing_summary -delay_type min_max -max_paths 10 -report_unconstrained -f
 report_clock_interaction -delay_type min_max -file [file join $rpt_dir route_clock_interaction.rpt]
 report_drc            -file [file join $rpt_dir route_drc.rpt]
 report_power          -file [file join $rpt_dir route_power.rpt]
-write_checkpoint -force [file join $build_dir nvme_host_top_routed.dcp]
+write_checkpoint -force [file join $build_dir ${top_name}_routed.dcp]
 if {$stage eq "bit"} {
     set bit [glob -nocomplain [file join $build_dir nvme_host nvme_host.runs impl_1 *.bit]]
-    if {[llength $bit]} { file copy -force [lindex $bit 0] [file join $build_dir nvme_host_top.bit] }
+    if {[llength $bit]} { file copy -force [lindex $bit 0] [file join $build_dir ${top_name}.bit] }
 }
 puts "INFO: $stage finished, reports in $rpt_dir"
 exit 0

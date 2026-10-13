@@ -1,15 +1,20 @@
-# fpga/ - Vivado build of `nvme_host_top` (XC7K325T-2 FFG900, Vivado 2022.2)
+# fpga/ - Vivado build of `kc705_top` / `nvme_host_top` (XC7K325T-2 FFG900, Vivado 2022.2)
 
 Everything generated lives in `fpga/build/` (git-ignored). Tracked here:
 
 | path | what |
 |---|---|
-| `scripts/create_project.tcl` | creates the project `fpga/build/nvme_host`, adds `rtl/filelist.f`, creates/imports and generates `pcie_7x_0`, adds the constraints |
+| `scripts/create_project.tcl` | creates the project `fpga/build/nvme_host`, adds `rtl/filelist.f`, creates/imports and generates `pcie_7x_0`, adds the constraints; top = `kc705_top` (default) or `nvme_host_top` (`-tclargs top=nvme_host_top`) |
 | `scripts/build.tcl` | batch flow: IP + synthesis (+ implementation, + bitstream) and the reports in `fpga/build/reports/` |
-| `scripts/bit_pre_loose_io.tcl` | write_bitstream pre-hook used by `build.tcl ... loose_io` |
+| `scripts/bit_pre_loose_io.tcl` | write_bitstream pre-hook used by `build.tcl ... loose_io` (only needed for `top=nvme_host_top`) |
+| `../rtl/board/kc705_top.sv` | board top: wraps `nvme_host_top`, test-data generator, buttons/DIP/LEDs (see below) |
+| `tools/check_pattern.py` | PC-side checker of the recorded test pattern (raw image or block device) |
 | `ip/pcie_7x_0/pcie_7x_0.xci` | the IP configuration (only the `.xci` is tracked; all output products are regenerated) |
-| `constraints/kc705_fmc_m2.xdc` | clocks, example pins, example GT LOCs (KC705 + FMC M.2 adapter) |
+| `constraints/kc705_board.xdc` | KC705 board I/O of `kc705_top`: SYSCLK (`free_clk`, 200 MHz), CPU_RESET, GPIO buttons / DIP / LEDs, false paths of the user I/O, config properties (CFGBVS, CONFIG_VOLTAGE, compress) |
+| `constraints/kc705_fmc_m2.xdc` | FMC / PCIe part: `sys_clk` 100 MHz + pins (GBTCLK0 C8/C7), PERST# (C25), GT LOCs, ASYNC_REG false path (KC705 + FMC M.2 adapter) |
 | `constraints/kc705_fmc_m2_cdc.xdc` | clock groups, implementation only (the IP's clocks do not exist while the IP is a black box in `synth_design`) |
+
+Every constraint exists exactly once. There is no `data_clk` constraint any more: `kc705_top` feeds `nvme_host_top.data_clk` from `user_clk_out`.
 
 ## How to build
 
@@ -20,10 +25,11 @@ C:\Xilinx\Vivado\2022.2\bin\vivado.bat -mode batch -source ..\scripts\build.tcl 
 
 | `-tclargs` | result |
 |---|---|
-| `synth` (default) | create project if missing, IP (OOC) synthesis, `synth_1`, `reports/synth_*.rpt`, `nvme_host_top_synth.dcp` (~4 min) |
-| `impl` | + `impl_1` up to `route_design`, `reports/route_*.rpt`, `nvme_host_top_routed.dcp` (~12 min in total) |
-| `bit` | + `write_bitstream` -> `fpga/build/nvme_host_top.bit`; fails the DRC NSTD-1 / UCIO-1 while the user-side ports have no pins |
-| `loose_io` (with `bit`) | demote NSTD-1 / UCIO-1 to warnings so that a bitstream is produced anyway (bring-up experiments only) |
+| `synth` (default) | create project if missing, IP (OOC) synthesis, `synth_1`, `reports/synth_*.rpt`, `<top>_synth.dcp` (~4 min) |
+| `impl` | + `impl_1` up to `route_design`, `reports/route_*.rpt`, `<top>_routed.dcp` |
+| `bit` | + `write_bitstream` -> `fpga/build/<top>.bit` (`kc705_top.bit`: all pins assigned, no `loose_io` needed) |
+| `top=kc705_top` (default) / `top=nvme_host_top` | project top; a different top than the existing project recreates it. `nvme_host_top` has no pins for the user-side ports: its `bit` fails the DRC NSTD-1 / UCIO-1 (that path is untested since the board top was added) |
+| `loose_io` (with `bit`) | demote NSTD-1 / UCIO-1 to warnings (bring-up experiments with `top=nvme_host_top` only) |
 | `jobs=N`, `recreate` | parallel jobs (default 4); force `create_project.tcl` even if the project exists |
 
 `create_project.tcl` alone (`-source fpga/scripts/create_project.tcl`) only creates the project and generates the IP (~15 s).
@@ -74,31 +80,64 @@ The 168 ports of the generated `pcie_7x_0` (`ip/pcie_7x_0/pcie_7x_0.veo`) are al
 `rtl/pcie/pcie7x_wrapper.sv`; unused outputs are open, unused inputs are tied as in the Xilinx Root Port example design
 (`open_example_project`, `cgator_wrapper.v`). The Tcl check "every IP port appears exactly once in the instance" returned no missing and no extra port.
 
-## Results (Vivado 2022.2.2, `xc7k325tffg900-2`, default strategies)
+## Board top `kc705_top` (`rtl/board/kc705_top.sv`)
 
-Synthesis finished without errors and without critical warnings; implementation routed completely.
+Wraps `nvme_host_top`, so that every port has a pin and `build.tcl bit` needs no `loose_io`. Buttons, DIP switches and LEDs are on the
+free-running `link_clk` (they work before the first link-up and after `link_fail`); the test-data generator is on `user_clk` and
+`data_clk = user_clk_out` (no separate data clock, no `data_clk` constraint).
 
-| | LUT | FF | RAMB36 | DSP | BUFG | MMCM | GTX |
-|---|---|---|---|---|---|---|---|
-| `nvme_host_top`, after `synth_design` (incl. IP) | 7 895 (3.9 %) | 7 669 (1.9 %) | 270 (60.7 %) | 0 | 9 | 1 | 4 |
-| same, without the IP (`u_core` + glue) | 6 083 | 4 423 | 266 | 0 | | | |
-| `pcie_7x_0` alone (OOC) | 1 812 | 3 246 | 4 | 0 | 7 | 1 | 4 |
-| after `route_design` | 7 299 (3.6 %) | 6 767 (1.7 %) | 270 | 0 | 8 | 1 | 4 |
+| pin (KC705) | port | function |
+|---|---|---|
+| AD12 / AD11 (LVDS) | `free_clk_p/n` | SYSCLK 200 MHz -> `link_clk`, `LINK_CLK_HZ = 200_000_000` |
+| C8 / C7 | `sys_clk_p/n` | PCIe refclk 100 MHz, FMC GBTCLK0_M2C |
+| C25 (LVCMOS25) | `pcie_perst_n` | PERST# to the FMC / M.2 slot |
+| GTXE2_CHANNEL_X0Y12..15 | `pci_exp_*[3:0]` | PCIe lanes (FMC DP0..3) |
+| AB7 (LVCMOS15) | `cpu_reset` | CPU_RESET, active high, inverted to `board_rst_n`; also the way to start a new run |
+| G12 (LVCMOS25) | `gpio_sw_c` | START: latches `ctrl_start` |
+| AB12 (LVCMOS15) | `gpio_sw_s` | STOP: latches the stop request (after START); `ctrl_stop` follows once the generator has stopped |
+| AA12 / AG5 / AC6 (LVCMOS15) | `gpio_sw_n/e/w` | LED pages while held: `status_flags` / {cmd_errors!=0, lba_range_err, link_width[1:0], link_lost, link_fail, link_retries[1:0]} / `status_error` |
+| Y29, W29, AA28, Y28 (LVCMOS25) | `gpio_dip_sw[0..3]` | [1:0] rate: full, 1/2, 1/4, 1/8; [3:2] length: 1 GiB, 8 GiB, 64 GiB, unlimited |
+| AB8, AA8, AC9, AB9 (LVCMOS15), AE26, G19, E18, F16 (LVCMOS25) | `gpio_led[0..7]` | link_up, gen2, enum_done, nvme_ready, running, done, error (any), heartbeat |
 
-(the 8 x 128 KiB data slots are 256 RAMB36 of the 270). Bonded IOB 355 of 500, because the wide statistic buses and the data stream are top-level ports.
+All KC705 user-I/O pins are marked `verify UG810` in `kc705_board.xdc` (from memory of the KC705 master XDC; the DRC only proves that the pins exist and
+that the bank voltages are consistent).
+
+Test pattern: beat `n` (32-bit beat counter from 0, wraps after 64 GiB) = `{~n, n ^ 32'hA5A5A5A5, n*7, n}` (128-bit AXI-S, little-endian words in memory), identical to
+`sim/tb/tb_top.sv`; the recording starts at LBA 0, beat `n` at byte `16*n`. Check a recorded SSD on a PC with `dd` + `fpga/tools/check_pattern.py`:
+
+```
+dd if=/dev/nvme1n1 of=rec.img bs=1M count=1024 iflag=direct
+python fpga/tools/check_pattern.py rec.img --expect 1G         # or the device itself: ... /dev/nvme1n1 --bytes 1G
+```
+It prints the number of verified bytes and the first mismatch (byte offset, LBA, beat, expected / found word); exit status 1 on a mismatch.
+`vivado.bat` splits `key=value` tclargs into `key value`; `build.tcl` / `create_project.tcl` merge them back, so `top=nvme_host_top` and `jobs=8` work as written.
+
+## Results (Vivado 2022.2.2, `xc7k325tffg900-2`, default strategies, `kc705_top`, no `loose_io`)
+
+`build.tcl bit` (project re-created, IP + synth + impl + bitstream) finished in 8 min without errors and without critical warnings; `fpga/build/kc705_top.bit` (4.7 MB, compressed) was written.
+The DRC of the routed design has no error (NSTD-1 / UCIO-1 pass): REQP-1839 warnings (20 shown, rule limit reached), 1 RTSTAT-10 and 2 REQP-181 advisories, see Open items.
+
+| | LUT | FF | RAMB36 | DSP | BUFG | MMCM | GTX | bonded IOB |
+|---|---|---|---|---|---|---|---|---|
+| `kc705_top`, after `synth_design` (incl. IP) | 7 864 (3.9 %) | 7 652 (1.9 %) | 270 (60.7 %) | 0 | | | 4 | |
+| after `route_design` | 7 257 (3.6 %) | 6 733 (1.7 %) | 270 | 0 | 8 | 1 | 4 | 21 of 500 |
+
+(the 8 x 128 KiB data slots are 256 RAMB36 of the 270; the statistic buses and the data stream are no longer pins, so the IOB count dropped from 355 to 21).
 
 Post-route timing (`reports/route_timing_summary.rpt`, "All user specified timing constraints are met"):
 
 | clock | period | WNS setup | WHS hold |
 |---|---|---|---|
-| `userclk2` (= `user_clk_out`, the whole NVMe host) | 8.000 ns (125 MHz) | **+0.517 ns** (worst of the design) | +0.056 ns |
-| `clk_250mhz_mux_x0y0` / `userclk1` (IP internal pipe clocks) | 4.000 ns | +0.528 / +1.580 ns | |
-| `free_clk` (link_bringup) | 5.000 ns (200 MHz) | +1.872 ns | +0.144 ns |
-| `data_clk` (placeholder) | 8.000 ns | +3.415 ns | +0.181 ns |
-| `sys_clk` | 10.000 ns | +9.029 ns | |
+| `userclk2` (= `user_clk_out` = `data_clk`, the whole NVMe host and the generator) | 8.000 ns (125 MHz) | **+0.345 ns** (worst of the design) | +0.059 ns |
+| `clk_250mhz_mux_x0y0` (IP internal pipe clock) | 4.000 ns | +0.460 ns | +0.067 ns |
+| `userclk1` | 4.000 ns | +1.706 ns | +0.033 ns |
+| `free_clk` (link_bringup, board logic) | 5.000 ns (200 MHz) | +1.053 ns | +0.145 ns |
+| `sys_clk` | 10.000 ns | +9.029 ns | +0.172 ns |
 
-Design totals: WNS +0.517 ns, TNS 0, WHS +0.040 ns, 0 failing endpoints of 29 698. A bitstream (`loose_io`) was written successfully (4.7 MB, compressed).
-Not constrained (check_timing): 132 inputs without input delay and 196 outputs without output delay (all user-side ports).
+Design totals: WNS +0.345 ns, TNS 0, WHS +0.033 ns, 0 failing endpoints of 29 305. Not constrained by design (check_timing): 10 inputs (CPU_RESET, 5 buttons, 4 DIP) and
+9 outputs (8 LEDs, PERST#) without input/output delay; they are `set_false_path` in `kc705_board.xdc` (asynchronous or static). Compared with the bare `nvme_host_top`
+(previous result, WNS +0.517 ns) the margin on `userclk2` shrank by 0.17 ns (different placement; the generator is on the same clock).
+The `top=nvme_host_top` flow was only checked up to project creation (generated extra XDC with `free_clk` / `data_clk`), not re-run through synthesis.
 
 ## Findings made while building (all handled in the repo)
 
@@ -109,7 +148,7 @@ Not constrained (check_timing): 132 inputs without input delay and 196 outputs w
    Xilinx Root Port example routes). Leaving ODIV2 unconnected makes the same netlist route (verified, then re-verified in the full flow).
    Consequence: `link_clk` (free-running clock of `link_bringup`, needed before `user_clk` exists) now comes from a separate board
    oscillator: new ports `free_clk_p/n` of `nvme_host_top` (IBUFDS -> BUFG), `LINK_CLK_HZ` default 200 MHz (KC705 SYSCLK).
-   The `refclk_odiv2` port of `pcie7x_wrapper` is gone. ARCHITECTURE.md (clocking paragraph, 5.12, parameter table) and docs/ still describe ODIV2 = 50 MHz.
+   The `refclk_odiv2` port of `pcie7x_wrapper` is gone. ARCHITECTURE.md (clocking paragraph, 5.12, parameter table) and docs/03..05 now describe the free-running board clock (`free_clk_p/n` -> IBUFDS -> BUFG, `LINK_CLK_HZ = 200_000_000`).
 2. Everything else in the wrapper only needed names/ties corrected (see git diff of `rtl/pcie/pcie7x_wrapper.sv`): the IP has no `tx_cmd_err`,
    needs `int_pclk_sel_slave`, `fc_sel` and about 40 more inputs tied, all error inputs are active high.
 3. Root Port with the GTs in quad 118 (`X0Y12..15`, FMC HPC) and refclk on FMC `GBTCLK0_M2C` (IBUFDS_GTE2_X0Y6) places and routes
@@ -117,13 +156,13 @@ Not constrained (check_timing): 132 inputs without input delay and 196 outputs w
 
 ## Open items for a real board
 
-* **Pins**: `kc705_fmc_m2.xdc` pins (refclk C8/C7, PERST# C25, SYSCLK AD12/AD11, GT LOCs X0Y12..15) are examples taken from the
-  documents, not checked against UG810 / the adapter schematic. Nothing was rejected by place/route, but they are not verified.
-  Missing: `board_rst_n` (KC705 CPU_RESET is active high), `ctrl_*`, `status_*`, the data stream and `stat_*` buses (no pins, no I/O standards).
-* **`data_clk`**: a placeholder 125 MHz constraint is in the XDC; set the real period, add `set_input_delay` for `s_data_*`.
-* **Free-running clock**: `free_clk_p/n` is new; check the real KC705 SYSCLK I/O standard/pins (the example uses LVDS on AD12/AD11) or supply your own oscillator and set `LINK_CLK_HZ`.
+* **Pins**: `kc705_fmc_m2.xdc` pins (refclk C8/C7, PERST# C25, GT LOCs X0Y12..15) and all KC705 user-I/O pins in `kc705_board.xdc` (SYSCLK AD12/AD11, CPU_RESET AB7, GPIO_SW_*, GPIO_DIP_SW*, GPIO_LED_*) come from memory/the documents and are not checked against UG810 / the adapter schematic (`verify UG810`). Place/route and the DRC accept them (bank voltages are consistent), but a wrong net would not be noticed. Check especially SYSCLK (LVDS in a 1.5 V bank, input only) and which GPIO_SW pin is N/E/W/C.
+* **PERST# polarity**: `pcie_perst_n` is active low; the Opsero FMC M.2 adapter takes an active-high reset (see `link_bringup.sv`, docs/05 5.1.2). One inverter in `kc705_top` is needed for that adapter.
+* **REQP-1839 (20+ warnings)**: the `ENARDEN` pins of the data-ring RAMB36 are driven by `user_reset_out_reg` of the IP, a register with an asynchronous reset (per `report_drc`). A reset assertion could corrupt RAM contents / read values; the data is invalid after a reset anyway, but gating the RAM enable with a synchronous reset copy in `sdp_ram` / `data_ring` would remove the warning. RTSTAT-10 (`store_ltssm` in the IP) is harmless.
+* **Free-running clock**: SYSCLK is used as `free_clk_p/n`; with another oscillator set `LINK_CLK_HZ` and `free_clk` in the XDC.
 * **GT lane order / polarity** on the FMC M.2 adapter and whether the adapter feeds the 100 MHz refclk on `GBTCLK0_M2C`.
-* **Timing margin**: user clock WNS is +0.5 ns at 125 MHz with 8 x 128 KiB slots; the IP's `clk_250mhz` path has +0.53 ns. Re-check after any RTL change; first candidates would be the `hostmem`/`data_ring` BRAM output paths.
+* **Timing margin**: user clock WNS is +0.35 ns at 125 MHz with 8 x 128 KiB slots; the IP's `clk_250mhz` path has +0.46 ns. Re-check after any RTL change; first candidates would be the `hostmem`/`data_ring` BRAM output paths.
 * **Reset/PERST# timing** was not simulated against the real IP (the IP is only checked by elaboration/synthesis/implementation here); verify `sys_rst_n` release vs. `user_reset_out` and `rx_np_ok` behaviour in hardware (ILA on `pl_ltssm_state`, `user_lnk_up`).
 * `Buf_Opt_BMA = false` / NP credits 12: keep in sync with the request FIFO depth in `hostmem_completer`.
-* The unrouted-IO situation prevents a clean `write_bitstream`; a board-level wrapper (or `loose_io` for experiments) is needed.
+* `stat_bytes_done`, `stat_first_error_lba` and the other wide statistic buses are not routed to pins in `kc705_top` (only the LED pages); add a VIO / ILA (or UART) if they are needed on hardware.
+* A new run needs CPU_RESET (the START / STOP latches are only cleared by it); after "unlimited" + STOP the last partial ring slot is not on the SSD.

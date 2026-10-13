@@ -15,7 +15,7 @@
 | RTL (SystemVerilog, `rtl/`) | написан; 17 модульных тестов и системный тест проходят в xsim 2022.2 |
 | Поведенческие модели блока pcie_7x и NVMe SSD (`sim/models/`) | готовы, самопроверка `tb_models` |
 | Синтез `nvme_host_core` (xc7k325t, 125 МГц) | ≈7,9k LUT, ≈5,6k FF, 266 RAMB36; тайминг сходится |
-| Генерация IP pcie_7x (Root Port, x4, Gen2, 128 бит) и синтез `nvme_host_top` | см. `fpga/README.md` |
+| IP pcie_7x v3.3 (Root Port, x4, Gen2, 128 бит) + полный маршрут до битстрима (`kc705_top`) | битстрим собирается; после трассировки WNS +0,35 нс на 125 МГц; 7,3k LUT, 270 RAMB36 (`fpga/README.md`) |
 | Учебник (`docs/`, 8 глав + глоссарий, русский) | готов |
 | Проверка на реальной плате | **не выполнялась** — нужна Kintex-7 + FMC-адаптер M.2 с собственным REFCLK |
 
@@ -42,6 +42,8 @@ bash sim/scripts/run_xsim.sh models top # самопроверка моделе�
 | `rtl/pcie/` | Адаптеры к pcie_7x, демультиплексор/арбитр TLP, requester, перечисление, запуск линка, cfg_mgmt |
 | `rtl/nvme/` | Completer памяти хоста, приёмник записей, очереди, инициализация NVMe, движок записи, sequencer, `nvme_host_core` |
 | `rtl/nvme_host_top.sv` | Верхний уровень с IP pcie_7x |
+| `rtl/board/kc705_top.sv` | Платный top для KC705 + FMC M.2: генератор тестового потока, кнопки, DIP, светодиоды |
+| `fpga/tools/check_pattern.py` | Проверка записанного тестового потока на ПК |
 | `sim/models/` | Модели ядра pcie_7x (128-бит AXI-Stream со straddling) и NVMe SSD |
 | `sim/tb/` | Тестбенчи; `sim/scripts/` — запуск |
 | `fpga/` | Скрипты Vivado, констрейны, `.xci` IP |

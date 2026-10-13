@@ -412,7 +412,7 @@
 <p>Тактовых доменов три, и граница между ними проведена так, чтобы через неё шло как можно меньше сигналов.</p>
 <ul>
 <li><b><code>user_clk</code></b>, 125 МГц, выход ядра <code>user_clk_out</code>. В нём работает весь <code>nvme_host_core</code>. Частота выбрана так, чтобы 128 бит × 125 МГц = 2,0 ГБ/с совпадали со скоростью линка.</li>
-<li><b><code>link_clk</code></b> — свободно бегущий такт от опорного генератора 100 МГц (выход ODIV2 буфера <code>IBUFDS_GTE2</code> через BUFG). В нём работает только <code>link_bringup</code>. Причина проста: <code>user_clk</code> появляется лишь после выхода ядра из сброса, а сброс ядра выдаёт как раз <code>link_bringup</code>. Логика, отсчитывающая 100 мс до снятия сброса, не может тактироваться тем, что появится после.</li>
+<li><b><code>link_clk</code></b> — свободно бегущий такт платы (генератор SYSCLK 200 МГц на KC705: <code>free_clk_p/n</code> → <code>IBUFDS</code> → <code>BUFG</code>; выход <code>ODIV2</code> буфера <code>IBUFDS_GTE2</code> использовать нельзя, он не трассируется вместе с <code>O</code> → <code>BUFG</code> внутри ядра). В нём работает только <code>link_bringup</code>. Причина проста: <code>user_clk</code> появляется лишь после выхода ядра из сброса, а сброс ядра выдаёт как раз <code>link_bringup</code>. Логика, отсчитывающая 100 мс до снятия сброса, не может тактироваться тем, что появится после.</li>
 <li><b><code>data_clk</code></b> — такт источника данных, произвольной частоты. Переход в <code>user_clk</code> выполняет асинхронное FIFO на 512 beat'ов внутри <code>data_ring</code>. Чтобы источник не стал узким местом, он должен выдавать ≥ 1,82 ГБ/с: 16 B × f<sub>data</sub> ≥ 1,82 ГБ/с, то есть f<sub>data</sub> ≥ 114 МГц при непрерывном <code>tvalid</code>.</li>
 </ul>
 <p>Остальные пересечения — квазистатические уровни (<code>link_ready</code>, <code>link_gen2</code>, <code>link_width</code>, <code>ctrl_start</code>, <code>ctrl_stop</code>). Они проходят через двухтриггерные синхронизаторы в <code>nvme_host_top</code>.</p>
@@ -442,7 +442,7 @@
 </g>
 <rect x="540" y="228" width="150" height="40" rx="5" fill="var(--code-bg)" stroke="var(--accent2)" stroke-width="1.5"/>
 <g fill="var(--fg)" text-anchor="middle">
-<text x="120" y="77" font-size="11">IBUFDS_GTE2 → ODIV2 → BUFG</text>
+<text x="120" y="77" font-size="11">free_clk_p/n → IBUFDS → BUFG</text>
 <text x="120" y="142" font-family="monospace" font-weight="700">link_bringup</text>
 <text x="120" y="158" font-size="10.5" fill="var(--muted)">HOLD ≥ 100 мс → RELEASE</text>
 <text x="120" y="172" font-size="10.5" fill="var(--muted)">→ WAIT_LNK → 100 мс → READY</text>
@@ -776,7 +776,7 @@ i ≥ SLOT_BYTES/4096 − 1  →  0   (корректный SSD их не чит
 <tr><td><code>REQ_TIMEOUT_CYCLES</code></td><td>1 250 000</td><td>таймаут нашего non-posted запроса: 10 мс @ 125 МГц</td></tr>
 <tr><td><code>START_LBA</code></td><td>0</td><td>первый записываемый LBA</td></tr>
 <tr><td><code>SIM_FAST</code></td><td>0</td><td>в симуляции «миллисекунды» таймеров становятся микросекундами</td></tr>
-<tr><td><code>LINK_CLK_HZ</code></td><td>100 000 000</td><td>реальная частота <code>link_clk</code> (ODIV2) для таймеров <code>link_bringup</code></td></tr>
+<tr><td><code>LINK_CLK_HZ</code></td><td>200 000 000</td><td>реальная частота <code>link_clk</code> (генератор <code>free_clk_p/n</code>, SYSCLK KC705) для таймеров <code>link_bringup</code></td></tr>
 </table></div>
 
 <h3>3.7.1. Как параметры масштабируются</h3>

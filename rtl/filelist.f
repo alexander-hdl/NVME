@@ -1,7 +1,7 @@
 # =============================================================================
 # RTL file list, in compile order (paths relative to the repository root).
 # Used by fpga/scripts/create_project.tcl.  Comment lines start with '#'.
-# NOTE: rtl/pcie/pcie7x_wrapper.sv and rtl/nvme_host_top.sv instantiate the Vivado IP
+# NOTE: rtl/pcie/pcie7x_wrapper.sv, rtl/nvme_host_top.sv and rtl/board/kc705_top.sv (via nvme_host_top) instantiate the Vivado IP
 # `pcie_7x_0` and the Xilinx primitives IBUFDS_GTE2 / BUFG: they cannot be elaborated
 # in xsim without the IP.  Simulation lists (sim/tb/tb_*.f) exclude those two files.
 # =============================================================================
@@ -42,3 +42,6 @@ rtl/nvme/nvme_host_core.sv
 
 # --- top ---
 rtl/nvme_host_top.sv
+
+# --- board top (KC705: pins in fpga/constraints/kc705_board.xdc; also holds the test-data generator) ---
+rtl/board/kc705_top.sv

@@ -154,9 +154,10 @@ for 3DW headers. `hostmem_completer` = memory beats → `dw_shift(left, addr[3:2
 Clocking: one domain `user_clk` (125 MHz) for everything except the user data input (`data_clk`, any frequency,
 crossed inside `data_ring` by an async FIFO) and the free-running `link_clk` used only by `link_bringup`
 timers before `user_clk` is stable (the pcie_7x `user_clk_out` is present once the MMCM locks). `link_clk` is the
-IBUFDS_GTE2 `ODIV2` output through a BUFG = **refclk / 2 = 50 MHz** for the 100 MHz PCIe reference clock (Vivado derives
-`refclk_odiv2` with a 20 ns period); `link_bringup`'s `CLK_HZ` default is 50_000_000 and the top passes `LINK_CLK_HZ = 50_000_000`.
-Re-check on hardware, the PERST# timing depends on it.
+free-running board oscillator (`free_clk_p/n` → `IBUFDS` → `BUFG`; **200 MHz LVDS SYSCLK on the KC705**), not the `IBUFDS_GTE2`
+`ODIV2` output: the pcie_7x IP already feeds a BUFG from `IBUFDS_GTE2.O`, and `O`→BUFG and `ODIV2`→BUFG share one output path
+(`route_design` fails with Route 35-54). The top passes `LINK_CLK_HZ = 200_000_000` (`link_bringup`'s `CLK_HZ` default stays
+50_000_000 and must be overridden); with another oscillator set `LINK_CLK_HZ` to its real frequency, the PERST# timing depends on it.
 
 Reset: `user_reset` from the core (synchronous, active high) → all `nvme_host_core` logic. `link_bringup` has its own
 reset from the board. The core's `user_reset` is asserted by the IP on **every PERST# cycle** (link drop, retrain) and wipes
@@ -347,7 +348,7 @@ Two command ports with the `rp_requester` command-port signature, fixed priority
 
 ### 5.12 `link_bringup`
 ```
-input  clk (free-running; in nvme_host_top = IBUFDS_GTE2 ODIV2 -> BUFG = refclk/2 = 50 MHz), rst (board reset, synchronous release);
+input  clk (free-running; in nvme_host_top = free_clk_p/n -> IBUFDS -> BUFG, 200 MHz on the KC705), rst (board reset, synchronous release);
 input  user_lnk_up, [5:0] pl_ltssm_state, pl_sel_lnk_rate, [1:0] pl_sel_lnk_width, pl_link_gen2_cap, pl_link_partner_gen2_supported;
 output perst_n;          // to SSD, ACTIVE LOW (an active-high reset input, e.g. Opsero FMC M.2 adapters, needs ONE inverter in front of the pin)
 output sys_rst_n;        // to pcie_7x
@@ -477,6 +478,7 @@ error_code: 01 E_LINK_LOST, 02 E_ENUM (detail = enum fail_step), 03 E_ADMIN (det
 ### 5.18 `nvme_host_top` ports
 ```
 input  sys_clk_p, sys_clk_n;            // 100 MHz PCIe refclk (shared with SSD)
+input  free_clk_p, free_clk_n;          // free-running board oscillator (KC705 SYSCLK 200 MHz) -> IBUFDS -> BUFG -> link_clk
 input  board_rst_n;                     // board reset (active low)
 output pcie_perst_n;                    // to M.2 PERST#
 output [3:0] pci_exp_txp, pci_exp_txn; input [3:0] pci_exp_rxp, pci_exp_rxn;
@@ -485,8 +487,11 @@ input  ctrl_start, ctrl_stop;
 output status_link_up, status_gen2, status_enum_done, status_nvme_ready, status_running, status_done;
 output [7:0] status_error; output [63:0] stat_bytes_done; output [31:0] stat_cmd_errors; output [31:0] stat_max_latency;
 output user_clk_out (125 MHz, for user's convenience)
+output [7:0] status_flags; output [63:0] stat_first_error_lba;   // exported from the core (see below)
+output [1:0] link_retries; output link_lost, link_fail;          // link_bringup, link_clk domain
+output link_clk_out;                                              // free-running link_clk for board logic
 ```
-**`nvme_host_core` additions (v1.1)** - to be wired in `nvme_host_top` (the top currently leaves them open / defaulted):
+**`nvme_host_core` additions (v1.1)** - wired in `nvme_host_top` (`link_lost`/`link_fail` from `link_bringup` straight into the core, which synchronises them):
 ```
 input  link_lost = 0, link_fail = 0;   // sticky link_bringup flags (link_clk domain; synchronised inside the core)
 output [7:0] status_flags;             // [0] shutdown_timeout  [1] doorbell_err  [2] io_timeout  [3] flush_skipped
@@ -495,7 +500,16 @@ output [7:0] status_flags;             // [0] shutdown_timeout  [1] doorbell_err
 output [63:0] stat_first_error_lba;    // SLBA of the first failed Write
 parameter IO_TIMEOUT_MS = 30000;
 ```
-The top should additionally export `link_bringup`'s `link_lost`, `link_fail`, `link_retries` (link_clk domain, valid while the core is in reset).
+`nvme_host_top` additionally exports `link_bringup`'s `link_lost`, `link_fail`, `link_retries` (link_clk domain, valid while the core is in reset).
+
+**Board top `kc705_top` (`rtl/board/kc705_top.sv`, B1).** Wraps `nvme_host_top` for the KC705 so that every port has a pin and
+`write_bitstream` passes without `loose_io`: CPU_RESET (active high, inverted) → `board_rst_n`; GPIO_SW_C = START (latched
+`ctrl_start`), GPIO_SW_S = STOP (latched; `ctrl_stop` follows once the generator has stopped); DIP[1:0] generator rate (full, 1/2,
+1/4, 1/8), DIP[3:2] length (1 / 8 / 64 GiB, unlimited); 8 LEDs (link_up, gen2, enum_done, nvme_ready, running, done, error,
+heartbeat) plus three debug pages on GPIO_SW_N/E/W (status_flags, link info, status_error). The built-in 128-bit AXI-S generator runs
+on `user_clk` (= `data_clk`, no separate data clock) and produces the beat `{~n, n ^ 32'hA5A5A5A5, n*7, n}` (n = beat counter, 32 bit), the
+same as `sim/tb/tb_top.sv`, so a recording starting at LBA 0 can be verified on a PC with `fpga/tools/check_pattern.py`. Buttons, latches and
+LEDs run on the free-running `link_clk` (they work while `user_clk` is dead).
 
 ---
 
@@ -515,7 +529,7 @@ The top should additionally export `link_bringup`'s `link_lost`, `link_fail`, `l
 | `REQ_TIMEOUT_CYCLES` | 1_250_000 | 10 ms at 125 MHz; testbench overrides via parameter |
 | `SIM_FAST` | 0 | shrinks millisecond timers to microseconds in simulation |
 | `IO_TIMEOUT_MS` | 30000 | write engine: per-command (and Flush) timeout |
-| `LINK_CLK_HZ` / `CLK_HZ` of link_bringup | 50_000_000 | frequency of the IBUFDS_GTE2 ODIV2 clock (refclk / 2) |
+| `LINK_CLK_HZ` / `CLK_HZ` of link_bringup | 200_000_000 (top) / 50_000_000 (module default) | frequency of the free-running board clock `free_clk_p/n` (KC705 SYSCLK 200 MHz) |
 | `LINK_TIMEOUT_MS`, `LINK_RETRY_MAX` | 2000, 3 | link-up timeout and PERST# re-runs before `link_fail` |
 
 ---
