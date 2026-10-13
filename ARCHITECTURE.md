@@ -61,7 +61,7 @@ AXI4-Stream, `DATA_W = 128`, `user_clk` domain, `tvalid/tready/tlast/tkeep[15:0]
 
 | Beat | `tdata[31:0]` | `[63:32]` | `[95:64]` | `[127:96]` |
 |---|---|---|---|---|
-| 0 (header) | H0 (Fmt/Type/TC/TD/EP/Attr/Length) | H1 (ReqID/Tag/BE or CplID/Status/BC) | H2 (Addr or ReqID/Tag/LowerAddr) | H3 (Addr[63:32] for 4DW, else 0) |
+| 0 (header) | H0 (Fmt/Type/TC/TD/EP/Attr/Length) | H1 (ReqID/Tag/BE or CplID/Status/BC) | H2 (3DW: Addr[31:2]; 4DW: Addr[63:32]; Cpl: ReqID/Tag/LowerAddr) | H3 (4DW: Addr[31:2]; else 0) |
 | 1..n (payload) | D0 / D4 / ... | D1 / D5 | D2 / D6 | D3 / D7 |
 
 Rules:
@@ -226,7 +226,7 @@ input  [127:0] rd_data; input rd_valid;            // rd_valid = rd_en delayed 2
 ```
 Behaviour:
 1. Pop MRd headers into a request FIFO (depth 16 ≥ 12 NP credits of the core).
-2. For each request: decode `addr` (H2 for 3DW; if 4DW with H2≠0 → UR) into region (§2). Unknown → one `Cpl` with
+2. For each request: decode `addr` (H2 for 3DW; for 4DW the PCIe layout applies: H2 = Addr[63:32], H3 = Addr[31:2]; if H2≠0 → UR) into region (§2). Unknown → one `Cpl` with
    Status=UR (`BC` = requested bytes, `LA` = addr[6:0]), Length=0 (header-only packet). Poisoned/ECRC flags are
    not applicable (requests have no payload).
 3. For known regions: total bytes = `len_dw·4` (len 0 → 1024 DW = 4096 B; MRd length ≤ MRRS=512 B expected but
@@ -252,7 +252,7 @@ output [11:0] ident_wr_addr /*16B beats*/; output [127:0] wr_data; output [15:0]
 output [ADDR_W-1:0] wr_beat_addr;   // shared beat address, region-relative
 output drop_cnt_inc;                // MWr to unmapped address (e.g. MSI) or poisoned
 ```
-Behaviour: decode H2 (3DW; 4DW with H3≠0 → drop). Compute first-beat byte enables from `addr[3:2]` and First BE,
+Behaviour: decode the address (3DW: H2; 4DW: H2 = Addr[63:32] must be 0 else drop, H3 = Addr[31:2]). Compute first-beat byte enables from `addr[3:2]` and First BE,
 last from Last BE and Length; use `dw_realign` to shift payload DWs **right** by `addr[3:2]` so each output beat
 is a 16-byte aligned memory beat with the proper `wr_be`. A MWr may cover several beats; MWr never crosses 4 KiB
 (core-checked). Regions: Identify buffer, ACQ, IOCQ; any other → consume and count.
