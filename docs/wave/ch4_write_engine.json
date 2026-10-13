@@ -1,0 +1,111 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p........|...."
+  },
+  {
+   "name": "slot_full[3]",
+   "wave": "1........|..0."
+  },
+  [
+   "submit",
+   {
+    "name": "sub_state",
+    "wave": "=3...4=..|....",
+    "data": [
+     "IDLE",
+     "WR",
+     "COMMIT",
+     "IDLE"
+    ]
+   },
+   {
+    "name": "iosq_wr_en",
+    "wave": "01...0........"
+   },
+   {
+    "name": "iosq_wr_addr",
+    "wave": "x====x........",
+    "data": [
+     "28",
+     "29",
+     "2A",
+     "2B"
+    ]
+   },
+   {
+    "name": "sq_tail",
+    "wave": "=.....3.......",
+    "data": [
+     "10",
+     "11"
+    ]
+   }
+  ],
+  [
+   "doorbell",
+   {
+    "name": "db_state",
+    "wave": "=......44|=..4",
+    "data": [
+     "IDLE",
+     "REQ",
+     "RSP",
+     "IDLE",
+     "REQ"
+    ]
+   },
+   {
+    "name": "req_valid",
+    "wave": "0......10....1"
+   },
+   {
+    "name": "req_addr ← wdata",
+    "wave": "x......3x....5",
+    "data": [
+     "SQ1TDBL←11",
+     "CQ1HDBL←21"
+    ]
+   }
+  ],
+  [
+   "reap",
+   {
+    "name": "iocq_rd_data",
+    "wave": "=........|5=..",
+    "data": [
+     "P≠phase",
+     "P=1 CID 3",
+     "P≠phase"
+    ]
+   },
+   {
+    "name": "reap_hit",
+    "wave": "0.........10.."
+   },
+   {
+    "name": "slot_free[3]",
+    "wave": "0..........10."
+   },
+   {
+    "name": "cq_head",
+    "wave": "=..........3..",
+    "data": [
+     "20",
+     "21"
+    ]
+   }
+  ]
+ ],
+ "head": {
+  "text": "nvme_write_engine: слот 3 → SQE → SQ1TDBL; CQE → slot_free[3] → CQ1HDBL",
+  "tick": 0
+ },
+ "foot": {
+  "text": "Столбец 9 сжимает время выполнения команды в SSD (сотни мкс). CQ-doorbell ждёт «тихого» такта после reap"
+ },
+ "config": {
+  "cell_width": 68
+ }
+}

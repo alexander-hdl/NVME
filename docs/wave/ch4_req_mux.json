@@ -1,0 +1,79 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p......|..."
+  },
+  [
+   "порт 0 (admin)",
+   {
+    "name": "p0_req_valid",
+    "wave": "1....0....."
+   },
+   {
+    "name": "p0_req_ready",
+    "wave": "0...10....."
+   },
+   {
+    "name": "p0_rsp_valid",
+    "wave": "0........10"
+   }
+  ],
+  [
+   "порт 1 (doorbell)",
+   {
+    "name": "p1_req_valid",
+    "wave": "10........."
+   },
+   {
+    "name": "p1_req_ready",
+    "wave": "10........."
+   },
+   {
+    "name": "p1_rsp_valid",
+    "wave": "0..10......"
+   }
+  ],
+  {
+   "name": "last_p0_q",
+   "wave": "10...1....."
+  },
+  {
+   "name": "busy_q",
+   "wave": "01..01....0"
+  },
+  {
+   "name": "owner_q",
+   "wave": "x4...3....x",
+   "data": [
+    "p1",
+    "p0"
+   ]
+  },
+  {
+   "name": "rp_requester",
+   "wave": "=444=33|.3=",
+   "data": [
+    "IDLE",
+    "HDR",
+    "DATA",
+    "RSP",
+    "IDLE",
+    "HDR",
+    "WAIT_CPL",
+    "RSP",
+    "IDLE"
+   ]
+  }
+ ],
+ "head": {
+  "text": "req_mux: оба порта ждут, прошлую команду обслужил p0 → сначала p1 (MWr), затем p0 (MRd)",
+  "tick": 0
+ },
+ "foot": {
+  "text": "p1 ждёт не дольше одной команды p0; ответ (rsp_valid) возвращается только владельцу"
+ },
+ "config": {
+  "cell_width": 64
+ }
+}

@@ -1,0 +1,133 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p......."
+  },
+  [
+   "ядро",
+   {
+    "name": "tvalid",
+    "wave": "01...0.."
+   },
+   {
+    "name": "tready",
+    "wave": "1......."
+   },
+   {
+    "name": "is_sof/eof",
+    "wave": "x35x5x..",
+    "data": [
+     "SOF@0",
+     "EOF@0 SOF@2",
+     "EOF@0"
+    ]
+   },
+   {
+    "name": "DW0",
+    "wave": "x3456x..",
+    "data": [
+     "H0a",
+     "D1a",
+     "H2c",
+     "D3c"
+    ]
+   },
+   {
+    "name": "DW1",
+    "wave": "x3x6x...",
+    "data": [
+     "H1a",
+     "D0c"
+    ]
+   },
+   {
+    "name": "DW2",
+    "wave": "x356x...",
+    "data": [
+     "H2a",
+     "H0c",
+     "D1c"
+    ]
+   },
+   {
+    "name": "DW3",
+    "wave": "x456x...",
+    "data": [
+     "D0a",
+     "H1c",
+     "D2c"
+    ]
+   }
+  ],
+  [
+   "tlp_axis",
+   {
+    "name": "m_tvalid",
+    "wave": "0..1...0"
+   },
+   {
+    "name": "[31:0]",
+    "wave": "x..3456x",
+    "data": [
+     "H0a",
+     "D0a",
+     "H0c",
+     "D0c"
+    ]
+   },
+   {
+    "name": "[63:32]",
+    "wave": "x..3456x",
+    "data": [
+     "H1a",
+     "D1a",
+     "H1c",
+     "D1c"
+    ]
+   },
+   {
+    "name": "[95:64]",
+    "wave": "x..3x56x",
+    "data": [
+     "H2a",
+     "H2c",
+     "D2c"
+    ]
+   },
+   {
+    "name": "[127:96]",
+    "wave": "x..3x56x",
+    "data": [
+     "0",
+     "0",
+     "D3c"
+    ]
+   },
+   {
+    "name": "m_tkeep",
+    "wave": "x..====x",
+    "data": [
+     "FFFF",
+     "00FF",
+     "FFFF",
+     "FFFF"
+    ]
+   },
+   {
+    "name": "m_tlast",
+    "wave": "0...1010"
+   }
+  ]
+ ],
+ "head": {
+  "text": "pcie7x_rx_adapt: MWr 8 B (a, SOF@DW0) и CplD 16 B (c, SOF@DW2, straddle)",
+  "tick": 0
+ },
+ "foot": {
+  "text": "a: данные с DW3 сдвинуты влево на 3; c: данные с DW1 — влево на 1. Выходные D — после bswap32 (память-порядок)"
+ },
+ "config": {
+  "cell_width": 86
+ }
+}

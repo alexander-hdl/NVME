@@ -1,0 +1,77 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p..|......"
+  },
+  {
+   "name": "s_data_tready",
+   "wave": "1...0...1.",
+   "node": "...."
+  },
+  {
+   "name": "f_tvalid",
+   "wave": "1........."
+  },
+  {
+   "name": "f_tready",
+   "wave": "1.0...1...",
+   "node": "..a......."
+  },
+  {
+   "name": "wr_slot",
+   "wave": "=.3.......",
+   "data": [
+    "7",
+    "0"
+   ]
+  },
+  {
+   "name": "wr_beat",
+   "wave": "===|...===",
+   "data": [
+    "8190",
+    "8191",
+    "0",
+    "1",
+    "2",
+    "3"
+   ]
+  },
+  {
+   "name": "slot_full[7]",
+   "wave": "0.1......."
+  },
+  {
+   "name": "slot_full[0]",
+   "wave": "1.....0..."
+  },
+  {
+   "name": "slot_free[0]",
+   "wave": "0....10...",
+   "node": ".....b...."
+  },
+  {
+   "name": "slots_used",
+   "wave": "=.=...=...",
+   "data": [
+    "7",
+    "8",
+    "7"
+   ]
+  }
+ ],
+ "head": {
+  "text": "data_ring: кольцо заполнено, писатель ждёт освобождения слота 0",
+  "tick": 0
+ },
+ "foot": {
+  "text": "s_data_tready — в домене data_clk, показан условно: падает, когда FIFO 512 beat'ов заполнилось"
+ },
+ "config": {
+  "cell_width": 60
+ },
+ "edge": [
+  "b~>a slot_full[0] ← 0"
+ ]
+}

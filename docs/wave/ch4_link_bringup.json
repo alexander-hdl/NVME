@@ -1,0 +1,55 @@
+{
+ "signal": [
+  {
+   "name": "link_clk",
+   "wave": "p|.|..|.|...."
+  },
+  {
+   "name": "state",
+   "wave": "3|4|56|7|8.9.",
+   "data": [
+    "HOLD",
+    "REL_SYS",
+    "REL_PERST",
+    "WAIT_LNK",
+    "WAIT_POST",
+    "WAIT_GEN2",
+    "READY"
+   ]
+  },
+  {
+   "name": "sys_rst_n",
+   "wave": "0.1.........."
+  },
+  {
+   "name": "perst_n",
+   "wave": "0....1......."
+  },
+  {
+   "name": "user_lnk_up",
+   "wave": "0.....1......"
+  },
+  {
+   "name": "pl_sel_lnk_rate",
+   "wave": "0........1..."
+  },
+  {
+   "name": "link_ready",
+   "wave": "0..........1."
+  },
+  {
+   "name": "link_gen2",
+   "wave": "0..........1."
+  }
+ ],
+ "head": {
+  "text": "link_bringup: PERST# ≥ 100 мс, 16 тактов между sys_rst_n и PERST#, 100 мс после link-up",
+  "tick": 0
+ },
+ "foot": {
+  "text": "Входы ядра синхронизируются 2-FF; «Gen2 достигнут» — два подряд отсчёта rate = 1 и LTSSM = L0 (0x16)"
+ },
+ "config": {
+  "cell_width": 68
+ }
+}

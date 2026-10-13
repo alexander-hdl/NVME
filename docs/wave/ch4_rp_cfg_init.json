@@ -1,0 +1,86 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p........."
+  },
+  {
+   "name": "состояние",
+   "wave": "3..=4..=5.",
+   "data": [
+    "RD_DEV",
+    "GAP_RD",
+    "WR_DEV",
+    "GAP_DEV",
+    "DONE"
+   ]
+  },
+  {
+   "name": "cfg_mgmt_rd_en",
+   "wave": "1..0......"
+  },
+  {
+   "name": "cfg_mgmt_wr_en",
+   "wave": "0...1..0.."
+  },
+  {
+   "name": "cfg_mgmt_dwaddr",
+   "wave": "3..=4..=..",
+   "data": [
+    "01A",
+    "000",
+    "01A",
+    "000"
+   ]
+  },
+  {
+   "name": "cfg_mgmt_byte_en",
+   "wave": "3..=4..=..",
+   "data": [
+    "1111",
+    "0000",
+    "0011",
+    "0000"
+   ]
+  },
+  {
+   "name": "cfg_mgmt_rd_wr_done",
+   "wave": "0.10..10..",
+   "node": "..a......."
+  },
+  {
+   "name": "cfg_mgmt_do",
+   "wave": "x.3x......",
+   "data": [
+    "0000_2810"
+   ]
+  },
+  {
+   "name": "cfg_mgmt_di",
+   "wave": "=...4..=..",
+   "data": [
+    "0",
+    "0000_2930",
+    "0"
+   ],
+   "node": "....b....."
+  },
+  {
+   "name": "done",
+   "wave": "0.......1."
+  }
+ ],
+ "head": {
+  "text": "rp_cfg_init: read-modify-write Device Control Root Port'а (MPS = 256 B, Ext Tag = 1)",
+  "tick": 0
+ },
+ "foot": {
+  "text": "0x2810 & ~0x01E0 | (1 << 5) | (1 << 8) = 0x2930; пишутся только байты 0–1 (BE 0011)"
+ },
+ "config": {
+  "cell_width": 70
+ },
+ "edge": [
+  "a~>b модификация"
+ ]
+}

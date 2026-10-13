@@ -1,0 +1,73 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p..."
+  },
+  {
+   "name": "tvalid",
+   "wave": "01.0"
+  },
+  [
+   "tdata",
+   {
+    "name": "[31:0]",
+    "wave": "x34x",
+    "data": [
+     "H0=4000_0001",
+     "D0=0000_0006"
+    ]
+   },
+   {
+    "name": "[63:32]",
+    "wave": "x3x.",
+    "data": [
+     "H1=0000_000F"
+    ]
+   },
+   {
+    "name": "[95:64]",
+    "wave": "x3x.",
+    "data": [
+     "H2=C000_1008"
+    ]
+   },
+   {
+    "name": "[127:96]",
+    "wave": "x3x.",
+    "data": [
+     "H3=0"
+    ]
+   }
+  ],
+  {
+   "name": "tkeep",
+   "wave": "x==x",
+   "data": [
+    "FFFF",
+    "000F"
+   ]
+  },
+  {
+   "name": "tlast",
+   "wave": "0.10"
+  },
+  {
+   "name": "tuser",
+   "wave": "x=.x",
+   "data": [
+    "00"
+   ]
+  }
+ ],
+ "head": {
+  "text": "tlp_axis: MWr32 с 1 DW — SQ1TDBL ← 6 (BAR0 + 0x1008)",
+  "tick": 0
+ },
+ "foot": {
+  "text": "beat 0 — только заголовок, beat 1 — данные с DW0; D0 в памяти-порядке (байт 0 = 0x06 в [7:0])"
+ },
+ "config": {
+  "cell_width": 118
+ }
+}

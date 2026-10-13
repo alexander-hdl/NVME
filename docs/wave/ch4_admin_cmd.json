@@ -1,0 +1,106 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p...........|."
+  },
+  {
+   "name": "state",
+   "wave": "3...44..5666=6",
+   "data": [
+    "AC_WR",
+    "MM_REQ",
+    "MM_RSP",
+    "SQDB",
+    "POLL_RD",
+    "W1",
+    "CHK",
+    "…",
+    "CHK"
+   ]
+  },
+  [
+   "asq_ram",
+   {
+    "name": "asq_wr_en",
+    "wave": "1...0........."
+   },
+   {
+    "name": "asq_wr_addr",
+    "wave": "====x.........",
+    "data": [
+     "08",
+     "09",
+     "0A",
+     "0B"
+    ]
+   },
+   {
+    "name": "asq_wr_data",
+    "wave": "3333x.........",
+    "data": [
+     "SQE b0",
+     "b1",
+     "b2",
+     "b3"
+    ]
+   }
+  ],
+  [
+   "порт 0",
+   {
+    "name": "req_valid",
+    "wave": "0...10........"
+   },
+   {
+    "name": "req_ready",
+    "wave": "0...10........"
+   },
+   {
+    "name": "req_addr/wdata",
+    "wave": "x...4x........",
+    "data": [
+     "SQ0TDBL←3"
+    ]
+   },
+   {
+    "name": "rsp_valid",
+    "wave": "0......10....."
+   }
+  ],
+  {
+   "name": "TLP (requester)",
+   "wave": "x....44x......",
+   "data": [
+    "MWr hdr",
+    "D0 = 3"
+   ]
+  },
+  [
+   "acq_ram",
+   {
+    "name": "acq_rd_en",
+    "wave": "0........10.|."
+   },
+   {
+    "name": "acq_rd_data.DW3",
+    "wave": "x..........5=3",
+    "data": [
+     "P=0",
+     "…",
+     "P=1 CID 2"
+    ]
+   }
+  ]
+ ],
+ "head": {
+  "text": "nvme_admin, admin_cmd: SQE → SQ0TDBL → опрос acq_ram[2] (фаза 1)",
+  "tick": 0
+ },
+ "foot": {
+  "text": "Опрос: POLL_RD → W1 → CHK — один цикл в 3 такта; после совпадения фазы — запись CQ0HDBL ← 3"
+ },
+ "config": {
+  "cell_width": 66
+ }
+}

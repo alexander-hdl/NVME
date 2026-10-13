@@ -1,0 +1,113 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p.|...|...|..."
+  },
+  [
+   "команда",
+   {
+    "name": "req_valid",
+    "wave": "10.....10....."
+   },
+   {
+    "name": "req_ready",
+    "wave": "10....1.0....1"
+   },
+   {
+    "name": "req_op/addr",
+    "wave": "3x.....3x.....",
+    "data": [
+     "CfgRd 0x00",
+     "CfgRd 0x08"
+    ]
+   }
+  ],
+  {
+   "name": "state",
+   "wave": "==4..5=.=4..5=",
+   "data": [
+    "IDLE",
+    "HDR",
+    "WAIT_CPL",
+    "RSP",
+    "IDLE",
+    "HDR",
+    "WAIT_CPL",
+    "RSP",
+    "IDLE"
+   ]
+  },
+  [
+   "TLP",
+   {
+    "name": "m_req_tvalid",
+    "wave": "010.....10...."
+   },
+   {
+    "name": "m_req_tdata",
+    "wave": "x3x.....3x....",
+    "data": [
+     "CfgRd0 t0",
+     "CfgRd0 t1"
+    ]
+   },
+   {
+    "name": "s_cpl_tvalid",
+    "wave": "0..1.0........"
+   },
+   {
+    "name": "s_cpl_tdata",
+    "wave": "x..44x........",
+    "data": [
+     "CplD t0",
+     "A808_144D"
+    ]
+   }
+  ],
+  {
+   "name": "to_cnt",
+   "wave": "x.==.....===..",
+   "data": [
+    "1000…998",
+    "997",
+    "4",
+    "3…1",
+    "0"
+   ]
+  },
+  [
+   "ответ",
+   {
+    "name": "rsp_valid",
+    "wave": "0....10.....10"
+   },
+   {
+    "name": "rsp_status",
+    "wave": "x....3x.....5x",
+    "data": [
+     "SC",
+     "TIMEOUT"
+    ]
+   },
+   {
+    "name": "rsp_rdata",
+    "wave": "x....3x.....=x",
+    "data": [
+     "A808_144D",
+     "0"
+    ]
+   }
+  ]
+ ],
+ "head": {
+  "text": "rp_requester: CfgRd0 VID/DID с ответом и CfgRd0 без ответа (timeout_cycles = 4)",
+  "tick": 0
+ },
+ "foot": {
+  "text": "Разрывы: такты ожидания сжаты. rsp_valid — через такт после последнего beat'а CplD; TIMEOUT — через 5 тактов WAIT_CPL"
+ },
+ "config": {
+  "cell_width": 70
+ }
+}

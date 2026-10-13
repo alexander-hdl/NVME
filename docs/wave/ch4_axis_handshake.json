@@ -1,0 +1,54 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p........."
+  },
+  [
+   "AXI4-Stream",
+   {
+    "name": "tvalid",
+    "wave": "01..01..0.",
+    "node": ".........."
+   },
+   {
+    "name": "tready",
+    "wave": "1.01..01..",
+    "node": "..a......."
+   },
+   {
+    "name": "tdata",
+    "wave": "x34.x56.x.",
+    "data": [
+     "A",
+     "B",
+     "C",
+     "D"
+    ]
+   },
+   {
+    "name": "tlast",
+    "wave": "0.....1.0."
+   }
+  ],
+  {},
+  {
+   "name": "передача",
+   "wave": "010101010.",
+   "node": "...b......."
+  }
+ ],
+ "head": {
+  "text": "Передача beat'а = такт, в котором tvalid = tready = 1",
+  "tick": 0
+ },
+ "foot": {
+  "text": "Такты 2 и 6: tready = 0, источник держит B и D неизменными"
+ },
+ "config": {
+  "cell_width": 52
+ },
+ "edge": [
+  "a~>b B ждёт"
+ ]
+}

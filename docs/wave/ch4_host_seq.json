@@ -1,0 +1,74 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p.|.|..|.|...."
+  },
+  {
+   "name": "start",
+   "wave": "1............."
+  },
+  {
+   "name": "state",
+   "wave": "=3|4|56|7|889=",
+   "data": [
+    "IDLE",
+    "LINK",
+    "ENUM",
+    "RPCFG",
+    "ADMIN_INIT",
+    "RUN",
+    "DRAIN",
+    "FLUSH",
+    "SHUTDOWN",
+    "DONE"
+   ]
+  },
+  {
+   "name": "link_ready",
+   "wave": "0.1..........."
+  },
+  {
+   "name": "enum_start",
+   "wave": "0..10........."
+  },
+  {
+   "name": "rpcfg_start",
+   "wave": "0....10......."
+  },
+  {
+   "name": "init_start",
+   "wave": "0.....10......"
+  },
+  {
+   "name": "we_enable",
+   "wave": "0.......1..0.."
+  },
+  {
+   "name": "stop",
+   "wave": "0........1...."
+  },
+  {
+   "name": "flush_req",
+   "wave": "0..........10."
+  },
+  {
+   "name": "shutdown_start",
+   "wave": "0...........10"
+  },
+  {
+   "name": "done",
+   "wave": "0............1"
+  }
+ ],
+ "head": {
+  "text": "host_sequencer: временная шкала запуска и останова (масштаб не соблюдён)",
+  "tick": 0
+ },
+ "foot": {
+  "text": "Разрывы «|» — ожидание link_ready / enum_done / init_done / stop; импульсы *_start — на входе в состояние"
+ },
+ "config": {
+  "cell_width": 60
+ }
+}

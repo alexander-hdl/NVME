@@ -1,0 +1,94 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p......"
+  },
+  {
+   "name": "tvalid",
+   "wave": "01....0"
+  },
+  {
+   "name": "tready",
+   "wave": "1......"
+  },
+  [
+   "tdata",
+   {
+    "name": "DW0 [31:0]",
+    "wave": "x34444x",
+    "data": [
+     "H0",
+     "D1'",
+     "D5'",
+     "D9'",
+     "D13'"
+    ]
+   },
+   {
+    "name": "DW1 [63:32]",
+    "wave": "x34444x",
+    "data": [
+     "H1",
+     "D2'",
+     "D6'",
+     "D10'",
+     "D14'"
+    ]
+   },
+   {
+    "name": "DW2 [95:64]",
+    "wave": "x34444x",
+    "data": [
+     "H2",
+     "D3'",
+     "D7'",
+     "D11'",
+     "D15'"
+    ]
+   },
+   {
+    "name": "DW3 [127:96]",
+    "wave": "x4444x.",
+    "data": [
+     "D0'",
+     "D4'",
+     "D8'",
+     "D12'"
+    ]
+   }
+  ],
+  {
+   "name": "tkeep",
+   "wave": "x=====x",
+   "data": [
+    "FFFF",
+    "FFFF",
+    "FFFF",
+    "FFFF",
+    "0FFF"
+   ]
+  },
+  {
+   "name": "tlast",
+   "wave": "0....10"
+  },
+  {
+   "name": "tuser[3:0]",
+   "wave": "x=....x",
+   "data": [
+    "0000"
+   ]
+  }
+ ],
+ "head": {
+  "text": "TX ядра: тот же CplD 64 B в формате pcie_7x (3DW-заголовок + 16 DW)",
+  "tick": 0
+ },
+ "foot": {
+  "text": "Dn' = bswap32(Dn); DW подряд без дыр: D0 сразу за H2; последний beat — 3 DW, tkeep = 0FFF"
+ },
+ "config": {
+  "cell_width": 80
+ }
+}

@@ -1,0 +1,91 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p......."
+  },
+  [
+   "вход",
+   {
+    "name": "s_tvalid",
+    "wave": "01..0..."
+   },
+   {
+    "name": "s_tready",
+    "wave": "1..01...",
+    "node": "...a...."
+   },
+   {
+    "name": "s_tdata",
+    "wave": "x335.x..",
+    "data": [
+     "D3 D2 D1 D0",
+     "— — D5 D4",
+     "— — E1 E0"
+    ]
+   },
+   {
+    "name": "s_tkeep",
+    "wave": "x===.x..",
+    "data": [
+     "FFFF",
+     "00FF",
+     "00FF"
+    ]
+   },
+   {
+    "name": "s_tlast",
+    "wave": "0.1..0.."
+   },
+   {
+    "name": "s_dir/s_shift",
+    "wave": "x3.5.x..",
+    "data": [
+     "L / 1",
+     "R / 3"
+    ]
+   }
+  ],
+  [
+   "выход",
+   {
+    "name": "m_tvalid",
+    "wave": "0..1...0"
+   },
+   {
+    "name": "m_tdata",
+    "wave": "x..3355x",
+    "data": [
+     "D4 D3 D2 D1",
+     "— — — D5",
+     "E0 — — —",
+     "— — — E1"
+    ]
+   },
+   {
+    "name": "m_tkeep",
+    "wave": "x..====x",
+    "data": [
+     "FFFF",
+     "000F",
+     "F000",
+     "000F"
+    ]
+   },
+   {
+    "name": "m_tlast",
+    "wave": "0...1010"
+   }
+  ]
+ ],
+ "head": {
+  "text": "dw_shift: пакет 6 DW со сдвигом влево на 1, затем пакет 2 DW со сдвигом вправо на 3",
+  "tick": 0
+ },
+ "foot": {
+  "text": "DW указаны от старшего (DW3) к младшему (DW0). Такт 3: flush-beat «D5», вход ждёт (s_tready = 0)"
+ },
+ "config": {
+  "cell_width": 92
+ }
+}

@@ -1,0 +1,93 @@
+{
+ "signal": [
+  {
+   "name": "clk",
+   "wave": "p.........."
+  },
+  [
+   "completer",
+   {
+    "name": "s_cpl_tvalid",
+    "wave": "01.......0."
+   },
+   {
+    "name": "s_cpl_tready",
+    "wave": "1...0.1...."
+   },
+   {
+    "name": "s_cpl_tdata",
+    "wave": "x3335..55x.",
+    "data": [
+     "A0",
+     "A1",
+     "A2",
+     "B0",
+     "B1",
+     "B2"
+    ]
+   },
+   {
+    "name": "s_cpl_tlast",
+    "wave": "0..10...10."
+   }
+  ],
+  [
+   "requester",
+   {
+    "name": "s_req_tvalid",
+    "wave": "0.1...0...."
+   },
+   {
+    "name": "s_req_tready",
+    "wave": "0...1.0...."
+   },
+   {
+    "name": "s_req_tdata",
+    "wave": "x.4..4x....",
+    "data": [
+     "R0",
+     "R1"
+    ]
+   },
+   {
+    "name": "s_req_tlast",
+    "wave": "0....10...."
+   }
+  ],
+  [
+   "выход",
+   {
+    "name": "m_tvalid",
+    "wave": "0.1.......0"
+   },
+   {
+    "name": "m_tdata",
+    "wave": "x.33344555x",
+    "data": [
+     "A0",
+     "A1",
+     "A2",
+     "R0",
+     "R1",
+     "B0",
+     "B1",
+     "B2"
+    ]
+   },
+   {
+    "name": "m_tlast",
+    "wave": "0...1010.10"
+   }
+  ]
+ ],
+ "head": {
+  "text": "tlp_tx_arb: completer выиграл пакет A, поэтому следующим идёт ждущий R, затем B",
+  "tick": 0
+ },
+ "foot": {
+  "text": "Решение принимается на границе пакета; выход задержан на 1 такт регистровым срезом"
+ },
+ "config": {
+  "cell_width": 54
+ }
+}
