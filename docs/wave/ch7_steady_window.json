@@ -1,0 +1,69 @@
+{
+ "signal": [
+  {
+   "name": "s_data (100 МГц)",
+   "wave": "9............|................",
+   "data": [
+    "источник: 16 B на такт data_clk без пауз = 1,6 ГБ/с"
+   ]
+  },
+  {
+   "name": "слот заполнен",
+   "wave": "010..........|.......10.......",
+   "node": ".a...................b"
+  },
+  {},
+  {
+   "name": "TX (FPGA→SSD)",
+   "wave": "xx2x4x5x6....|..xx2xxx2x4x5x6.",
+   "data": [
+    "DB",
+    "SQE",
+    "PRP",
+    "CplD данных подряд",
+    "DB CQ",
+    "DB",
+    "SQE",
+    "PRP",
+    "CplD …"
+   ]
+  },
+  {
+   "name": "RX (SSD→FPGA)",
+   "wave": "xxx4x5x6.....|xxx7xxxxx4x5x6..",
+   "data": [
+    "SQE",
+    "PRP",
+    "MRd данных, ≤16 в полёте",
+    "CQE",
+    "SQE",
+    "PRP",
+    "MRd …"
+   ]
+  },
+  {
+   "name": "s_axis_tx_tvalid",
+   "wave": "0.1010101....|..0.10..1010101."
+  },
+  {},
+  {
+   "name": "окно",
+   "wave": "xxxxxxxx3....|................",
+   "data": [
+    "окно измерения: ratio = Σ tvalid / Σ тактов"
+   ]
+  }
+ ],
+ "head": {
+  "text": "tb_top: команды в установившемся режиме (схематично, время сжато «|»)"
+ },
+ "foot": {
+  "text": "TX: DB = MWr в SQ1TDBL, SQE/PRP = CplD с SQE/PRP-списком, DB CQ = MWr в CQ1HDBL; RX: MRd SQE/PRP, MWr CQE"
+ },
+ "config": {
+  "cell_width": 34
+ },
+ "edge": [
+  "a~>b 16 KiB / 1,6 ГБ/с ≈ 10,2 мкс"
+ ]
+}

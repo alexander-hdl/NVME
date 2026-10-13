@@ -1,0 +1,15 @@
+{
+  "signal": [
+    {"name": "user_clk", "wave": "p............"},
+    {"name": "s_axis_tx_tvalid", "wave": "01.........0."},
+    {"name": "s_axis_tx_tready", "wave": "1..0.1.0.1...", "node": "...a.b"},
+    {"name": "s_axis_tx_tdata",  "wave": "x345..67..8x.", "data": ["B0", "B1", "B2", "B3", "B4", "B5"]},
+    {},
+    {"name": "vcnt (tvalid)",    "wave": "=============", "data": ["0","1","2","3","4","5","6","7","8","9","10","10","10"]},
+    {"name": "bcnt (принято)",   "wave": "=============", "data": ["0","1","2","2","2","3","4","4","4","5","6","6","6"]}
+  ],
+  "head": {"text": "Две метрики tb_top при стойках tready (такты 1…10)", "tick": 0},
+  "foot": {"text": "valid-beat ratio = 10/10 = 1,0; accepted beats/cycle = 6/10 = 0,6 = (1 − 4/10) × 1,0"},
+  "config": {"cell_width": 46},
+  "edge": ["a~>b B2 держится"]
+}

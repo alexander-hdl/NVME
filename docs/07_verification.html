@@ -1,0 +1,975 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Глава 7. Верификация и симуляция</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="layout">
+<!-- NAV:BEGIN -->
+<nav class="side">
+  <h2>NVMe-хост на Kintex-7</h2>
+  <ul>
+    <li><a href="index.html">Введение и цели</a></li>
+    <li><a href="01_pcie_basics.html">1. PCIe с нуля</a></li>
+    <li><a href="02_nvme_basics.html">2. NVMe с нуля</a></li>
+    <li><a href="03_architecture.html">3. Архитектура хоста</a></li>
+    <li><a href="04_modules.html">4. Модули и интерфейсы</a></li>
+    <li><a href="05_bringup.html">5. Запуск: от PERST# до первой записи</a></li>
+    <li><a href="06_performance.html">6. Пропускная способность</a></li>
+    <li><a href="07_verification.html" class="cur">7. Верификация и симуляция</a></li>
+    <li><a href="08_lab.html">8. Лабораторные задания</a></li>
+    <li><a href="glossary.html">Глоссарий</a></li>
+  </ul>
+</nav>
+<!-- NAV:END -->
+<main>
+<h1>Глава 7. Верификация и симуляция</h1>
+<p class="lead">Как убедиться, что NVMe-хост работает, ещё до того, как в руках окажутся плата и SSD. Мы разберём две поведенческие модели (ядро pcie_7x и NVMe-накопитель), девятнадцать самопроверяющихся тестбенчей и системный тест, который пропускает через весь хост 1 MiB данных и сверяет каждый байт. Отдельно поговорим о том, почему модель должна быть «злой» и как доказать, что тест вообще способен упасть.</p>
+
+<div class="box"><span class="t">Что нужно знать заранее</span>
+Формат TLP и правила completion (глава 1), очереди, фазовый бит и PRP (глава 2), архитектура хоста и внутренний поток <code>tlp_axis</code> (главы 3 и 4), последовательность запуска (глава 5) и бюджет пропускной способности (глава 6). Все пути к файлам даны от корня репозитория. Симулятор — xsim из Vivado 2022.2.</div>
+
+<p><b>Содержание главы.</b>
+<a href="#s1">7.1 Зачем модель, а не железо</a> ·
+<a href="#s2">7.2 Где стоит модель</a> ·
+<a href="#s3">7.3 Модель ядра pcie_7x</a> ·
+<a href="#s4">7.4 Модель SSD</a> ·
+<a href="#s5">7.5 tb_models: самопроверка моделей</a> ·
+<a href="#s6">7.6 Модульные тесты</a> ·
+<a href="#s7">7.7 Системный тест tb_top</a> ·
+<a href="#s8">7.8 Как запускать</a> ·
+<a href="#s9">7.9 Что не покрыто</a> ·
+<a href="#s10">7.10 Самопроверка и задачи</a></p>
+
+<!-- ============================================================ -->
+<h2 id="s1">7.1. Зачем модель, а не железо</h2>
+
+<p>Первое желание — собрать битстрим, подключить SSD и посмотреть, что получится. Для NVMe-хоста без процессора это худшая стратегия. На плате видно только конечный симптом: «линк поднялся, SSD молчит». Причиной может быть неверный Byte Count в одном CplD, забытый бит BME в Root Port или CQE, записанный со смещением 8 байт. Пока мы найдём её с ILA, пройдут дни. Каждая итерация «правка → синтез → загрузка» занимает 20–40 минут, а окно ILA видит лишь несколько тысяч тактов.</p>
+
+<p>Симуляция меняет соотношение. Полный прогон системного теста — от снятия сброса до shutdown, 1 MiB данных — занимает несколько минут реального времени. При этом видна каждая TLP, каждый регистр и каждый байт памяти. Главное же — в симуляции можно <b>создать условия, которых на столе почти не бывает</b>: straddling на каждом втором такте, 16 одновременных чтений случайного размера, CQE, разрезанный на две записи по 8 байт. Реальный SSD так ведёт себя редко, и ошибка проявится через неделю работы, а не на первом запуске.</p>
+
+<h3>7.1.1. Пирамида тестов</h3>
+
+<p>Тесты проекта образуют классическую пирамиду (test pyramid). Внизу — быстрые тесты маленьких примитивов, в середине — тесты отдельных модулей с собственными эталонными моделями, наверху — один системный тест. Чем выше уровень, тем больше охват, но тем дольше прогон и тем труднее понять, где именно ошибка.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 345" width="760" role="img" aria-label="Пирамида тестов проекта" font-size="13">
+<defs>
+<marker id="f71a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+<marker id="f71b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+</defs>
+<polygon points="200,20 320,20 370,100 150,100" fill="var(--warn-bg)" stroke="var(--accent2)" stroke-width="1.5"/>
+<text x="260" y="55" text-anchor="middle" font-weight="700" fill="var(--fg)">Система</text>
+<text x="260" y="75" text-anchor="middle" font-size="12" fill="var(--fg)">tb_top + 6 вариантов</text>
+<text x="260" y="91" text-anchor="middle" font-size="11" fill="var(--muted)">≈ 0,7 мс модельного времени</text>
+<polygon points="146,106 374,106 424,190 96,190" fill="var(--note-bg)" stroke="var(--accent)" stroke-width="1.5"/>
+<text x="260" y="138" text-anchor="middle" font-weight="700" fill="var(--fg)">Модули: 15 тестов</text>
+<text x="260" y="158" text-anchor="middle" font-size="12" fill="var(--fg)">tb_rx_adapt, tb_completer, tb_enum,</text>
+<text x="260" y="174" text-anchor="middle" font-size="12" fill="var(--fg)">tb_nvme_admin, tb_write_engine …</text>
+<polygon points="92,196 428,196 478,280 42,280" fill="var(--code-bg)" stroke="var(--fg)" stroke-width="1.5"/>
+<text x="260" y="228" text-anchor="middle" font-weight="700" fill="var(--fg)">Примитивы: 2 теста</text>
+<text x="260" y="248" text-anchor="middle" font-size="12" fill="var(--fg)">tb_common (FIFO, skid, RAM, таймер),</text>
+<text x="260" y="264" text-anchor="middle" font-size="12" fill="var(--fg)">tb_dw_shift</text>
+<line x1="500" y1="278" x2="500" y2="26" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#f71a)"/>
+<text x="512" y="40" font-size="12" fill="var(--muted)">охват ↑</text>
+<text x="512" y="58" font-size="12" fill="var(--muted)">время прогона ↑</text>
+<text x="512" y="76" font-size="12" fill="var(--muted)">точность диагноза ↓</text>
+<rect x="560" y="120" width="190" height="66" rx="6" fill="var(--ok-bg)" stroke="#2f9e55" stroke-width="1.5"/>
+<text x="655" y="144" text-anchor="middle" font-weight="700" fill="var(--fg)">tb_models</text>
+<text x="655" y="162" text-anchor="middle" font-size="12" fill="var(--fg)">модели без DUT</text>
+<text x="655" y="178" text-anchor="middle" font-size="12" fill="var(--fg)">+ 8 негативных прогонов</text>
+<path d="M600,120 C560,80 420,60 336,58" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#f71b)"/>
+<text x="655" y="204" text-anchor="middle" font-size="11" fill="var(--accent)">→ модели, которым можно доверять</text>
+<rect x="20" y="298" width="730" height="36" rx="6" fill="none" stroke="var(--accent2)" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="385" y="321" text-anchor="middle" font-size="12" fill="var(--fg)">Вне симуляции: GTX и физический линк, временные ограничения (STA), поведение реального SSD → проверка на плате</text>
+</svg>
+<figcaption>Рис. 7.1. Пирамида тестов проекта: 2 теста примитивов, 15 модульных тестов и системный tb_top. Модели, на которые опирается tb_top, сначала проверяются отдельно в tb_models. Всё, что ниже пунктира, симуляцией не закрывается.</figcaption>
+</figure>
+
+<p>Почему не обойтись одним системным тестом? Допустим, tb_top упал на проверке данных: 3 байта из миллиона не совпали. Виноват может быть RX-адаптер, демультиплексор, completer, кольцо данных, генератор PRP или сама модель SSD. Модульный тест completer'а за секунду скажет «Byte Count 316, ожидалось 320, запрос по адресу …044». Поэтому правило проекта простое: <b>каждый модуль сначала проходит свой тест, и лишь потом попадает в систему</b>.</p>
+
+<h3>7.1.2. Что можно проверить без платы, а что нельзя</h3>
+
+<table>
+<caption>Табл. 7.1. Границы симуляции</caption>
+<tr><th>Проверяется в симуляции</th><th>Не проверяется в симуляции</th></tr>
+<tr><td>Протокол AXI-Stream ядра pcie_7x: tkeep, tlast, стабильность при <code>tready = 0</code>, кадрирование RX со straddling</td><td>Физический уровень: GTX, LTSSM на реальном канале, полярность и порядок линий, качество опорной частоты</td></tr>
+<tr><td>Формат каждой TLP: заголовок, Byte Count, Lower Address, разбиение по MPS и RCB, порядок CplD</td><td>Временные ограничения: setup/hold после размещения и трассировки — это задача STA в Vivado, а не симулятора</td></tr>
+<tr><td>Нумерация PCIe: CRS, BAR, список capabilities, DevCtl; настройка Root Port через cfg_mgmt</td><td>Поведение конкретного SSD: задержки до 10 мс, исчерпание SLC-кэша, тепловой троттлинг, «особенности» прошивки</td></tr>
+<tr><td>Инициализация NVMe, admin-команды, создание и удаление очередей, shutdown</td><td>Электрика: питание M.2 3,3 В, PERST#, CLKREQ#, разводка FMC-адаптера</td></tr>
+<tr><td>Поток Write: SQE, PRP-списки, фазовый бит, переполнение очередей, ошибки в статусе CQE</td><td>Длительная работа: часы и терабайты; в симуляции мы пишем 1 MiB</td></tr>
+<tr><td>Целостность данных байт в байт и предельная пропускная способность логики (тактов на beat)</td><td>Реальная скорость линка с учётом DLLP, кредитов и повторов (replay)</td></tr>
+</table>
+
+<div class="box"><span class="t">Важно</span> Симуляция доказывает, что <b>логика</b> соблюдает протокол при любом допустимом поведении партнёра. Если на плате что-то не работает, а все тесты зелёные, ищите сначала в правой колонке табл. 7.1: тактирование, сброс, линк, конкретный накопитель.</div>
+
+<!-- ============================================================ -->
+<h2 id="s2">7.2. Где стоит модель</h2>
+
+<p>Модель можно поставить в одно из трёх мест. Можно смоделировать GT-приёмопередатчики и настоящий Endpoint на последовательных линиях. Можно взять пример ядра Xilinx с его PIPE-моделью. А можно заменить всё, что лежит за интерфейсом пользователя ядра pcie_7x. Мы выбрали третий вариант (решение D15 в <code>ARCHITECTURE.md</code>):</p>
+<ul>
+<li><b>Скорость.</b> Симуляция GT и DLL на уровне символов 8b/10b идёт в сотни раз медленнее. Прогнать 1 MiB данных стало бы делом часов.</li>
+<li><b>Предмет проверки.</b> Наш код начинается на интерфейсе AXI-Stream ядра. Всё, что ниже, — проверенный Xilinx hard block. Нам важно, чтобы модель воспроизводила именно <b>интерфейс</b> ядра со всеми его особенностями: straddling, смещённый payload 3DW-заголовков, big-endian порядок DW.</li>
+<li><b>Управляемость.</b> На уровне TLP модель SSD легко сделать «злой»: дробить чтения, перемешивать completion разных tag'ов, вставлять ошибки.</li>
+</ul>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 350" width="900" role="img" aria-label="Структура тестбенча tb_top" font-size="12">
+<defs>
+<marker id="f72a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+<marker id="f72b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+<marker id="f72c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+</defs>
+<rect x="436" y="28" width="458" height="162" rx="10" fill="none" stroke="var(--accent2)" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="665" y="20" text-anchor="middle" fill="var(--accent2)">заменяет: ядро pcie_7x (TL/DLL/PHY) + GTX + линк + M.2 SSD</text>
+<rect x="10" y="62" width="140" height="96" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="80" y="84" text-anchor="middle" font-weight="700" fill="var(--fg)">Источник данных</text>
+<text x="80" y="104" text-anchor="middle" fill="var(--fg)">data_clk 100 МГц</text>
+<text x="80" y="122" text-anchor="middle" fill="var(--fg)">pattern(n), 16 B/такт</text>
+<text x="80" y="140" text-anchor="middle" fill="var(--fg)">65 536 beat = 1 MiB</text>
+<rect x="200" y="46" width="190" height="128" rx="6" fill="var(--note-bg)" stroke="var(--accent)" stroke-width="2"/>
+<text x="295" y="70" text-anchor="middle" font-weight="700" fill="var(--fg)">nvme_host_core (DUT)</text>
+<text x="295" y="92" text-anchor="middle" fill="var(--fg)">N_SLOTS = 4 × 16 KiB</text>
+<text x="295" y="110" text-anchor="middle" fill="var(--fg)">SIM_FAST = 1</text>
+<text x="295" y="128" text-anchor="middle" fill="var(--fg)">REQ_TIMEOUT = 20 000</text>
+<text x="295" y="152" text-anchor="middle" font-size="11" fill="var(--muted)">весь RTL ниже pcie7x_wrapper</text>
+<rect x="446" y="46" width="160" height="128" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="526" y="70" text-anchor="middle" font-weight="700" fill="var(--fg)">pcie7x_core_model</text>
+<text x="526" y="90" text-anchor="middle" font-size="11" fill="var(--muted)">u_core</text>
+<text x="526" y="110" text-anchor="middle" fill="var(--fg)">RX: straddle, SOF@DW2</text>
+<text x="526" y="128" text-anchor="middle" fill="var(--fg)">TX: проверки TX-*</text>
+<text x="526" y="146" text-anchor="middle" fill="var(--fg)">cfg_mgmt, LTSSM, BME</text>
+<rect x="714" y="46" width="170" height="128" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="799" y="70" text-anchor="middle" font-weight="700" fill="var(--fg)">nvme_ssd_model</text>
+<text x="799" y="90" text-anchor="middle" font-size="11" fill="var(--muted)">u_ssd</text>
+<text x="799" y="110" text-anchor="middle" fill="var(--fg)">config, BAR0, admin</text>
+<text x="799" y="128" text-anchor="middle" fill="var(--fg)">I/O: ≤ 16 MRd в полёте</text>
+<text x="799" y="146" text-anchor="middle" fill="var(--fg)">lba_mem[LBA], ev_log</text>
+<line x1="150" y1="110" x2="197" y2="110" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f72a)"/>
+<text x="174" y="102" text-anchor="middle" font-size="11" fill="var(--fg)">s_data</text>
+<line x1="392" y1="84" x2="443" y2="84" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f72a)"/>
+<text x="418" y="78" text-anchor="middle" font-size="10" fill="var(--fg)">s_axis_tx</text>
+<line x1="443" y1="112" x2="393" y2="112" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f72a)"/>
+<text x="418" y="106" text-anchor="middle" font-size="10" fill="var(--fg)">m_axis_rx</text>
+<line x1="392" y1="140" x2="443" y2="140" stroke="var(--fg)" stroke-width="1.5" marker-start="url(#f72a)" marker-end="url(#f72a)"/>
+<text x="418" y="134" text-anchor="middle" font-size="10" fill="var(--fg)">cfg_mgmt</text>
+<text x="418" y="160" text-anchor="middle" font-size="10" fill="var(--fg)">pl_*</text>
+<line x1="608" y1="90" x2="711" y2="90" stroke="var(--accent)" stroke-width="2" marker-end="url(#f72b)"/>
+<text x="660" y="84" text-anchor="middle" font-size="11" fill="var(--accent)">mb_down</text>
+<line x1="711" y1="130" x2="608" y2="130" stroke="var(--accent)" stroke-width="2" marker-end="url(#f72b)"/>
+<text x="660" y="124" text-anchor="middle" font-size="11" fill="var(--accent)">mb_up</text>
+<text x="660" y="152" text-anchor="middle" font-size="11" fill="var(--muted)">целые TLP (tlp_t)</text>
+<rect x="10" y="226" width="140" height="62" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="80" y="250" text-anchor="middle" font-weight="700" fill="var(--fg)">ref_mem[]</text>
+<text x="80" y="270" text-anchor="middle" font-size="11" fill="var(--fg)">копия каждого принятого байта</text>
+<line x1="80" y1="158" x2="80" y2="223" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f72a)"/>
+<text x="86" y="196" font-size="11" fill="var(--fg)">tvalid &amp;&amp; tready</text>
+<rect x="200" y="226" width="406" height="62" rx="6" fill="var(--warn-bg)" stroke="var(--accent2)" stroke-width="1.5"/>
+<text x="403" y="250" text-anchor="middle" font-weight="700" fill="var(--fg)">final_checks: T-1 … T-9</text>
+<text x="403" y="270" text-anchor="middle" font-size="11" fill="var(--fg)">stat_*, status_seq_state, ev_log, err_count обеих моделей, метрика TX</text>
+<line x1="295" y1="174" x2="295" y2="223" stroke="var(--accent2)" stroke-width="1.5" marker-end="url(#f72c)"/>
+<text x="301" y="204" font-size="11" fill="var(--fg)">status_*, stat_*</text>
+<rect x="714" y="226" width="170" height="62" rx="6" fill="var(--warn-bg)" stroke="var(--accent2)" stroke-width="1.5"/>
+<text x="799" y="250" text-anchor="middle" font-weight="700" fill="var(--fg)">check_range()</text>
+<text x="799" y="270" text-anchor="middle" font-size="11" fill="var(--fg)">LBA 0…2047 против ref_mem</text>
+<line x1="799" y1="174" x2="799" y2="223" stroke="var(--accent2)" stroke-width="1.5" marker-end="url(#f72c)"/>
+<text x="805" y="204" font-size="11" fill="var(--fg)">lba_mem</text>
+<line x1="711" y1="257" x2="609" y2="257" stroke="var(--accent2)" stroke-width="1.5" marker-end="url(#f72c)"/>
+<text x="660" y="250" text-anchor="middle" font-size="11" fill="var(--fg)">T-1</text>
+<path d="M80,288 V320 H860 V291" fill="none" stroke="var(--accent2)" stroke-width="1.5" marker-end="url(#f72c)"/>
+<text x="470" y="314" text-anchor="middle" font-size="11" fill="var(--fg)">эталон данных</text>
+<path d="M700,170 C660,200 600,210 560,224" fill="none" stroke="var(--accent2)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#f72c)"/>
+<text x="650" y="216" font-size="10" fill="var(--muted)">ev_log</text>
+<text x="450" y="342" text-anchor="middle" font-size="11" fill="var(--muted)">user_clk 125 МГц генерирует u_core; link_ready / ctrl_start / ctrl_stop задаёт сам тестбенч</text>
+</svg>
+<figcaption>Рис. 7.2. Структура tb_top. DUT — весь <code>nvme_host_core</code>. Справа от него модели заменяют ядро pcie_7x, линк и накопитель. Модели обмениваются целыми TLP через почтовые ящики пакета <code>pcie_sim_pkg</code>. Источник данных пишет копию каждого принятого байта в <code>ref_mem</code>. В конце <code>check_range</code> сверяет её с тем, что SSD-модель сохранила в <code>lba_mem</code>.</figcaption>
+</figure>
+
+<h3>7.2.1. Пакет pcie_sim_pkg: общий язык двух моделей</h3>
+
+<p>Модели не передают друг другу такты AXI. Они обмениваются <b>целыми TLP</b> через два почтовых ящика (mailbox) SystemVerilog. Такое разделение принципиально. Всё, что касается кадрирования 128-битной шины (straddling, смещение payload, порядок байт), сосредоточено в модели ядра. Модель SSD думает только о транзакциях: «прочитать 384 байта с адреса 0x4001_2C40 под tag 37».</p>
+
+<table>
+<caption>Табл. 7.2. Содержимое <code>sim/models/pcie_sim_pkg.sv</code></caption>
+<tr><th>Элемент</th><th>Назначение</th></tr>
+<tr><td><code>tlp_t</code></td><td>Структура TLP: <code>hdr[4]</code> — DW заголовка в раскладке спецификации PCIe (ровно то, что лежит в <code>tdata[31:0]</code>, <code>[63:32]</code>… шины ядра; <code>hdr[3] = 0</code> для 3DW); <code>data[$]</code> — payload как очередь байт <b>в порядке памяти</b> (<code>data[0]</code> — байт по младшему адресу); <code>poison</code>; служебные <code>acc_cycle</code>, <code>acc_beats</code> — такт и номер beat'а, на котором ядро приняло последний beat TX-пакета (для измерения пропускной способности)</td></tr>
+<tr><td><code>mb_down</code></td><td>Ядро → SSD: TLP, переданные хостом по <code>s_axis_tx</code>, и completion, которые Root Port генерирует сам (Cpl-UR при BME = 0)</td></tr>
+<tr><td><code>mb_up</code></td><td>SSD → ядро: TLP накопителя; модель ядра раскладывает их на такты <code>m_axis_rx</code></td></tr>
+<tr><td>Функции</td><td><code>hdr_dws</code>, <code>len_dw</code>, <code>is_np</code>, <code>is_mrd/is_mwr/is_cpl/is_cfg0</code>, <code>req_addr</code>, <code>bytes_to_bus_dw</code>, <code>le32</code>, <code>tlp_name</code>, <code>tlp_str</code> (печать TLP в лог)</td></tr>
+<tr><td>Классы <code>dma_ctx</code>, <code>nvme_sq</code>, <code>nvme_cq</code>, тип <code>cqe_t</code></td><td>Внутренности модели SSD: контекст DMA-чтения (буфер и счётчик незавершённых MRd), состояние очередей (base, size, head, tail, фаза, очередь CQE на отправку)</td></tr>
+<tr><td><code>ev_kind_e</code>, <code>ev_t</code></td><td>Журнал событий SSD (<code>ev_log</code>): CfgRd/CfgWr, CRS, чтения и записи MMIO, admin- и I/O-команды, CQE, смены RDY и SHST. По нему tb_top проверяет порядок инициализации</td></tr>
+</table>
+
+<div class="box warn"><span class="t">Ограничение</span> Почтовые ящики объявлены в пакете, то есть они глобальные. В одной симуляции может быть только одна пара «модель ядра + модель SSD». Для нашего проекта этого достаточно. Если понадобится два SSD, ящики придётся перенести внутрь модулей и связать параметрами или интерфейсом.</div>
+
+<p>Порядок байт заслуживает отдельного слова. На шине 7-series payload передаётся DW'ами в big-endian: байт по младшему адресу едет в битах <code>[31:24]</code> первого DW. В <code>tlp_t</code> payload хранится в порядке памяти. Перевод между ними делает <b>только</b> модель ядра (и мини-хост в tb_models). Модели SSD не нужно знать, как устроена шина. Наши адаптеры при этом проверяются честно: если <code>pcie7x_tx_adapt</code> забудет переставить байты, SSD-модель получит данные в неправильном порядке, и проверка T-1 это поймает.</p>
+
+<!-- ============================================================ -->
+<h2 id="s3">7.3. Модель ядра pcie_7x</h2>
+
+<p><code>sim/models/pcie7x_core_model.sv</code> заменяет IP-ядро pcie_7x v3.3 в режиме Root Port (Gen2 x4, 128 бит, 125 МГц) с точки зрения пользовательской логики. У неё те же порты, что у ядра: <code>m_axis_rx_*</code>, <code>s_axis_tx_*</code>, <code>tx_buf_av</code>, <code>tx_cfg_req/gnt</code>, <code>cfg_mgmt_*</code>, <code>pl_*</code>. Есть и два «модельных» входа: <code>link_up_delay_cycles</code> и <code>gen2_delay_cycles</code>. Модель генерирует <code>user_clk_out</code> (период 8 нс) — от него тактируется и DUT, и модель SSD.</p>
+
+<h3>7.3.1. Что рандомизируется на RX</h3>
+
+<p>Сторона RX — главная ценность модели. Каждую TLP от SSD она раскладывает на 128-битные такты <b>случайным, но законным</b> по PG054 способом (Table 2-10, Tables 3-4…3-9, Fig. 3-49):</p>
+<ul>
+<li><b>SOF в DW0 или DW2.</b> Пакет, который мог бы начаться с DW0, с вероятностью <code>sof_dw2_pct</code> начинается с DW2 (DW0 и DW1 этого такта пусты). Поле <code>is_sof</code> в <code>tuser[14:10]</code> равно <code>10000b</code> или <code>11000b</code>.</li>
+<li><b>Straddling.</b> Если пакет закончился в DW0 или DW1, а следующий уже ждёт, то с вероятностью <code>straddle_pct</code> следующий начинается в DW2 того же такта. В одном такте тогда есть и EOF, и SOF.</li>
+<li><b>Смещение payload 3DW-заголовка (misalignment).</b> Оно не рандомизируется отдельно, а получается само, потому что DW идут подряд. У 3DW TLP, начатой с DW0, первый DW данных лежит в DW3 того же такта. У начатой с DW2 — в DW1 следующего. Это и есть та «невыровненность», которую должен убрать <code>pcie7x_rx_adapt</code>.</li>
+<li><b>Мусор в неиспользуемых линиях</b> (<code>junk_fill = 1</code> по умолчанию). Всё, что не покрыто SOF/EOF, заполняется случайными данными, включая <code>tdata</code> в тактах без <code>tvalid</code>. DUT, который смотрит на линии вне пакета, получит мусор, а не удобные нули.</li>
+<li><b>Паузы:</b> <code>rx_gap_pct</code> — пустой такт перед пакетом; <code>rx_midpkt_gap_pct</code> — <code>tvalid = 0</code> посреди пакета.</li>
+<li><b>Отравленные TLP:</b> <code>rx_poison_pct</code> — EP = 1 и <code>rx_err_fwd</code> для MWr/CplD (только для тестов путей ошибок).</li>
+</ul>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 320" width="760" role="img" aria-label="Пример кадрирования RX со straddling" font-size="12">
+<defs>
+<pattern id="f73h" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="var(--muted)" stroke-width="1"/></pattern>
+</defs>
+<text x="20" y="38" font-weight="700" fill="var(--fg)">линия</text>
+<text x="180" y="38" text-anchor="middle" font-weight="700" fill="var(--fg)">такт 0</text>
+<text x="300" y="38" text-anchor="middle" font-weight="700" fill="var(--fg)">такт 1</text>
+<text x="420" y="38" text-anchor="middle" font-weight="700" fill="var(--fg)">такт 2</text>
+<text x="540" y="38" text-anchor="middle" font-weight="700" fill="var(--fg)">такт 3</text>
+<text x="660" y="38" text-anchor="middle" font-weight="700" fill="var(--fg)">такт 4</text>
+<text x="20" y="72" fill="var(--fg)">DW0 [31:0]</text>
+<text x="20" y="108" fill="var(--fg)">DW1 [63:32]</text>
+<text x="20" y="144" fill="var(--fg)">DW2 [95:64]</text>
+<text x="20" y="180" fill="var(--fg)">DW3 [127:96]</text>
+<!-- beat 0: A H0 H1 H2 D0 -->
+<rect x="122" y="50" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)"/><text x="180" y="72" text-anchor="middle" fill="var(--fg)">A: H0</text>
+<rect x="122" y="86" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)"/><text x="180" y="108" text-anchor="middle" fill="var(--fg)">A: H1</text>
+<rect x="122" y="122" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)"/><text x="180" y="144" text-anchor="middle" fill="var(--fg)">A: H2</text>
+<rect x="122" y="158" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)" stroke-width="2.5"/><text x="180" y="180" text-anchor="middle" font-weight="700" fill="var(--fg)">A: D0</text>
+<!-- beat 1 -->
+<rect x="242" y="50" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)"/><text x="300" y="72" text-anchor="middle" fill="var(--fg)">A: D1</text>
+<rect x="242" y="86" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)"/><text x="300" y="108" text-anchor="middle" fill="var(--fg)">A: D2</text>
+<rect x="242" y="122" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)"/><text x="300" y="144" text-anchor="middle" fill="var(--fg)">A: D3</text>
+<rect x="242" y="158" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)"/><text x="300" y="180" text-anchor="middle" fill="var(--fg)">A: D4</text>
+<!-- beat 2: A D5 EOF, junk, B H0 H1 -->
+<rect x="362" y="50" width="116" height="34" fill="var(--note-bg)" stroke="var(--accent)"/><text x="420" y="72" text-anchor="middle" fill="var(--fg)">A: D5 (EOF)</text>
+<rect x="362" y="86" width="116" height="34" fill="url(#f73h)" stroke="var(--border)"/><text x="420" y="108" text-anchor="middle" fill="var(--muted)">мусор</text>
+<rect x="362" y="122" width="116" height="34" fill="var(--warn-bg)" stroke="var(--accent2)"/><text x="420" y="144" text-anchor="middle" fill="var(--fg)">B: H0 (SOF)</text>
+<rect x="362" y="158" width="116" height="34" fill="var(--warn-bg)" stroke="var(--accent2)"/><text x="420" y="180" text-anchor="middle" fill="var(--fg)">B: H1</text>
+<!-- beat 3: B H2 D0 D1 D2 -->
+<rect x="482" y="50" width="116" height="34" fill="var(--warn-bg)" stroke="var(--accent2)"/><text x="540" y="72" text-anchor="middle" fill="var(--fg)">B: H2</text>
+<rect x="482" y="86" width="116" height="34" fill="var(--warn-bg)" stroke="var(--accent2)" stroke-width="2.5"/><text x="540" y="108" text-anchor="middle" font-weight="700" fill="var(--fg)">B: D0</text>
+<rect x="482" y="122" width="116" height="34" fill="var(--warn-bg)" stroke="var(--accent2)"/><text x="540" y="144" text-anchor="middle" fill="var(--fg)">B: D1</text>
+<rect x="482" y="158" width="116" height="34" fill="var(--warn-bg)" stroke="var(--accent2)"/><text x="540" y="180" text-anchor="middle" fill="var(--fg)">B: D2</text>
+<!-- beat 4: B D3 EOF, junk -->
+<rect x="602" y="50" width="116" height="34" fill="var(--warn-bg)" stroke="var(--accent2)"/><text x="660" y="72" text-anchor="middle" fill="var(--fg)">B: D3 (EOF)</text>
+<rect x="602" y="86" width="116" height="34" fill="url(#f73h)" stroke="var(--border)"/><text x="660" y="108" text-anchor="middle" fill="var(--muted)">мусор</text>
+<rect x="602" y="122" width="116" height="34" fill="url(#f73h)" stroke="var(--border)"/><text x="660" y="144" text-anchor="middle" fill="var(--muted)">мусор</text>
+<rect x="602" y="158" width="116" height="34" fill="url(#f73h)" stroke="var(--border)"/><text x="660" y="180" text-anchor="middle" fill="var(--muted)">мусор</text>
+<text x="20" y="218" fill="var(--fg)">is_sof</text>
+<text x="180" y="218" text-anchor="middle" font-family="monospace" fill="var(--fg)">10000 (DW0)</text>
+<text x="300" y="218" text-anchor="middle" font-family="monospace" fill="var(--muted)">0xxxx</text>
+<text x="420" y="218" text-anchor="middle" font-family="monospace" fill="var(--accent2)">11000 (DW2)</text>
+<text x="540" y="218" text-anchor="middle" font-family="monospace" fill="var(--muted)">0xxxx</text>
+<text x="660" y="218" text-anchor="middle" font-family="monospace" fill="var(--muted)">0xxxx</text>
+<text x="20" y="242" fill="var(--fg)">is_eof</text>
+<text x="180" y="242" text-anchor="middle" font-family="monospace" fill="var(--muted)">0xxxx</text>
+<text x="300" y="242" text-anchor="middle" font-family="monospace" fill="var(--muted)">0xxxx</text>
+<text x="420" y="242" text-anchor="middle" font-family="monospace" fill="var(--accent)">10011 (DW0)</text>
+<text x="540" y="242" text-anchor="middle" font-family="monospace" fill="var(--muted)">0xxxx</text>
+<text x="660" y="242" text-anchor="middle" font-family="monospace" fill="var(--accent2)">10011 (DW0)</text>
+<rect x="122" y="262" width="16" height="12" fill="var(--note-bg)" stroke="var(--accent)"/><text x="144" y="273" fill="var(--fg)">A — CplD, 3DW, 6 DW данных, SOF в DW0: D0 в DW3 того же такта</text>
+<rect x="122" y="282" width="16" height="12" fill="var(--warn-bg)" stroke="var(--accent2)"/><text x="144" y="293" fill="var(--fg)">B — MWr (CQE), 3DW, 4 DW, SOF в DW2 (straddle): D0 в DW1 следующего такта</text>
+<rect x="122" y="302" width="16" height="12" fill="url(#f73h)" stroke="var(--border)"/><text x="144" y="313" fill="var(--fg)">случайные данные вне пакетов (junk_fill = 1); tlast в 128-битном режиме всегда 0</text>
+</svg>
+<figcaption>Рис. 7.3. Один из вариантов, которые модель ядра генерирует на <code>m_axis_rx</code>. В такте 2 пакет A заканчивается в DW0, а пакет B начинается в DW2 — это straddling. Жирной рамкой выделен первый DW данных каждого пакета: его положение зависит и от длины заголовка, и от позиции SOF.</figcaption>
+</figure>
+
+<h3>7.3.2. Что рандомизируется на TX и в управлении потоком</h3>
+<ul>
+<li><code>tx_stall_pct</code> — вероятность (на такт) того, что <code>s_axis_tx_tready = 0</code>. При <code>tx_stall_midpkt = 1</code> стойки возможны и внутри пакета: реальное ядро так делает, когда у него кончаются буферы или кредиты.</li>
+<li><code>np_ok_lag</code> — с каким запаздыванием модель выполняет снятие <code>rx_np_ok</code>. По PG054 пользователь должен снять сигнал как минимум за 2 такта до переполнения. Модель задерживает только non-posted TLP (MRd от SSD), а posted и completion обгоняют их. Так проверяется обратное давление completer'а (<code>np_backpressure</code>).</li>
+<li><code>np_req_mode</code> — альтернативный кредитный режим <code>rx_np_req</code>.</li>
+<li><code>tx_latency_cycles</code> (16) — через сколько тактов после последнего beat'а TLP попадёт в SSD-модель.</li>
+</ul>
+
+<h3>7.3.3. Какие правила проверяет модель</h3>
+
+<p>Каждое нарушение — это <code>$error</code> с идентификатором правила и увеличение <code>err_count</code>. Идентификатор нужен, чтобы по логу сразу найти правило в заголовке модели, а от него перейти к первоисточнику.</p>
+
+<table>
+<caption>Табл. 7.3. Проверки модели ядра (<code>pcie7x_core_model.sv</code>) и их источники</caption>
+<tr><th>ID</th><th>Правило</th><th>Источник</th></tr>
+<tr><td>TX-1</td><td><code>tkeep ≠ FFFFh</code> на не последнем такте пакета</td><td>PG054 Table 2-9 (<code>s_axis_tx_tkeep</code>)</td></tr>
+<tr><td>TX-2</td><td><code>tkeep</code> последнего такта не из {000Fh, 00FFh, 0FFFh, FFFFh}</td><td>PG054 Table 2-9</td></tr>
+<tr><td>TX-3</td><td><code>tvalid</code> упал внутри пакета (между SOF и <code>tlast</code>)</td><td>PG054 p. 52 (режим <code>tx_str</code>: пакет обнуляется). Модель строже ядра: требует непрерывности всегда</td></tr>
+<tr><td>TX-4</td><td>При <code>tready = 0</code> упал <code>tvalid</code> или изменились <code>tdata/tkeep/tlast</code></td><td>PG054 pp. 51–52; правило рукопожатия AXI4-Stream</td></tr>
+<tr><td>TX-5</td><td>Число DW в пакете ≠ заголовок + Length, или нет <code>tlast</code></td><td>PCIe Base 2.1 §2.2 (malformed TLP); PG054 Table 3-42</td></tr>
+<tr><td>TX-6</td><td>Payload больше DevCtl.MPS Root Port'а: TLP отбрасывается как malformed</td><td>PG054 p. 52; PCIe Base §2.2.2 (Max_Payload_Size)</td></tr>
+<tr><td>TX-7</td><td>MWr пересекает границу 4 KiB; Cfg-запрос с Length ≠ 1</td><td>PCIe Base 2.1 §2.2.7 (правила Memory и Configuration Request)</td></tr>
+<tr><td>TX-8</td><td>Установлены <code>tx_err_fwd</code> / <code>tx_src_dsc</code>, бит TD или EP в заголовке</td><td>PG054 Table 2-9 (<code>s_axis_tx_tuser</code>)</td></tr>
+<tr><td>RX-1</td><td>MWr/CplD от SSD длиннее DevCtl.MPS Root Port'а: «malformed», отбрасывается</td><td>PG054 Table 3-42 (проверки приёма)</td></tr>
+<tr><td>RX-2</td><td>MWr от SSD пересекает 4 KiB: отбрасывается</td><td>PG054 Table 3-42</td></tr>
+<tr><td>RX-3</td><td>Число байт payload в TLP от SSD-модели не совпадает с Length (самопроверка модели SSD)</td><td>PG054 Table 3-42</td></tr>
+<tr><td>CM-1</td><td><code>cfg_mgmt_wr_en</code> и <code>cfg_mgmt_rd_en</code> одновременно</td><td>PG054 pp. 112–113 (порт конфигурации)</td></tr>
+</table>
+
+<p>Обратите внимание на RX-1. Сам DUT это правило нарушить не может: длинную TLP посылает SSD. Но правило ловит ошибку <b>настройки</b>. Если хост не записал DevCtl.MPS = 256 B в Root Port через cfg_mgmt, а SSD уже настроен на 256 B, первый же CQE длиной 16 B пройдёт, а первый Identify (MWr по 256 B) будет «отброшен ядром». Именно так проявлялась ошибка LiteNVMe (см. <a href="#s4">7.4.6</a>).</p>
+
+<h3>7.3.4. Root Port: cfg_mgmt, BME, LTSSM</h3>
+
+<p><b>cfg_mgmt.</b> В модели есть регистровый файл Type-1 конфигурационного пространства Root Port'а. В нём Command (DW 001h), номера шин (DW 006h) и PCIe capability по 60h: DevCap, DevCtl (68h), LinkCap, LinkCtl/LinkSta. У каждого DW своя маска записи. <code>cfg_mgmt_rd_wr_done</code> выставляется через такт после enable. Все записи попадают в журнал <code>cfgmgmt_wr_log</code>, а функции <code>rp_command()</code> и <code>rp_devctl()</code> позволяют тестбенчу проверить результат (T-6).</p>
+
+<p><b>BME = 0.</b> По PG054 (Table 3-25) Root Port со сброшенным Bus Master Enable отвечает на каждый входящий MRd completion'ом UR, а входящий MWr молча отбрасывает. Модель повторяет это поведение: Cpl-UR формируется внутри и уходит к SSD через рукопожатие <code>tx_cfg_req/tx_cfg_gnt</code>, как у настоящего ядра. Ручка <code>force_bme_off</code> включает такое поведение принудительно, что бы ни записал хост. На ней построен негативный тест <code>+nobme</code>.</p>
+
+<p><b>Линк.</b> После отпускания <code>sys_rst_n</code> модель проходит LTSSM: Detect.Quiet (00h) → Detect.Active (01h) → Polling (02h) → Configuration (07h) → L0 (16h) за <code>link_up_delay_cycles</code> тактов. Затем поднимается <code>user_lnk_up</code>, а пока <code>reset_until_link = 1</code>, удерживается <code>user_reset_out</code>. Ещё через <code>gen2_delay_cycles</code> модель делает короткий заход в Recovery (0Dh) и выставляет <code>pl_sel_lnk_rate = 1</code> (5 GT/s). Ширина всегда <code>2'b10</code> (x4). Этого хватает, чтобы проверить логику ожидания Gen2. Настоящее переобучение линка модель не изображает.</p>
+
+<table>
+<caption>Табл. 7.4. Ручки (knobs) модели ядра и значения по умолчанию</caption>
+<tr><th>Ручка</th><th>По умолчанию</th><th>Смысл</th></tr>
+<tr><td><code>tx_stall_pct</code></td><td class="num">0</td><td>вероятность <code>s_axis_tx_tready = 0</code> на такт, %</td></tr>
+<tr><td><code>tx_stall_midpkt</code></td><td class="num">1</td><td>разрешить стойки внутри пакета</td></tr>
+<tr><td><code>tx_latency_cycles</code></td><td class="num">16</td><td>задержка доставки TLP в SSD-модель</td></tr>
+<tr><td><code>sof_dw2_pct</code></td><td class="num">0</td><td>SOF в DW2 без straddle, %</td></tr>
+<tr><td><code>straddle_pct</code></td><td class="num">0</td><td>straddle, когда он возможен, %</td></tr>
+<tr><td><code>rx_gap_pct</code> / <code>rx_midpkt_gap_pct</code></td><td class="num">0 / 0</td><td>паузы перед пакетом / внутри пакета, %</td></tr>
+<tr><td><code>rx_poison_pct</code></td><td class="num">0</td><td>отравленные MWr/CplD, %</td></tr>
+<tr><td><code>np_ok_lag</code></td><td class="num">2</td><td>запаздывание реакции на <code>rx_np_ok</code>, тактов</td></tr>
+<tr><td><code>np_req_mode</code></td><td class="num">0</td><td>кредитный режим <code>rx_np_req</code></td></tr>
+<tr><td><code>junk_fill</code></td><td class="num">1</td><td>мусор в неиспользуемых линиях RX</td></tr>
+<tr><td><code>reset_until_link</code></td><td class="num">1</td><td><code>user_reset_out</code> до <code>user_lnk_up</code></td></tr>
+<tr><td><code>force_bme_off</code></td><td class="num">0</td><td>вести себя так, будто BME Root Port'а = 0</td></tr>
+<tr><td><code>verbose</code></td><td class="num">0</td><td>печатать каждую TLP</td></tr>
+</table>
+
+<p>Ручки — обычные переменные модуля. Тестбенч задаёт их иерархически в момент 0, например <code>u_core.straddle_pct = 50;</code>. Отдельный механизм конфигурации (как <code>uvm_config_db</code>) для проекта такого размера избыточен.</p>
+
+<!-- ============================================================ -->
+<h2 id="s4">7.4. Модель SSD</h2>
+
+<p><code>sim/models/nvme_ssd_model.sv</code> — поведенческий NVMe-контроллер за моделью ядра. Это PCIe Endpoint с конфигурационным пространством и BAR0. Он исполняет admin- и I/O-команды, сам ходит по шине за SQE, PRP-списками и данными и пишет CQE. В нём около 1300 строк, и бо́льшая их часть — не функциональность, а проверки.</p>
+
+<h3>7.4.1. Конфигурационное пространство и CRS</h3>
+<ul>
+<li>VID/DID 144Dh/A808h, класс 01_08_02h (NVMe), в Command записываемы MSE, BME и INTxDis.</li>
+<li>64-битный непредвыбираемый BAR0 на 16 KiB по смещениям 10h/14h. При записи всех единиц читается <code>FFFF_C004h</code> / <code>FFFF_FFFFh</code>.</li>
+<li>Список capabilities: 34h → 40h (PM) → 50h (MSI) → 80h (PCIe). DevCap: MPSS = 2 (512 B), ETFS = 1. DevCtl после сброса = 2810h. LinkCap/LinkSta — Gen2 x4.</li>
+<li>Первые <code>crs_count</code> (2) конфигурационных запросов после снятия PERST# получают <b>CRS</b> (Configuration Request Retry Status). Так модель заставляет <code>pcie_enum</code> отработать повторы.</li>
+<li>Номер шины и устройства модель «запоминает» по первому CfgWr0 без CRS. Дальше он служит Requester ID её запросов (в tb_top это 0100h).</li>
+</ul>
+
+<h3>7.4.2. Регистры BAR0 и admin-команды</h3>
+<p>CAP: MQES = 1023, CQR = 1, TO = 1, DSTRD = 0, CSS (бит 37) = 1, MPSMIN = MPSMAX = 0. VS = 1.4.0. CSTS.RDY следует за CC.EN через <code>rdy_delay_cycles</code>. CC.SHN = 01b переводит SHST в 01b, а через <code>shn_delay_cycles</code> — в 10b. Doorbell'ы лежат по адресу <code>1000h + 4·(2·qid + is_cq)</code>. Доступ к BAR0 возможен только при Command.MSE = 1.</p>
+<p>Admin-очередь понимает Identify (CNS 1 — контроллер, CNS 0 — namespace), Set Features (FID 7 и FID 6), Create I/O CQ/SQ (только QID 1 и PC = 1), Delete I/O SQ/CQ. Всё остальное получает Invalid Opcode. Данные Identify реалистичны: MDTS = 5 (128 KiB), SQES = 66h, CQES = 44h, LBADS = 9, NSZE задаётся параметром (16 777 216 блоков = 8 GiB в tb_top).</p>
+
+<h3>7.4.3. I/O-движок</h3>
+<p>Движок записи — самая «злая» часть модели. Каждый шаг в нём нарочно сделан не так, как удобно хосту:</p>
+<ol>
+<li><b>Выборка SQE пачками.</b> Через <code>fetch_delay_cycles</code> после doorbell'а движок одним MRd забирает до <code>sq_fetch_max</code> (4) SQE. Число ограничено ещё тремя вещами: концом кольца (через границу кольца одно чтение не идёт), свободными местами для параллельных команд и MRRS / 64. Хост видит MRd на 64, 128 или 256 байт по любому индексу очереди.</li>
+<li><b>Параллельные команды.</b> Каждая выбранная команда запускается в отдельном потоке (<code>fork … join_none</code>), всего до <code>concurrent_cmds</code> (4). Перед началом команда «думает» случайное время от <code>cmd_latency_min</code> до <code>cmd_latency_max</code> тактов. Поэтому чтения данных разных команд перемежаются, а CQE приходят не по порядку.</li>
+<li><b>PRP-список кусками.</b> Для команд длиннее двух страниц список читается постранично. С вероятностью <code>prp_chunk_pct</code> (50 %) страница списка запрашивается серией MRd случайной длины от 8 до 64 B, кратной 8 B. В остальных случаях — кусками по MRRS. Поддерживаются цепочки списков: последний элемент страницы указывает на следующую страницу.</li>
+<li><b>Данные — до 16 MRd в полёте.</b> Каждая страница данных режется на MRd случайного размера <code>4·U(mrd_size_min/4, MRRS/4)</code>, то есть от 64 до 512 B, кратного DW. Чтение никогда не пересекает 4 KiB. Tag выбирается случайно среди свободных (из 32, а при Extended Tags — из 256). Общий лимит — <code>max_outstanding</code> (16) tag'ов на все цели.</li>
+<li><b>Проверки команды.</b> NSID, диапазон LBA, MDTS, смещения PRP: на ошибку модель отвечает настоящим статусом NVMe (0Bh, 80h, 02h, 13h) и печатает <code>$warning</code>.</li>
+<li><b>Сохранение.</b> Принятые данные ложатся в <code>lba_mem</code> — ассоциативный массив 512-байтных блоков по номеру LBA. Повторная запись LBA — ошибка W-1.</li>
+</ol>
+
+<h3>7.4.4. Проверка каждого CplD</h3>
+
+<p>Модель SSD — главный судья нашего completer'а. Для каждого tag'а она хранит адрес, длину, число уже принятых байт, Requester ID и время выдачи. Каждый пришедший CplD проходит полный набор проверок requester'а из спецификации PCIe (§2.3.1.1, §2.3.2).</p>
+
+<table>
+<caption>Табл. 7.5. Проверки DMA в модели SSD (группа D)</caption>
+<tr><th>ID</th><th>Что проверяется</th><th>Типичная причина срабатывания</th></tr>
+<tr><td>D-1</td><td>SSD должен выдать запрос, а его Command.BME = 0</td><td>Хост забыл записать Command = 0406h в SSD</td></tr>
+<tr><td>D-2</td><td>Статус completion ≠ SC (UR, CA)</td><td>BME Root Port'а = 0; адрес не декодируется хостом</td></tr>
+<tr><td>D-3</td><td>Cpl без данных со статусом SC в ответ на MRd</td><td>Completer перепутал Cpl и CplD</td></tr>
+<tr><td>D-4</td><td>Неизвестный tag; не отражён Requester ID; Completer ID ≠ ожидаемого; не отражены TC/Attr; установлен BCM</td><td>Ошибка в формировании заголовка CplD</td></tr>
+<tr><td>D-5</td><td>Длина CplD больше MPS</td><td>Completer не режет ответ по MPS</td></tr>
+<tr><td>D-6</td><td>Byte Count ≠ число оставшихся байт</td><td>BC = длина текущего CplD вместо остатка; BC = 0 (это 4096!)</td></tr>
+<tr><td>D-7</td><td>Lower Address ≠ младшие 7 бит адреса очередного байта</td><td>Ошибка LA; CplD одного tag'а пришли не по порядку</td></tr>
+<tr><td>D-8</td><td>Разбиение не на границе RCB (64 B)</td><td>Completer режет «с начала запроса», а не по адресной сетке</td></tr>
+<tr><td>D-9</td><td>Данных больше, чем запрошено; CplD нулевой длины</td><td>Ошибка счётчика в completer</td></tr>
+<tr><td>D-10</td><td>Отравленный CplD (EP = 1)</td><td>Тест путей ошибок (<code>rx_poison_pct</code>)</td></tr>
+<tr><td>D-11</td><td>Тайм-аут completion (<code>cpl_timeout_cycles</code> = 100 000)</td><td>Completer потерял запрос; переполнение очереди NP</td></tr>
+</table>
+
+<p>Остальные группы проверок контролируют конфигурацию (C), доступ к BAR (B), протокол NVMe (N) и данные (W):</p>
+
+<table>
+<caption>Табл. 7.6. Проверки протокола в модели SSD (группы C, B, N, W)</caption>
+<tr><th>ID</th><th>Правило</th></tr>
+<tr><td>C-1, C-2</td><td>Конфигурационный запрос с Length ≠ 1, Last BE ≠ 0, TC/Attr ≠ 0; запрос Type 0 к несуществующему устройству или функции</td></tr>
+<tr><td>B-1, B-2, B-3</td><td>Доступ к BAR при MSE = 0 или вне BAR0; чтение MMIO длиннее 2 DW; запись doorbell'а с BE ≠ Fh</td></tr>
+<tr><td>N-1 … N-4</td><td>AQA/ASQ/ACQ, CC.MPS/CSS/AMS изменены при EN = 1; IOSQES/IOCQES изменены при существующих I/O-очередях; EN 0→1 при RDY = 1</td></tr>
+<tr><td>N-5</td><td>Плохая конфигурация в момент EN: нулевые размеры в AQA, ASQ/ACQ не выровнены на 4 KiB, MPS ≠ 0, CSS ≠ 0 → CSTS.CFS = 1</td></tr>
+<tr><td>N-6 … N-9</td><td>Doorbell при RDY = 0 или для несуществующей очереди; значение ≥ размера очереди; tail, переполняющий SQ или идущий назад; head CQ дальше выставленных записей</td></tr>
+<tr><td>N-10</td><td>CC.SHN = 11b (зарезервировано)</td></tr>
+<tr><td>W-1</td><td>LBA записан дважды (если не <code>allow_overwrite</code>)</td></tr>
+</table>
+
+<h3>7.4.5. Запись CQE и инжекция статуса</h3>
+<p>Для каждой CQ работает свой поток <code>cq_poster</code>. Он учитывает фазу (P = 1 на первом проходе, инверсия на каждом обороте), записывает SQHD и ждёт head-doorbell'а, если CQ заполнена. Два способа записи нарочно неудобны для хоста:</p>
+<ul>
+<li><b>Coalescing</b> (<code>cqe_coalesce_pct</code>): два готовых CQE уходят одной MWr на 32 B, если не пересекают конец кольца.</li>
+<li><b>Split 8 + 8</b> (<code>cqe_split_pct</code>): один CQE пишется двумя MWr по 8 B с паузой 0–3 такта. Вторая половина (DW2–DW3) содержит фазовый бит и приходит последней. Хост, который опрашивает CQ, может увидеть верхнюю половину раньше нижней, и тогда DW0 окажется устаревшим. Корректный хост смотрит на фазу и читает CQE целиком после её смены.</li>
+</ul>
+<p><b>Инжекция статуса.</b> <code>inject_status_at_cmd</code> — номер I/O Write (с нуля), который получит ошибочный статус <code>inject_status_value</code>. По умолчанию это DNR = 1, SCT = 2, SC = 80h (Write Fault), что в 15-битном поле статуса даёт <code>4280h</code>. Данные при этом всё равно сохраняются, поэтому проверка данных продолжает работать. Тестируется не повтор, а то, что хост <b>заметил</b> ошибку и посчитал её.</p>
+
+<table>
+<caption>Табл. 7.7. Ручки модели SSD, значения по умолчанию и что меняет tb_top</caption>
+<tr><th>Ручка</th><th>По умолчанию</th><th>Смысл</th><th>tb_top</th></tr>
+<tr><td><code>crs_count</code></td><td class="num">2</td><td>число CRS после PERST#</td><td>—</td></tr>
+<tr><td><code>rdy_delay_cycles</code></td><td class="num">200</td><td>CC.EN → CSTS.RDY</td><td>—</td></tr>
+<tr><td><code>shn_delay_cycles</code></td><td class="num">500</td><td>CC.SHN → SHST = 10b</td><td>—</td></tr>
+<tr><td><code>mmio_lat_cycles</code></td><td class="num">8</td><td>задержка ответа на Cfg/MMIO</td><td>—</td></tr>
+<tr><td><code>fetch_delay_cycles</code></td><td class="num">20</td><td>doorbell → MRd SQE</td><td>—</td></tr>
+<tr><td><code>cmd_latency_min/max</code></td><td class="num">20 / 200</td><td>«обдумывание» команды, тактов</td><td>—</td></tr>
+<tr><td><code>concurrent_cmds</code></td><td class="num">4</td><td>команд одновременно</td><td>—</td></tr>
+<tr><td><code>sq_fetch_max</code></td><td class="num">4</td><td>SQE за один MRd</td><td>—</td></tr>
+<tr><td><code>max_outstanding</code></td><td class="num">16</td><td>tag'ов в полёте</td><td>—</td></tr>
+<tr><td><code>mrd_size_min</code></td><td class="num">64</td><td>минимальный MRd данных, B (максимум = MRRS)</td><td>—</td></tr>
+<tr><td><code>mrd_gap_max</code></td><td class="num">0</td><td>случайная пауза между MRd одной команды</td><td>2 при <code>+stress</code></td></tr>
+<tr><td><code>prp_chunk_pct</code></td><td class="num">50</td><td>PRP-список мелкими MRd 8–64 B, %</td><td>—</td></tr>
+<tr><td><code>cqe_split_pct</code></td><td class="num">0</td><td>CQE двумя MWr по 8 B, %</td><td>50 при <code>+cqesplit</code>, <code>+stress</code></td></tr>
+<tr><td><code>cqe_coalesce_pct</code></td><td class="num">0</td><td>два CQE в одной MWr, %</td><td>50 при <code>+cqesplit</code>, <code>+stress</code></td></tr>
+<tr><td><code>inject_status_at_cmd</code></td><td class="num">−1</td><td>номер Write с ошибкой (−1 — выкл.)</td><td>10 при <code>+inject_err</code></td></tr>
+<tr><td><code>inject_status_value</code></td><td class="num">4280h</td><td>{DNR, M, CRD, SCT, SC}</td><td>—</td></tr>
+<tr><td><code>rcb_bytes</code></td><td class="num">64</td><td>RCB Root Port'а для D-8</td><td>—</td></tr>
+<tr><td><code>exp_cpl_id</code></td><td class="num">0000h</td><td>ожидаемый Completer ID</td><td>—</td></tr>
+<tr><td><code>cpl_timeout_cycles</code></td><td class="num">100 000</td><td>тайм-аут completion (D-11)</td><td>—</td></tr>
+<tr><td><code>allow_overwrite</code></td><td class="num">0</td><td>разрешить повторную запись LBA</td><td>—</td></tr>
+<tr><td><code>verbose</code></td><td class="num">0</td><td>печатать каждую TLP и команду</td><td>1 при <code>+verbose</code></td></tr>
+</table>
+
+<h3 id="s4-6">7.4.6. Почему модель должна быть злой</h3>
+
+<p>Модель, которая отвечает «как удобно», бесполезна: она проверяет, что хост работает с самой собой. Каждая случайность в нашей модели взята из реальной ошибки, которую кто-то уже совершил. Обзор открытых проектов (<code>research/01_open_source_survey.md</code>) даёт целую коллекцию таких ошибок, и почти каждая молчалива: на плате она проявляется как зависание без единого бита ошибки.</p>
+
+<table>
+<caption>Табл. 7.8. Ошибки открытых NVMe-хостов и чем их ловит наша модель</caption>
+<tr><th>Ошибка (проект)</th><th>Как проявлялась на плате</th><th>Что делает модель</th><th>Проверка</th></tr>
+<tr><td>Byte Count в CplD = 0, то есть 4096 (LiteNVMe, 7-series)</td><td>SSD ждёт после выборки SQE вечно; ни CQE, ни ошибки</td><td>Сверяет BC каждого CplD с остатком по tag'у</td><td>D-6, затем D-11</td></tr>
+<tr><td>MPS Root Port'а остался 128 B, а у SSD поднят до 256 (LiteNVMe)</td><td>Тайм-ауты чтений</td><td>Модель ядра отбрасывает upstream-TLP длиннее DevCtl.MPS RP</td><td>RX-1, TX-6; T-6 в tb_top</td></tr>
+<tr><td>BME Root Port'а не установлен (типовая ошибка из Xilinx PCIe Debug K-Map)</td><td>Каждый DMA SSD получает UR</td><td>Повторяет диспозицию PG054 Table 3-25</td><td>D-2; негативный <code>+nobme</code></td></tr>
+<tr><td>CQE по 16 B ложится внутрь 128-битного слова (LiteNVMe; Design Gateway, ревизия 3.01)</td><td>Порча соседнего CQE, «пропавшие» команды</td><td>Coalescing по 32 B, split 8 + 8 со смещением 8</td><td>Сбой разбора CQE в хосте → T-2/T-3, тайм-аут</td></tr>
+<tr><td>Генератор PRP повторно выдаёт элемент 0 (mcrl)</td><td>Записываются чужие страницы</td><td>Читает PRP-список кусками 8–64 B со случайных смещений</td><td>T-1 (данные), W-1, статус 13h</td></tr>
+<tr><td>CQE приходят подряд (mcrl)</td><td>Хост пропускает второй CQE</td><td>4 параллельные команды, coalescing</td><td>T-2 (число команд)</td></tr>
+<tr><td>Ранние конфигурационные чтения после PERST#</td><td>На части SSD нумерация не проходит</td><td>CRS для первых 2 запросов</td><td>tb_enum, T-5</td></tr>
+<tr><td>Только одно чтение в полёте, completer с пузырями (LiteNVMe, «самодельный» потолок 460 MB/s)</td><td>Скорость в разы ниже линка</td><td>16 MRd в полёте, случайные размеры</td><td>Метрика valid-beat ratio, tb_completer</td></tr>
+</table>
+
+<div class="box"><span class="t">Принцип</span> Любое поведение, которое спецификация <b>разрешает</b> SSD, модель должна хотя бы иногда <b>делать</b>. Если спецификация разрешает разбивать чтение PRP-списка на куски по 8 байт, а модель всегда читает его целиком, хост, сломанный на кусках, пройдёт все тесты.</div>
+
+<!-- ============================================================ -->
+<h2 id="s5">7.5. tb_models: самопроверка моделей</h2>
+
+<p>Модели — тоже код, и в них тоже есть ошибки. Если tb_top падает, нужно знать, что виноват DUT, а не модель. Если tb_top проходит, нужно знать, что модель вообще способна заметить ошибку. Для этого существует <code>sim/tb/tb_models.sv</code>: тест, в котором <b>DUT нет совсем</b>.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 270" width="760" role="img" aria-label="Структура tb_models" font-size="12">
+<defs>
+<marker id="f74a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+<marker id="f74b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+</defs>
+<rect x="10" y="20" width="270" height="200" rx="8" fill="var(--ok-bg)" stroke="#2f9e55" stroke-width="1.5"/>
+<text x="145" y="42" text-anchor="middle" font-weight="700" fill="var(--fg)">Мини-хост внутри tb_models</text>
+<text x="24" y="66" fill="var(--fg)">• свой RX-разборщик (straddle, SOF@DW2)</text>
+<text x="24" y="86" fill="var(--fg)">• свой TX-framer (3DW: {D0, H2, H1, H0})</text>
+<text x="24" y="106" fill="var(--fg)">• completer по hmem: случайный</text>
+<text x="34" y="122" fill="var(--fg)">законный split CplD (RCB / MPS)</text>
+<text x="24" y="142" fill="var(--fg)">• requester Cfg/MMIO с повтором CRS</text>
+<text x="24" y="162" fill="var(--fg)">• «драйвер»: init, I/O, shutdown</text>
+<text x="24" y="188" fill="var(--accent2)">инжекции: neg1–4 (CplD), neg7 (tkeep),</text>
+<text x="24" y="204" fill="var(--accent2)">neg8 (doorbell), neg5/neg6 (BME)</text>
+<rect x="330" y="60" width="170" height="110" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="415" y="86" text-anchor="middle" font-weight="700" fill="var(--fg)">pcie7x_core_model</text>
+<text x="415" y="108" text-anchor="middle" fill="var(--fg)">ловит: TX-1, TX-6</text>
+<text x="415" y="126" text-anchor="middle" fill="var(--fg)">отвечает UR при</text>
+<text x="415" y="142" text-anchor="middle" fill="var(--fg)">BME RP = 0 (neg5)</text>
+<rect x="570" y="60" width="180" height="110" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="660" y="86" text-anchor="middle" font-weight="700" fill="var(--fg)">nvme_ssd_model</text>
+<text x="660" y="108" text-anchor="middle" fill="var(--fg)">ловит: D-1, D-2,</text>
+<text x="660" y="126" text-anchor="middle" fill="var(--fg)">D-6, D-7, D-8, N-7</text>
+<text x="660" y="146" text-anchor="middle" font-size="11" fill="var(--muted)">NSZE = 1 048 576</text>
+<line x1="282" y1="100" x2="327" y2="100" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f74a)"/>
+<line x1="327" y1="130" x2="282" y2="130" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f74a)"/>
+<text x="305" y="92" text-anchor="middle" font-size="10" fill="var(--fg)">TX</text>
+<text x="305" y="146" text-anchor="middle" font-size="10" fill="var(--fg)">RX</text>
+<line x1="502" y1="100" x2="567" y2="100" stroke="var(--accent)" stroke-width="2" marker-end="url(#f74b)"/>
+<line x1="567" y1="130" x2="502" y2="130" stroke="var(--accent)" stroke-width="2" marker-end="url(#f74b)"/>
+<text x="535" y="92" text-anchor="middle" font-size="10" fill="var(--accent)">mb_down</text>
+<text x="535" y="146" text-anchor="middle" font-size="10" fill="var(--accent)">mb_up</text>
+<rect x="330" y="190" width="420" height="54" rx="6" fill="var(--warn-bg)" stroke="var(--accent2)" stroke-width="1.5"/>
+<text x="540" y="212" text-anchor="middle" fill="var(--fg)">негативный режим: ждать err_count &gt; 0 не дольше 3 мс,</text>
+<text x="540" y="230" text-anchor="middle" fill="var(--fg)">иначе $fatal «модели НЕ заметили внесённую ошибку»</text>
+<text x="380" y="262" text-anchor="middle" font-size="11" fill="var(--muted)">в тестбенче нет ни одной строки RTL проекта</text>
+</svg>
+<figcaption>Рис. 7.4. tb_models: две модели работают друг с другом через мини-хост, написанный в тестбенче. Оранжевым отмечены места, куда негативные прогоны вносят ровно одну ошибку.</figcaption>
+</figure>
+
+<h3>7.5.1. Позитивный прогон: две независимые реализации</h3>
+<p>Мини-хост — <b>независимая</b> реализация тех же правил, что заложены в DUT. Он написан на поведенческом SystemVerilog без оглядки на RTL. Это частный случай N-версионной проверки: если две независимо написанные реализации одинаково понимают спецификацию, вероятность общей ошибки мала. Сценарий проходит весь жизненный цикл:</p>
+<ol>
+<li>сброс, линк, cfg_mgmt Root Port'а; нумерация с повторами CRS, BAR, capabilities, DevCtl;</li>
+<li>инициализация NVMe с admin-очередями <b>на 4 записи</b>, чтобы они быстро обернулись и фаза сменилась;</li>
+<li>Identify ×2 (данные проверяются), Set Features, Create CQ/SQ на 4 записи; команда с неверным кодом операции (ожидается SC = 01h);</li>
+<li>Write 8 KiB (PRP2 — страница), 32 KiB (PRP-список с ненулевым смещением), 12 KiB со смещением PRP1 и <b>цепочкой</b> PRP-списков, затем 12 × 4 KiB до трёх в полёте;</li>
+<li><code>check_range</code>, Flush, удаление очередей, CC.SHN, ожидание SHST.</li>
+</ol>
+<p>Рандомизация включена по умолчанию: straddle, SOF@DW2, паузы RX, стойки TX и <code>m_axis_rx_tready</code>, переключение <code>rx_np_ok</code>, split и coalescing CQE. Типичный прогон: хост увидел 493 TLP на RX, из них 24 такта со straddle и 135 с SOF@DW2. SSD выполнил 15 Write и 1 Flush, записал 200 LBA (102 400 B). Обе CQ обернулись, ошибок 0.</p>
+
+<div class="box warn"><span class="t">Чтение лога</span> В логе успешного tb_models есть строка <code>Warning: [nvme_ssd_model] admin opc 7f cid 5 completed with status 4001 (SCT 0 SC 01)</code>. Это не сбой, а <b>ожидаемая</b> реакция на команду с неверным кодом операции. Предупреждение модели означает «хост получит ошибку NVMe». Ошибка теста — это только <code>$error</code> и <code>$fatal</code>.</div>
+
+<h3>7.5.2. Негативные прогоны: «сначала докажи, что тест умеет падать»</h3>
+
+<p>Проверка, которая ни разу не срабатывала, неотличима от отсутствующей. Опечатка в условии, перепутанный знак, проверка на ветке, куда исполнение никогда не попадает — и правило D-6 «работает», ничего не проверяя. Поэтому каждое важное правило моделей доказывается <b>негативным тестом</b>: в мини-хост вносится ровно одна ошибка, и тест проходит, только если модель её заметила.</p>
+
+<table>
+<caption>Табл. 7.9. Негативные прогоны tb_models (<code>+negN</code>)</caption>
+<tr><th>Ключ</th><th>Внесённая ошибка (мини-хост)</th><th>Кто должен заметить</th></tr>
+<tr><td><code>+neg1</code></td><td>В одном из промежуточных CplD Byte Count увеличен на 4</td><td>SSD, D-6</td></tr>
+<tr><td><code>+neg2</code></td><td>Lower Address промежуточного CplD увеличен на 4</td><td>SSD, D-7</td></tr>
+<tr><td><code>+neg3</code></td><td>Completion разрезан на 60 B — не на границе RCB</td><td>SSD, D-8</td></tr>
+<tr><td><code>+neg4</code></td><td>CplD длиннее MPS (весь остаток одним пакетом)</td><td>ядро, TX-6 (malformed)</td></tr>
+<tr><td><code>+neg5</code></td><td>BME Root Port'а не записан через cfg_mgmt</td><td>ядро отвечает UR → SSD, D-2</td></tr>
+<tr><td><code>+neg6</code></td><td>В Command SSD записано 0402h без BME</td><td>SSD, D-1</td></tr>
+<tr><td><code>+neg7</code></td><td>TX-пакет с недопустимым <code>tkeep</code></td><td>ядро, TX-1</td></tr>
+<tr><td><code>+neg8</code></td><td>Doorbell admin SQ = 7 при размере очереди 4</td><td>SSD, N-7</td></tr>
+</table>
+
+<p>Механика проста. При <code>neg ≠ 0</code> запускается сторож. Он ждёт, пока <code>u_ssd.err_count + u_core.err_count</code> станет больше нуля, и печатает <code>TEST PASSED</code>. Если за 3 мс модельного времени ошибки нет — <code>$fatal</code>. Ключ принимается в двух формах, <code>+neg=3</code> и <code>+neg3</code> (почему так, см. <a href="#s8">7.8</a>).</p>
+
+<div class="box task"><span class="t">Слабое место (и упражнение)</span> Сторож принимает <b>любую</b> ошибку моделей. Если при <code>+neg1</code> вместо D-6 сработает, скажем, D-11, тест всё равно пройдёт. Строже было бы запоминать ID последней ошибки (например, строку в <code>err()</code>) и сравнивать с ожидаемым для данного N. Это хорошее первое упражнение в коде моделей.</div>
+
+<p>Тот же приём используется и в системном тесте (<code>+nobme</code>, раздел <a href="#s7">7.7</a>) и в модульных тестах: tb_enum содержит 8 негативных сценариев, tb_nvme_admin — 8 из 10, tb_write_engine вставляет CQE с ошибками. Общее правило проекта: <b>у каждой проверки должен быть прогон, на котором она срабатывает</b>.</p>
+
+<!-- ============================================================ -->
+<h2 id="s6">7.6. Модульные тесты</h2>
+
+<h3>7.6.1. Как устроен типичный checker</h3>
+
+<p>Все модульные тесты проекта построены по одной схеме (рис. 7.5). Это упрощённая версия того, что в UVM называют agent + scoreboard, но без библиотеки: только SystemVerilog-очереди и задачи.</p>
+
+<figure>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 260" width="760" role="img" aria-label="Устройство самопроверяющегося тестбенча" font-size="12">
+<defs>
+<marker id="f75a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+<marker id="f75b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+</defs>
+<rect x="10" y="90" width="160" height="70" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="90" y="115" text-anchor="middle" font-weight="700" fill="var(--fg)">Генератор</text>
+<text x="90" y="133" text-anchor="middle" fill="var(--fg)">directed + random</text>
+<text x="90" y="149" text-anchor="middle" font-size="11" fill="var(--muted)">random_req(), сценарии</text>
+<rect x="250" y="20" width="170" height="70" rx="6" fill="var(--note-bg)" stroke="var(--accent)" stroke-width="2"/>
+<text x="335" y="48" text-anchor="middle" font-weight="700" fill="var(--fg)">DUT</text>
+<text x="335" y="68" text-anchor="middle" fill="var(--fg)">напр. hostmem_completer</text>
+<rect x="250" y="160" width="170" height="70" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="335" y="186" text-anchor="middle" font-weight="700" fill="var(--fg)">Эталонная модель</text>
+<text x="335" y="204" text-anchor="middle" fill="var(--fg)">mem_byte(), bc_total_ref()</text>
+<text x="335" y="220" text-anchor="middle" font-size="11" fill="var(--muted)">очередь ожиданий exp_q</text>
+<rect x="500" y="20" width="160" height="70" rx="6" fill="var(--code-bg)" stroke="var(--fg)"/>
+<text x="580" y="48" text-anchor="middle" font-weight="700" fill="var(--fg)">Монитор</text>
+<text x="580" y="68" text-anchor="middle" fill="var(--fg)">собирает пакеты</text>
+<rect x="500" y="160" width="160" height="70" rx="6" fill="var(--warn-bg)" stroke="var(--accent2)" stroke-width="1.5"/>
+<text x="580" y="186" text-anchor="middle" font-weight="700" fill="var(--fg)">Scoreboard</text>
+<text x="580" y="204" text-anchor="middle" fill="var(--fg)">check_packet():</text>
+<text x="580" y="220" text-anchor="middle" fill="var(--fg)">поле за полем</text>
+<line x1="170" y1="110" x2="247" y2="60" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f75a)"/>
+<line x1="170" y1="140" x2="247" y2="190" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f75a)"/>
+<text x="204" y="112" font-size="11" fill="var(--fg)">стимул</text>
+<text x="196" y="186" font-size="11" fill="var(--fg)">копия</text>
+<line x1="420" y1="55" x2="497" y2="55" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f75a)"/>
+<line x1="580" y1="90" x2="580" y2="157" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f75a)"/>
+<line x1="420" y1="195" x2="497" y2="195" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f75a)"/>
+<text x="458" y="188" text-anchor="middle" font-size="11" fill="var(--fg)">ожидание</text>
+<rect x="676" y="20" width="76" height="70" rx="6" fill="none" stroke="var(--accent2)" stroke-dasharray="4 3"/>
+<text x="714" y="44" text-anchor="middle" font-size="11" fill="var(--fg)">протокол:</text>
+<text x="714" y="60" text-anchor="middle" font-size="11" fill="var(--fg)">AXI, tkeep,</text>
+<text x="714" y="76" text-anchor="middle" font-size="11" fill="var(--fg)">tlast</text>
+<rect x="676" y="160" width="76" height="70" rx="6" fill="none" stroke="var(--muted)" stroke-dasharray="4 3"/>
+<text x="714" y="186" text-anchor="middle" font-size="11" fill="var(--fg)">метрики:</text>
+<text x="714" y="202" text-anchor="middle" font-size="11" fill="var(--fg)">латентность,</text>
+<text x="714" y="218" text-anchor="middle" font-size="11" fill="var(--fg)">beats/cycle</text>
+<text x="458" y="74" text-anchor="middle" font-size="10" fill="var(--accent2)">tready</text>
+<text x="458" y="86" text-anchor="middle" font-size="10" fill="var(--accent2)">случайный</text>
+</svg>
+<figcaption>Рис. 7.5. Самопроверяющийся тестбенч. Генератор подаёт стимул в DUT и его копию в эталонную модель. Монитор собирает выход DUT в пакеты, scoreboard сравнивает их с ожиданием. Протокольные проверки интерфейса и счётчики метрик работают независимо от данных.</figcaption>
+</figure>
+
+<p>Три компонента делают checker надёжным:</p>
+<ul>
+<li><b>Эталон, который нельзя «подогнать».</b> В tb_completer память — не массив, а чистая хеш-функция <code>mem_byte(sel, addr)</code>. Любой байт можно вычислить заново, и сдвиг на один байт в DUT не совпадёт с эталоном случайно. Шаблоны вроде «байт = младшие биты адреса» ловят меньше: сдвиг на 256 байт их не нарушит.</li>
+<li><b>Проверка каждого поля, а не «итог сошёлся».</b> Сравнивается не только payload, но и Fmt/Type, статус, Completer ID, Requester ID, Tag, TC, Attr, Length, границы разбиения, Byte Count и Lower Address каждого CplD.</li>
+<li><b>Обратное давление и мусор.</b> Случайный <code>tready</code>, а память с задержкой 2 такта возвращает мусор, если <code>rd_en</code> не был выставлен. DUT, который читает «на всякий случай», будет пойман.</li>
+</ul>
+
+<h3>7.6.2. Пример: запрос 512 B по адресу …040h в tb_completer</h3>
+
+<p>Разберём одну транзакцию, которую tb_completer повторяет 64 раза подряд в тесте пропускной способности. SSD читает 512 B (Length = 128 DW) с адреса, оканчивающегося на 040h; MPS = 256 B, RCB = 64 B. Правило разбиения в checker'е:</p>
+
+<pre><code>exp_end = ((abs_start / mps) + 1) * mps - (cur.addr &amp; 32'hFFF);  // до следующей границы MPS
+if (exp_end &gt; req_end) exp_end = req_end;                         // или до конца запроса
+if (start + nbytes != exp_end) fail("split: ...");</code></pre>
+
+<p>Первый CplD должен закончиться на ближайшей границе MPS по <b>адресу</b>, то есть на …100h. Последующие идут по MPS, последний — хвост:</p>
+
+<table>
+<caption>Табл. 7.10. Ожидаемые completion для MRd 512 B @ …040h, MPS = 256 B</caption>
+<tr><th>#</th><th>Адреса</th><th class="num">Payload, B</th><th class="num">Length, DW</th><th class="num">Byte Count</th><th class="num">Lower Address</th><th class="num">Тактов tlp_axis</th></tr>
+<tr><td>1</td><td>…040 – …0FF</td><td class="num">192</td><td class="num">48</td><td class="num">512</td><td class="num">40h</td><td class="num">1 + 12 = 13</td></tr>
+<tr><td>2</td><td>…100 – …1FF</td><td class="num">256</td><td class="num">64</td><td class="num">320</td><td class="num">00h</td><td class="num">1 + 16 = 17</td></tr>
+<tr><td>3</td><td>…200 – …23F</td><td class="num">64</td><td class="num">16</td><td class="num">64</td><td class="num">00h</td><td class="num">1 + 4 = 5</td></tr>
+</table>
+
+<p>Byte Count — это число байт, <b>оставшихся</b> до конца запроса, включая текущий CplD: 512, затем 512 − 192 = 320, затем 64. Lower Address — младшие 7 бит адреса первого байта CplD: 40h, затем 00h (…100h) и 00h (…200h). Внутренний поток <code>tlp_axis</code> кладёт заголовок в отдельный такт, поэтому на запрос уходит 13 + 17 + 5 = 35 тактов.</p>
+
+<figure class="wave">
+<svg xmlns="http://www.w3.org/2000/svg" width="1115.6" height="348" viewBox="0 0 1115.6 348" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wved7914h" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wved7914a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker><mask id="wved7914m5" maskUnits="userSpaceOnUse" x="135.6" y="183" width="972" height="30"><rect x="135.6" y="183" width="972" height="30" fill="#fff"/><polygon points="579.6,213 585.6,213 591.6,183 585.6,183" fill="#000"/><polygon points="759.6,213 765.6,213 771.6,183 765.6,183" fill="#000"/><polygon points="939.6,213 945.6,213 951.6,183 945.6,183" fill="#000"/></mask></defs><path d="M135.6,48 V318 M171.6,48 V318 M207.6,48 V318 M243.6,48 V318 M279.6,48 V318 M315.6,48 V318 M351.6,48 V318 M387.6,48 V318 M423.6,48 V318 M459.6,48 V318 M495.6,48 V318 M531.6,48 V318 M567.6,48 V318 M603.6,48 V318 M639.6,48 V318 M675.6,48 V318 M711.6,48 V318 M747.6,48 V318 M783.6,48 V318 M819.6,48 V318 M855.6,48 V318 M891.6,48 V318 M927.6,48 V318 M963.6,48 V318 M999.6,48 V318 M1035.6,48 V318 M1071.6,48 V318 M1107.6,48 V318" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="153.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">0</text><text x="189.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">1</text><text x="225.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">2</text><text x="261.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">3</text><text x="297.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">4</text><text x="333.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">5</text><text x="369.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">6</text><text x="405.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">7</text><text x="441.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">8</text><text x="477.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">9</text><text x="513.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">10</text><text x="549.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">11</text><text x="585.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">12</text><text x="621.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">13</text><text x="657.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">14</text><text x="693.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">15</text><text x="729.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">16</text><text x="765.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">17</text><text x="801.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">18</text><text x="837.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">19</text><text x="873.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">20</text><text x="909.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">21</text><text x="945.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">22</text><text x="981.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">23</text><text x="1017.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">24</text><text x="1053.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">25</text><text x="1089.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">26</text><text x="127.6" y="67.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">user_clk</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,72 L138.6,54 L153.6,54 L156.6,72 L171.6,72 M171.6,72 L174.6,54 L189.6,54 L192.6,72 L207.6,72 M207.6,72 L210.6,54 L225.6,54 L228.6,72 L243.6,72 M243.6,72 L246.6,54 L261.6,54 L264.6,72 L279.6,72 M279.6,72 L282.6,54 L297.6,54 L300.6,72 L315.6,72 M315.6,72 L318.6,54 L333.6,54 L336.6,72 L351.6,72 M351.6,72 L354.6,54 L369.6,54 L372.6,72 L387.6,72 M387.6,72 L390.6,54 L405.6,54 L408.6,72 L423.6,72 M423.6,72 L426.6,54 L441.6,54 L444.6,72 L459.6,72 M459.6,72 L462.6,54 L477.6,54 L480.6,72 L495.6,72 M495.6,72 L498.6,54 L513.6,54 L516.6,72 L531.6,72 M531.6,72 L534.6,54 L549.6,54 L552.6,72 L567.6,72 M567.6,72 L570.6,54 L585.6,54 L588.6,72 L603.6,72 M603.6,72 L606.6,54 L621.6,54 L624.6,72 L639.6,72 M639.6,72 L642.6,54 L657.6,54 L660.6,72 L675.6,72 M675.6,72 L678.6,54 L693.6,54 L696.6,72 L711.6,72 M711.6,72 L714.6,54 L729.6,54 L732.6,72 L747.6,72 M747.6,72 L750.6,54 L765.6,54 L768.6,72 L783.6,72 M783.6,72 L786.6,54 L801.6,54 L804.6,72 L819.6,72 M819.6,72 L822.6,54 L837.6,54 L840.6,72 L855.6,72 M855.6,72 L858.6,54 L873.6,54 L876.6,72 L891.6,72 M891.6,72 L894.6,54 L909.6,54 L912.6,72 L927.6,72 M927.6,72 L930.6,54 L945.6,54 L948.6,72 L963.6,72 M963.6,72 L966.6,54 L981.6,54 L984.6,72 L999.6,72 M999.6,72 L1002.6,54 L1017.6,54 L1020.6,72 L1035.6,72 M1035.6,72 L1038.6,54 L1053.6,54 L1056.6,72 L1071.6,72 M1071.6,72 L1074.6,54 L1089.6,54 L1092.6,72 L1107.6,72" fill="none"/></g><text x="127.6" y="97.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_mrd_tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,102 L171.6,102 M171.6,102 L174.6,84 L207.6,84 M207.6,84 L210.6,102 L1107.6,102" fill="none"/></g><text x="127.6" y="127.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_mrd_tdata</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="135.6,132 135.6,114 168.6,114 171.6,123 168.6,132" fill="url(#wved7914h)"/><polygon points="174.6,132 171.6,123 174.6,114 204.6,114 207.6,123 204.6,132" fill="#ffd7a8"/><text x="189.6" y="126.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MRd</text><polygon points="210.6,132 207.6,123 210.6,114 1107.6,114 1107.6,132" fill="url(#wved7914h)"/></g><text x="127.6" y="172.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">m_cpl_tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,177 L459.6,177 M459.6,177 L462.6,159 L999.6,159 M999.6,159 L1002.6,177 L1107.6,177" fill="none"/></g><text x="127.6" y="202.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">m_cpl_tdata</text><g mask="url(#wved7914m5)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="135.6,207 135.6,189 456.6,189 459.6,198 456.6,207" fill="url(#wved7914h)"/><polygon points="462.6,207 459.6,198 462.6,189 492.6,189 495.6,198 492.6,207" fill="#a8d4ff"/><text x="477.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="498.6,207 495.6,198 498.6,189 528.6,189 531.6,198 528.6,207" fill="#e4e4e4"/><text x="513.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D0</text><polygon points="534.6,207 531.6,198 534.6,189 600.6,189 603.6,198 600.6,207" fill="#e4e4e4"/><text x="567.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D1</text><polygon points="606.6,207 603.6,198 606.6,189 636.6,189 639.6,198 636.6,207" fill="#e4e4e4"/><text x="621.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D11</text><polygon points="642.6,207 639.6,198 642.6,189 672.6,189 675.6,198 672.6,207" fill="#a8f0ee"/><text x="657.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="678.6,207 675.6,198 678.6,189 708.6,189 711.6,198 708.6,207" fill="#e4e4e4"/><text x="693.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D0</text><polygon points="714.6,207 711.6,198 714.6,189 780.6,189 783.6,198 780.6,207" fill="#e4e4e4"/><text x="747.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D1</text><polygon points="786.6,207 783.6,198 786.6,189 816.6,189 819.6,198 816.6,207" fill="#e4e4e4"/><text x="801.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D15</text><polygon points="822.6,207 819.6,198 822.6,189 852.6,189 855.6,198 852.6,207" fill="#bff0a8"/><text x="837.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">H</text><polygon points="858.6,207 855.6,198 858.6,189 888.6,189 891.6,198 888.6,207" fill="#e4e4e4"/><text x="873.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D0</text><polygon points="894.6,207 891.6,198 894.6,189 960.6,189 963.6,198 960.6,207" fill="#e4e4e4"/><text x="927.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D1</text><polygon points="966.6,207 963.6,198 966.6,189 996.6,189 999.6,198 996.6,207" fill="#e4e4e4"/><text x="981.6" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">D3</text><polygon points="1002.6,207 999.6,198 1002.6,189 1107.6,189 1107.6,207" fill="url(#wved7914h)"/></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M579.6,210 L585.6,186"/><path d="M585.6,210 L591.6,186"/><path d="M759.6,210 L765.6,186"/><path d="M765.6,210 L771.6,186"/><path d="M939.6,210 L945.6,186"/><path d="M945.6,210 L951.6,186"/></g><text x="127.6" y="232.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">m_cpl_tlast</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,237 L603.6,237 M603.6,237 L606.6,219 L639.6,219 M639.6,219 L642.6,237 L783.6,237 M783.6,237 L786.6,219 L819.6,219 M819.6,219 L822.6,237 L963.6,237 M963.6,237 L966.6,219 L999.6,219 M999.6,219 L1002.6,237 L1107.6,237" fill="none"/></g><text x="127.6" y="277.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">CplD</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="135.6,282 135.6,264 456.6,264 459.6,273 456.6,282" fill="url(#wved7914h)"/><polygon points="462.6,282 459.6,273 462.6,264 636.6,264 639.6,273 636.6,282" fill="#ffd7a8"/><text x="549.6" y="276.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">#1 192 B: BC=512 LA=40h</text><polygon points="642.6,282 639.6,273 642.6,264 816.6,264 819.6,273 816.6,282" fill="#a8d4ff"/><text x="729.6" y="276.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">#2 256 B: BC=320 LA=00h</text><polygon points="822.6,282 819.6,273 822.6,264 996.6,264 999.6,273 996.6,282" fill="#a8f0ee"/><text x="909.6" y="276.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">#3 64 B: BC=64 LA=00h</text><polygon points="1002.6,282 999.6,273 1002.6,264 1107.6,264 1107.6,282" fill="url(#wved7914h)"/></g><text x="127.6" y="307.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">адрес</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="135.6,312 135.6,294 456.6,294 459.6,303 456.6,312" fill="url(#wved7914h)"/><polygon points="462.6,312 459.6,303 462.6,294 636.6,294 639.6,303 636.6,312" fill="#e3b8f5"/><text x="549.6" y="306.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">…040 – …0FF</text><polygon points="642.6,312 639.6,303 642.6,294 816.6,294 819.6,303 816.6,312" fill="#f5b8b8"/><text x="729.6" y="306.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">…100 – …1FF</text><polygon points="822.6,312 819.6,303 822.6,294 996.6,294 999.6,303 996.6,312" fill="#d0d0f5"/><text x="909.6" y="306.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">…200 – …23F</text><polygon points="1002.6,312 999.6,303 1002.6,294 1107.6,294 1107.6,312" fill="url(#wved7914h)"/></g><path d="M28,81 H24 V135 H28" stroke="var(--wave-fg, #222)" stroke-width="1.2" fill="none"/><text x="16" y="112" font-size="11" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" transform="rotate(-90 16 108)">вход MRd</text><path d="M28,156 H24 V240 H28" stroke="var(--wave-fg, #222)" stroke-width="1.2" fill="none"/><text x="16" y="202" font-size="11" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" transform="rotate(-90 16 198)">выход CplD (tlp_axis)</text><g stroke="var(--wave-edge, #2a6fb0)" stroke-width="1.2" fill="none"><path d="M173.1,93 C317.1,93 317.1,168 461.1,168" marker-end="url(#wved7914a)"/><rect x="286.7" y="132" width="60.8" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="317.1" y="142" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">8 тактов</text></g><text x="621.6" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">tb_completer: MRd 512 B (Length=128) по адресу …040h, MPS = 256 B</text><text x="621.6" y="334" font-size="12" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">первый CplD доходит до границы MPS (…100h); LA младших 7 бит адреса; «|» скрывает такты</text></svg>
+<figcaption>Рис. 7.6. Ответ hostmem_completer на MRd 512 B по адресу …040h (<code>docs/wave/ch7_completer_512.json</code>). От приёма заголовка MRd до первого такта CplD проходит 8 тактов (измерено: заголовок принят в такте 11, CplD выставлен в такте 19). Бюджет из <code>ARCHITECTURE.md</code> §8 — не более 12. Дальше три CplD идут без единого пустого такта.</figcaption>
+</figure>
+
+<p>Это легко проверить по логу. 64 запроса × 35 тактов = 2240 тактов. Первые 20 тактов (заполнение конвейера) тест исключает, остаётся 2220. Лог показывает <code>THROUGHPUT 64 x 512 B @0x..040, MPS 256: 2220 beats in 2220 cycles = 1.0000 beats/cycle, intra-packet gaps=0</code>. Для адреса …044h картина другая: 2284 такта данных за 2347 тактов (0,9732). Лишние 63 такта — это примерно один такт на запрос. Его тратит <code>dw_shift</code>, сбрасывая (flush) хвост, когда адрес не выровнен на 16 байт. На корректность это не влияет. Тест не скрывает цену невыровненности, а измеряет её.</p>
+
+<h3>7.6.3. Все модульные тесты</h3>
+
+<table>
+<caption>Табл. 7.11. Модульные тесты проекта (<code>sim/tb/tb_*.sv</code>), их проверки и измеренные значения</caption>
+<tr><th>Тест</th><th>DUT</th><th>Что проверяет</th><th>Ключевые числа последнего прогона</th></tr>
+<tr><td>tb_common</td><td>axis_skid, axis_fifo_sync/async, sdp_ram, timer_ms</td><td>Случайный трафик против тривиального эталона; полная скорость цепочки</td><td>20 000 beat'ов; окно полной скорости 9882 beat'а за 9882 такта; 28 351 проверка RAM</td></tr>
+<tr><td>tb_dw_shift</td><td>dw_shift</td><td>320 направленных пакетов (длина 1…40 DW × сдвиги 0…3 влево/вправо), 4 режима рукопожатия; сдвиг читается только с первым beat'ом</td><td>PERF: 1500 пакетов за 8591 входной такт — ровно как предсказано</td></tr>
+<tr><td>tb_rx_adapt</td><td>pcie7x_rx_adapt</td><td>Случайные TLP: MRd/MWr 32/64, CplD, Msg, 1024 DW при Length = 0, TD-дайджест; SOF DW0/DW2, straddle, мусор в линиях и tkeep; tuser</td><td>16 753 такта ядра, 1189 straddle, 1790 SOF@DW2; PERF: 3585 beat'ов на входе и выходе за 3586 тактов</td></tr>
+<tr><td>tb_tx_adapt</td><td>pcie7x_tx_adapt</td><td>Упаковка {H0, H1, H2, [H3], bswap(payload)}; tkeep; tlast; tvalid без разрывов; стабильность при стойках</td><td>PERF: 14 492 такта, 0 пузырей; поток CplD (3DW + 64 DW): 3383 такта без простоя</td></tr>
+<tr><td>tb_demux_arb</td><td>tlp_rx_demux, tlp_tx_arb</td><td>Маршрутизация по Fmt/Type, отбрасывание и счётчик; арбитр: пакеты не перемешиваются, справедливость, нет пузырей</td><td>Cpl 810, MRd 757, MWr 708, отброшено 1025; арбитр: 2062 beat'а за 2062 такта</td></tr>
+<tr><td>tb_completer</td><td>hostmem_completer</td><td>Разбиение по MPS, BC, LA, UR для неизвестных адресов, данные, стабильность AXI, <code>np_backpressure</code>; MPS 128…1024</td><td>Латентность 8 тактов; 1,0000 beat/такт (выровнено); 6034 запроса, 12 743 CplD, 334 UR</td></tr>
+<tr><td>tb_writer</td><td>hostmem_writer + hostmem_rams + мультиплексор prp_synth</td><td>Запись по byte enable со сдвигом DW, CQE по 8+8 B и по 1…3 CQE в MWr, отбрасывание отравленных и чужих; очистка CQ; мультиплексор чтения</td><td>1321 MWr (83 отброшено), 5167 beat'ов памяти, 3632 чтения мультиплексора</td></tr>
+<tr><td>tb_prp_synth</td><td>prp_synth</td><td>Формула <code>DATA_BASE + k·SLOT_BYTES + (j+1)·4096</code>, задержка 2 такта, два размера кольца</td><td>15 938 beat'ов, 0 ошибок</td></tr>
+<tr><td>tb_data_ring</td><td>data_ring</td><td>Два несвязанных тактовых домена (7 и 8 нс); стоп источника при полном кольце; порядок освобождения слотов; поток в установившемся режиме</td><td>31 806 beat'ов, 36 416 проверенных чтений, 16 528 тактов стойки источника</td></tr>
+<tr><td>tb_req_mux</td><td>req_mux</td><td>Строгое чередование при насыщении, отсутствие голодания, ответ — только владельцу</td><td>Насыщение: 67 / 66 команд</td></tr>
+<tr><td>tb_link_bringup</td><td>link_bringup</td><td>Удержание PERST#, порядок sys_rst_n → perst_n, ожидание Gen2 (поздний, никогда, только Gen1), падение линка</td><td>6 сценариев; link_ready через 7,04 мкс при допуске 7,00…7,10</td></tr>
+<tr><td>tb_rp_cfg_init</td><td>rp_cfg_init</td><td>Порядок и BE записей cfg_mgmt, удержание enable до done, read-modify-write DevCtl</td><td>DevCtl 2810h → 2930h (MPS = 1, ETE = 1)</td></tr>
+<tr><td>tb_enum</td><td>rp_requester + req_mux + pcie_enum</td><td>5 позитивных прогонов (CRS 0/5/случайно, параллельные doorbell'ы, чужие completion) и 8 негативных</td><td>Петля capabilities → <code>fail step 5</code>; CRS без конца → <code>step 1</code></td></tr>
+<tr><td>tb_nvme_admin</td><td>nvme_admin (поведенческие RAM)</td><td>T1–T10: полная инициализация, DSTRD = 2 и LBADS = 12, ошибка CQE, CSS, тайм-аут RDY, CFS, плохие SQES, SHST, MS ≠ 0, тайм-аут команды</td><td>Коды отказа 22h, 03h, 0Ah, 0Bh, 10h, 11h, 41h — как ожидалось</td></tr>
+<tr><td>tb_admin_rams</td><td>nvme_admin + настоящие hostmem_rams</td><td>Те же T1–T10 через реальные RAM и автомат очистки CQ</td><td>Совпадает с tb_nvme_admin</td></tr>
+<tr><td>tb_write_engine</td><td>nvme_write_engine</td><td>4 параллельных стенда: H0 — 600 команд, CQE не по порядку, ошибки; H1 — переполнение SQ; H2 — защита диапазона LBA; H3 — гонка освобождения слота</td><td>H0: 600 команд, 35 ошибок; H1: в полёте не более 63 = IO_QSIZE − 1</td></tr>
+<tr><td>tb_host_sequencer</td><td>host_sequencer</td><td>S1–S6: полный цикл, отказы enum и admin, потеря линка в RUN, стоп до инициализации, перезапуск</td><td>6 сценариев</td></tr>
+</table>
+
+<h3>7.6.4. Мутационная проверка тестов</h3>
+
+<p>Негативные прогоны tb_models проверяют модели. Сами модульные тесты проверяются <b>мутациями</b> (mutation testing): в RTL намеренно вносится маленькая правдоподобная ошибка, и тест должен упасть. Если после мутации тест зелёный, в нём дыра. Табл. 7.12 — набор мутаций, которые стоит проделать руками (по одной, с откатом). В правой колонке — проверка, которая обязана сработать.</p>
+
+<table>
+<caption>Табл. 7.12. Мутации RTL и ожидаемая реакция тестов (упражнение)</caption>
+<tr><th>Мутация</th><th>Модуль</th><th>Должен упасть / проверка</th></tr>
+<tr><td>Byte Count = длина текущего CplD вместо остатка</td><td>hostmem_completer</td><td>tb_completer «BC … exp …»; tb_top: D-6</td></tr>
+<tr><td>Первый CplD режется по MPS от начала запроса, а не по адресу</td><td>hostmem_completer</td><td>tb_completer «split: …»; tb_top: D-8 при невыровненных MRd</td></tr>
+<tr><td>Не переставлять байты payload (<code>bswap32</code>)</td><td>pcie7x_tx_adapt</td><td>tb_tx_adapt; tb_top T-1</td></tr>
+<tr><td>Игнорировать straddle (смотреть только SOF в DW0)</td><td>pcie7x_rx_adapt</td><td>tb_rx_adapt; tb_top с <code>+straddle</code></td></tr>
+<tr><td>Не инвертировать ожидаемую фазу на обороте CQ</td><td>nvme_write_engine</td><td>tb_write_engine (H0 оборачивает CQ более 9 раз); tb_top T-2</td></tr>
+<tr><td>Не записывать BME Root Port'а</td><td>rp_cfg_init</td><td>tb_rp_cfg_init; tb_top T-6 и D-2</td></tr>
+<tr><td>Писать CQE без учёта byte enable</td><td>hostmem_writer</td><td>tb_writer (CQE 8 + 8); tb_top с <code>+cqesplit</code></td></tr>
+<tr><td>Освобождать слот по CQE, не дожидаясь <code>slot_full</code></td><td>nvme_write_engine</td><td>tb_write_engine H3 (гонка освобождения)</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s7">7.7. Системный тест tb_top</h2>
+
+<p><code>sim/tb/tb_top.sv</code> соединяет весь <code>nvme_host_core</code> с двумя моделями (рис. 7.2). Параметры DUT уменьшены для скорости: 4 слота по 16 KiB (одна команда = 32 LBA по 512 B), <code>SIM_FAST = 1</code> (миллисекундные таймеры становятся микросекундными), <code>REQ_TIMEOUT_CYCLES = 20 000</code>. Это не мешает проверке: кольцо по-прежнему оборачивается, очереди заполняются, а каждая команда использует PRP-список (4 страницы — PRP1 и список из 3 элементов).</p>
+
+<h3>7.7.1. Сценарий по шагам</h3>
+
+<p>Времена взяты из лога базового прогона без ключей.</p>
+<ol>
+<li><b>t = 0.</b> Разбор plusargs и установка ручек моделей. <code>sys_rst_n = 0</code>.</li>
+<li><b>1 мкс.</b> Отпускается <code>sys_rst_n</code>, затем <code>data_rst</code> (через 20 тактов data_clk). Сразу выставляется <code>ctrl_start = 1</code>: хост ждёт линк сам.</li>
+<li><b>Линк.</b> Модель ядра поднимает <code>user_lnk_up</code> через 500 тактов, а Gen2 — ещё через 300. Через 100 тактов после этого тестбенч выставляет <code>link_ready = 1</code>, <code>link_gen2 = 1</code>, <code>link_width = 2</code>. Здесь тестбенч заменяет собой <code>link_bringup</code>, у которого свой тест. Лог: <code>[tb_top @8260000] link_ready asserted (LTSSM 16, Gen2 x4)</code>.</li>
+<li><b>ENUM.</b> Два CRS, затем нумерация. SSD запоминает свой номер: <code>captured bus/device number: BDF = 0100</code> (11,56 мкс).</li>
+<li><b>RPCFG.</b> Через cfg_mgmt записываются Command = 0006h и DevCtl.MPS Root Port'а.</li>
+<li><b>ADMIN_INIT.</b> CAP, CC, AQA/ASQ/ACQ, CC.EN; <code>CSTS.RDY=1</code> на 18,86 мкс. Identify ×2, Set Features, Create CQ (31,72 мкс), Create SQ (33,59 мкс).</li>
+<li><b>RUN</b> с 33,72 мкс. Источник отдаёт 65 536 beat'ов по 16 B; хост подаёт 64 команды Write. Источник заканчивает на 672,9 мкс.</li>
+<li><b>Стоп.</b> Через 200 тактов <code>ctrl_stop = 1</code>: DRAIN → FLUSH (Flush с CID 255 на 689,7 мкс) → SHUTDOWN (Delete SQ, Delete CQ, CC.SHN) → <code>CSTS.SHST=10b</code> на 697,4 мкс → DONE.</li>
+<li><b>Проверки</b> <code>final_checks</code> и сводка: ядро передало 7868 TLP и приняло 4048; SSD выдал 3914 MRd, получил 7686 CplD, записал 104 MWr (72 CQE + 32 MWr данных Identify по 256 B) и выполнил 64 Write.</li>
+</ol>
+
+<h3>7.7.2. Что проверяется</h3>
+
+<table>
+<caption>Табл. 7.13. Проверки tb_top</caption>
+<tr><th>ID</th><th>Проверка</th><th>Откуда данные</th></tr>
+<tr><td>T-1</td><td><code>check_range(0, 2048, ref_mem) == 0</code>: все 1 048 576 байт на месте; в <code>lba_mem</code> ровно 2048 LBA</td><td>ref_mem, lba_mem</td></tr>
+<tr><td>T-2</td><td><code>stat_bytes_done</code> = 1 MiB, <code>stat_cmds_done</code> = 64 (при <code>+inject_err</code> — на одну команду меньше); SSD выполнил 64 Write</td><td>stat_* DUT, счётчики SSD</td></tr>
+<tr><td>T-3</td><td><code>stat_cmd_errors</code> = 0 (при <code>+inject_err</code> = 1 и <code>stat_last_status</code> = внесённому статусу), <code>status_error</code> = 0</td><td>stat_*, status_*</td></tr>
+<tr><td>T-4</td><td>Секвенсор прошёл состояния 0 → 9 строго по порядку: IDLE, LINK, ENUM, RPCFG, ADMIN_INIT, RUN, DRAIN, FLUSH, SHUTDOWN, DONE</td><td>трасса <code>status_seq_state</code></td></tr>
+<tr><td>T-5</td><td>Нумерация глазами SSD: запись всех единиц в BAR0, BAR0 = C000_0000h, BAR1 = 0, DevCtl: MPS = 1, MRRS = 2, ETE = 1; Command = 0406h</td><td>ev_log, cfg SSD</td></tr>
+<tr><td>T-6</td><td>Root Port: Command = 0006h, DevCtl.MPS = 1</td><td>cfg_mgmt модели ядра</td></tr>
+<tr><td>T-7</td><td>Порядок инициализации NVMe: AQA = 001F_001Fh, ASQ, ACQ (и их старшие половины) записаны до CC = 0046_0001h; admin-команды ровно 06h (CNS 1), 06h (CNS 0), 09h (FID 7), 05h, 01h, …, 00h, 04h</td><td>ev_log</td></tr>
+<tr><td>T-8</td><td>Shutdown: ровно один Flush, после последнего Write; Delete SQ после Flush; CC.SHN = 01b после Delete CQ; затем чтение CSTS с SHST = 10b</td><td>ev_log</td></tr>
+<tr><td>T-9</td><td>Ни одной ошибки в моделях: <code>u_core.err_count == 0</code>, <code>u_ssd.err_count == 0</code></td><td>счётчики моделей</td></tr>
+</table>
+
+<p>Обратите внимание: T-5…T-8 проверяют <b>последовательность</b>, а не только результат. Хост, который включил контроллер до записи ASQ, мог бы «повезти» с моделью, если та читает ASQ лениво. Журнал событий <code>ev_log</code> позволяет поймать такой хост независимо от того, повезло ему или нет.</p>
+
+<h3>7.7.3. Plusargs и варианты прогона</h3>
+
+<table>
+<caption>Табл. 7.14. Варианты tb_top и их результаты</caption>
+<tr><th>Ключ</th><th>Что меняет</th><th>Результат</th></tr>
+<tr><td>(нет)</td><td>Ручки по умолчанию, <code>tready</code> всегда 1</td><td>PASS; valid-beat ratio 0,914; ≈ 1608 MB/s</td></tr>
+<tr><td><code>+straddle</code></td><td>straddle 50 %, SOF@DW2 25 %, паузы RX 5 %</td><td>PASS; 0,923</td></tr>
+<tr><td><code>+txstall20</code></td><td><code>tx_stall_pct = 20</code></td><td>PASS; valid 0,992, принято 0,794 beat/такт; ≈ 1396 MB/s</td></tr>
+<tr><td><code>+cqesplit</code></td><td>CQE split 50 % и coalescing 50 %</td><td>PASS; 0,914; TLP ядра: 7929 TX / 4143 RX</td></tr>
+<tr><td><code>+stress</code></td><td>straddle + txstall 10 % + cqesplit + паузы между MRd</td><td>PASS; valid 0,994, принято 0,895; 44 straddle, 1060 SOF@DW2</td></tr>
+<tr><td><code>+inject_err</code></td><td>Write № 10 получает статус 4280h</td><td>PASS; <code>stat_cmd_errors = 1</code>, 63 команды, 1 032 192 B</td></tr>
+<tr><td><code>+nobme</code></td><td>Негативный: <code>force_bme_off = 1</code></td><td>PASS, если модели сообщили об ошибке: UR на первую выборку SQE (MRd 64 B @ 1000_0000h, 19,68 мкс) → D-2</td></tr>
+<tr><td><code>+verbose</code></td><td>Модели печатают каждую TLP</td><td>Для отладки; лог огромный</td></tr>
+</table>
+
+<p>Почему в <code>+stress</code> так мало straddle (44) и так много SOF@DW2 (1060)? Straddle возможен, только если пакет закончился в DW0 или DW1, а следующий <b>уже ждёт</b>. В tb_top RX-трафик — это в основном одиночные MRd из 3 DW. Начатый с DW0, такой MRd кончается в DW2, и straddle невозможен. Поэтому плотное покрытие straddle даёт модульный tb_rx_adapt (1189 straddle), а tb_top проверяет, что редкие straddle не ломают систему. Это хороший пример того, почему ручка «50 %» ещё не означает «50 % случаев»: <b>покрытие нужно измерять, а не предполагать</b>. Для этого модель и считает <code>n_straddles</code> и <code>n_sof_dw2</code>.</p>
+
+<div class="box"><span class="t">Из практики: тест тоже ошибается</span> Первый прогон <code>+inject_err</code> упал: <code>T-2: stat_bytes_done = 1032192, expected 1048576</code>. RTL был прав. По контракту <code>nvme_write_engine</code> считает в <code>stat_bytes_done</code> только <b>успешные</b> команды, а тест ожидал полный мегабайт. Исправили ожидание в тесте и записали правило в его заголовок. Мораль: при падении сначала сверяйте ожидание с контрактом в <code>ARCHITECTURE.md</code>, а потом правьте RTL.</div>
+
+<h3>7.7.4. Метрика valid-beat ratio и почему 0,914 — предел источника</h3>
+
+<p>Тестбенч на каждом такте <code>user_clk</code> накапливает два счётчика: <code>vcnt</code> — такты с <code>s_axis_tx_tvalid = 1</code>, и <code>bcnt</code> — такты с <code>tvalid && tready</code>. Окно измерения — от первого до последнего CplD <b>данных</b>, принятого ядром. Эти моменты модель SSD берёт из полей <code>acc_cycle</code> TLP. Так исключаются инициализация и shutdown. Метрики:</p>
+<ul>
+<li><b>valid-beat ratio</b> = Δvcnt / Δтактов — доля тактов, когда DUT <b>предлагал</b> данные;</li>
+<li><b>accepted beats/cycle</b> = Δbcnt / Δтактов — доля тактов, когда данные реально ушли.</li>
+</ul>
+
+<figure class="wave">
+<svg xmlns="http://www.w3.org/2000/svg" width="754.2" height="273" viewBox="0 0 754.2 273" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wv509682h" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wv509682a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker></defs><path d="M144.8,48 V243 M190.8,48 V243 M236.8,48 V243 M282.8,48 V243 M328.8,48 V243 M374.8,48 V243 M420.8,48 V243 M466.8,48 V243 M512.8,48 V243 M558.8,48 V243 M604.8,48 V243 M650.8,48 V243 M696.8,48 V243 M742.8,48 V243" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="167.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">0</text><text x="213.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">1</text><text x="259.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">2</text><text x="305.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">3</text><text x="351.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">4</text><text x="397.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">5</text><text x="443.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">6</text><text x="489.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">7</text><text x="535.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">8</text><text x="581.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">9</text><text x="627.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">10</text><text x="673.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">11</text><text x="719.8" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none">12</text><text x="136.8" y="67.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">user_clk</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M144.8,72 L147.8,54 L167.8,54 L170.8,72 L190.8,72 M190.8,72 L193.8,54 L213.8,54 L216.8,72 L236.8,72 M236.8,72 L239.8,54 L259.8,54 L262.8,72 L282.8,72 M282.8,72 L285.8,54 L305.8,54 L308.8,72 L328.8,72 M328.8,72 L331.8,54 L351.8,54 L354.8,72 L374.8,72 M374.8,72 L377.8,54 L397.8,54 L400.8,72 L420.8,72 M420.8,72 L423.8,54 L443.8,54 L446.8,72 L466.8,72 M466.8,72 L469.8,54 L489.8,54 L492.8,72 L512.8,72 M512.8,72 L515.8,54 L535.8,54 L538.8,72 L558.8,72 M558.8,72 L561.8,54 L581.8,54 L584.8,72 L604.8,72 M604.8,72 L607.8,54 L627.8,54 L630.8,72 L650.8,72 M650.8,72 L653.8,54 L673.8,54 L676.8,72 L696.8,72 M696.8,72 L699.8,54 L719.8,54 L722.8,72 L742.8,72" fill="none"/></g><text x="136.8" y="97.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_axis_tx_tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M144.8,102 L190.8,102 M190.8,102 L193.8,84 L650.8,84 M650.8,84 L653.8,102 L742.8,102" fill="none"/></g><text x="136.8" y="127.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_axis_tx_tready</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M144.8,114 L282.8,114 M282.8,114 L285.8,132 L374.8,132 M374.8,132 L377.8,114 L466.8,114 M466.8,114 L469.8,132 L558.8,132 M558.8,132 L561.8,114 L742.8,114" fill="none"/></g><text x="136.8" y="157.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_axis_tx_tdata</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="144.8,162 144.8,144 187.8,144 190.8,153 187.8,162" fill="url(#wv509682h)"/><polygon points="193.8,162 190.8,153 193.8,144 233.8,144 236.8,153 233.8,162" fill="#ffd7a8"/><text x="213.8" y="156.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">B0</text><polygon points="239.8,162 236.8,153 239.8,144 279.8,144 282.8,153 279.8,162" fill="#a8d4ff"/><text x="259.8" y="156.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">B1</text><polygon points="285.8,162 282.8,153 285.8,144 417.8,144 420.8,153 417.8,162" fill="#a8f0ee"/><text x="351.8" y="156.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">B2</text><polygon points="423.8,162 420.8,153 423.8,144 463.8,144 466.8,153 463.8,162" fill="#bff0a8"/><text x="443.8" y="156.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">B3</text><polygon points="469.8,162 466.8,153 469.8,144 601.8,144 604.8,153 601.8,162" fill="#e3b8f5"/><text x="535.8" y="156.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">B4</text><polygon points="607.8,162 604.8,153 607.8,144 647.8,144 650.8,153 647.8,162" fill="#f5b8b8"/><text x="627.8" y="156.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">B5</text><polygon points="653.8,162 650.8,153 653.8,144 742.8,144 742.8,162" fill="url(#wv509682h)"/></g><text x="136.8" y="202.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">vcnt (tvalid)</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="144.8,207 144.8,189 187.8,189 190.8,198 187.8,207" fill="#e4e4e4"/><text x="167.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">0</text><polygon points="193.8,207 190.8,198 193.8,189 233.8,189 236.8,198 233.8,207" fill="#e4e4e4"/><text x="213.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">1</text><polygon points="239.8,207 236.8,198 239.8,189 279.8,189 282.8,198 279.8,207" fill="#e4e4e4"/><text x="259.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">2</text><polygon points="285.8,207 282.8,198 285.8,189 325.8,189 328.8,198 325.8,207" fill="#e4e4e4"/><text x="305.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">3</text><polygon points="331.8,207 328.8,198 331.8,189 371.8,189 374.8,198 371.8,207" fill="#e4e4e4"/><text x="351.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">4</text><polygon points="377.8,207 374.8,198 377.8,189 417.8,189 420.8,198 417.8,207" fill="#e4e4e4"/><text x="397.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">5</text><polygon points="423.8,207 420.8,198 423.8,189 463.8,189 466.8,198 463.8,207" fill="#e4e4e4"/><text x="443.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">6</text><polygon points="469.8,207 466.8,198 469.8,189 509.8,189 512.8,198 509.8,207" fill="#e4e4e4"/><text x="489.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">7</text><polygon points="515.8,207 512.8,198 515.8,189 555.8,189 558.8,198 555.8,207" fill="#e4e4e4"/><text x="535.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">8</text><polygon points="561.8,207 558.8,198 561.8,189 601.8,189 604.8,198 601.8,207" fill="#e4e4e4"/><text x="581.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">9</text><polygon points="607.8,207 604.8,198 607.8,189 647.8,189 650.8,198 647.8,207" fill="#e4e4e4"/><text x="627.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">10</text><polygon points="653.8,207 650.8,198 653.8,189 693.8,189 696.8,198 693.8,207" fill="#e4e4e4"/><text x="673.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">10</text><polygon points="699.8,207 696.8,198 699.8,189 742.8,189 742.8,207" fill="#e4e4e4"/><text x="719.8" y="201.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">10</text></g><text x="136.8" y="232.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">bcnt (принято)</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="144.8,237 144.8,219 187.8,219 190.8,228 187.8,237" fill="#e4e4e4"/><text x="167.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">0</text><polygon points="193.8,237 190.8,228 193.8,219 233.8,219 236.8,228 233.8,237" fill="#e4e4e4"/><text x="213.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">1</text><polygon points="239.8,237 236.8,228 239.8,219 279.8,219 282.8,228 279.8,237" fill="#e4e4e4"/><text x="259.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">2</text><polygon points="285.8,237 282.8,228 285.8,219 325.8,219 328.8,228 325.8,237" fill="#e4e4e4"/><text x="305.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">2</text><polygon points="331.8,237 328.8,228 331.8,219 371.8,219 374.8,228 371.8,237" fill="#e4e4e4"/><text x="351.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">2</text><polygon points="377.8,237 374.8,228 377.8,219 417.8,219 420.8,228 417.8,237" fill="#e4e4e4"/><text x="397.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">3</text><polygon points="423.8,237 420.8,228 423.8,219 463.8,219 466.8,228 463.8,237" fill="#e4e4e4"/><text x="443.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">4</text><polygon points="469.8,237 466.8,228 469.8,219 509.8,219 512.8,228 509.8,237" fill="#e4e4e4"/><text x="489.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">4</text><polygon points="515.8,237 512.8,228 515.8,219 555.8,219 558.8,228 555.8,237" fill="#e4e4e4"/><text x="535.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">4</text><polygon points="561.8,237 558.8,228 561.8,219 601.8,219 604.8,228 601.8,237" fill="#e4e4e4"/><text x="581.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">5</text><polygon points="607.8,237 604.8,228 607.8,219 647.8,219 650.8,228 647.8,237" fill="#e4e4e4"/><text x="627.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">6</text><polygon points="653.8,237 650.8,228 653.8,219 693.8,219 696.8,228 693.8,237" fill="#e4e4e4"/><text x="673.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">6</text><polygon points="699.8,237 696.8,228 699.8,219 742.8,219 742.8,237" fill="#e4e4e4"/><text x="719.8" y="231.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">6</text></g><g stroke="var(--wave-edge, #2a6fb0)" stroke-width="1.2" fill="none"><path d="M284.3,123 C330.3,123 330.3,123 376.3,123" marker-end="url(#wv509682a)"/><rect x="290" y="105" width="80.6" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="330.3" y="115" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">B2 держится</text></g><text x="443.8" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">Две метрики tb_top при стойках tready (такты 1…10)</text><text x="443.8" y="259" font-size="12" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">valid-beat ratio = 10/10 = 1,0; accepted beats/cycle = 6/10 = 0,6 = (1 − 4/10) × 1,0</text></svg>
+<figcaption>Рис. 7.7. Разница двух метрик (<code>docs/wave/ch7_valid_vs_accepted.json</code>). При стойке ядра (<code>tready = 0</code>) DUT держит beat: valid засчитывается, а передача — нет. Поэтому при <code>+txstall20</code> valid = 0,992, а принято 0,794 ≈ 0,8 × 0,992.</figcaption>
+</figure>
+
+<p>Почему без стоек получается именно 0,914, а не 1,0? Посмотрим на источник. Он выдаёт 16 B на такт 100 МГц, то есть 1,6 ГБ/с. Шина TX ядра — 16 B на такт 125 МГц, 2,0 ГБ/с. Одни только данные займут не больше 1,6 / 2,0 = 0,80 тактов шины. Остальное — заголовки CplD и служебные TLP. Оценим их долю по сводке:</p>
+<ul>
+<li>За окно ушло 7686 CplD на ≈ 1 MiB данных. Средний CplD несёт ≈ 136 B, потому что SSD читает кусками случайного размера 64…512 B, а completer режет их по границам MPS.</li>
+<li>В формате ядра 3DW-заголовок и данные идут подряд. CplD с 34 DW данных занимает (3 + 34) / 4 ≈ 9,3 такта, а с округлением до целого такта — в среднем ≈ 9,6 при 8,5 тактах чистых данных. Накладные расходы ≈ 13 %.</li>
+<li>0,80 × 1,13 ≈ 0,90; ещё ≈ 1 % добавляют doorbell'ы, CplD для SQE и PRP. Получается ≈ 0,91, что совпадает с измерением.</li>
+</ul>
+
+<p>Значит, DUT передаёт ровно столько, сколько получает от источника, и ещё простаивает: SSD выбирает данные слота быстрее, чем источник его заполняет, и ждёт следующего (рис. 7.8). Что узкое место — источник, а не DUT, доказывают варианты со стойками. При <code>+txstall20</code> valid = 0,992: когда ядро тормозит, у DUT <b>почти всегда</b> готов следующий beat. Будь DUT медленнее источника, valid не поднялся бы выше 0,914.</p>
+
+<figure class="wave">
+<svg xmlns="http://www.w3.org/2000/svg" width="1172.8" height="274" viewBox="0 0 1172.8 274" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wv36a11fh" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wv36a11fa" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker><mask id="wv36a11fm0" maskUnits="userSpaceOnUse" x="144.8" y="34" width="1020" height="30"><rect x="144.8" y="34" width="1020" height="30" fill="#fff"/><polygon points="597.8,64 603.8,64 609.8,34 603.8,34" fill="#000"/></mask><mask id="wv36a11fm1" maskUnits="userSpaceOnUse" x="144.8" y="64" width="1020" height="30"><rect x="144.8" y="64" width="1020" height="30" fill="#fff"/><polygon points="597.8,94 603.8,94 609.8,64 603.8,64" fill="#000"/></mask><mask id="wv36a11fm3" maskUnits="userSpaceOnUse" x="144.8" y="109" width="1020" height="30"><rect x="144.8" y="109" width="1020" height="30" fill="#fff"/><polygon points="597.8,139 603.8,139 609.8,109 603.8,109" fill="#000"/></mask><mask id="wv36a11fm4" maskUnits="userSpaceOnUse" x="144.8" y="139" width="1020" height="30"><rect x="144.8" y="139" width="1020" height="30" fill="#fff"/><polygon points="597.8,169 603.8,169 609.8,139 603.8,139" fill="#000"/></mask><mask id="wv36a11fm5" maskUnits="userSpaceOnUse" x="144.8" y="169" width="1020" height="30"><rect x="144.8" y="169" width="1020" height="30" fill="#fff"/><polygon points="597.8,199 603.8,199 609.8,169 603.8,169" fill="#000"/></mask><mask id="wv36a11fm7" maskUnits="userSpaceOnUse" x="144.8" y="214" width="1020" height="30"><rect x="144.8" y="214" width="1020" height="30" fill="#fff"/><polygon points="597.8,244 603.8,244 609.8,214 603.8,214" fill="#000"/></mask></defs><path d="M144.8,34 V244 M178.8,34 V244 M212.8,34 V244 M246.8,34 V244 M280.8,34 V244 M314.8,34 V244 M348.8,34 V244 M382.8,34 V244 M416.8,34 V244 M450.8,34 V244 M484.8,34 V244 M518.8,34 V244 M552.8,34 V244 M586.8,34 V244 M620.8,34 V244 M654.8,34 V244 M688.8,34 V244 M722.8,34 V244 M756.8,34 V244 M790.8,34 V244 M824.8,34 V244 M858.8,34 V244 M892.8,34 V244 M926.8,34 V244 M960.8,34 V244 M994.8,34 V244 M1028.8,34 V244 M1062.8,34 V244 M1096.8,34 V244 M1130.8,34 V244 M1164.8,34 V244" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="136.8" y="53.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_data (100 МГц)</text><g mask="url(#wv36a11fm0)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="144.8,58 144.8,40 1164.8,40 1164.8,58" fill="#d0d0f5"/><text x="654.8" y="52.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">источник: 16 B на такт data_clk без пауз = 1,6 ГБ/с</text></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M597.8,61 L603.8,37"/><path d="M603.8,61 L609.8,37"/></g><text x="136.8" y="83.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">слот заполнен</text><g mask="url(#wv36a11fm1)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M144.8,88 L178.8,88 M178.8,88 L181.8,70 L212.8,70 M212.8,70 L215.8,88 L858.8,88 M858.8,88 L861.8,70 L892.8,70 M892.8,70 L895.8,88 L1164.8,88" fill="none"/></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M597.8,91 L603.8,67"/><path d="M603.8,91 L609.8,67"/></g><text x="136.8" y="128.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">TX (FPGA→SSD)</text><g mask="url(#wv36a11fm3)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="144.8,133 144.8,115 209.8,115 212.8,124 209.8,133" fill="url(#wv36a11fh)"/><polygon points="215.8,133 212.8,124 215.8,115 243.8,115 246.8,124 243.8,133" fill="#fff3a8"/><text x="229.8" y="127.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">DB</text><polygon points="249.8,133 246.8,124 249.8,115 277.8,115 280.8,124 277.8,133" fill="url(#wv36a11fh)"/><polygon points="283.8,133 280.8,124 283.8,115 311.8,115 314.8,124 311.8,133" fill="#a8d4ff"/><text x="297.8" y="127.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">SQE</text><polygon points="317.8,133 314.8,124 317.8,115 345.8,115 348.8,124 345.8,133" fill="url(#wv36a11fh)"/><polygon points="351.8,133 348.8,124 351.8,115 379.8,115 382.8,124 379.8,133" fill="#a8f0ee"/><text x="365.8" y="127.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">PRP</text><polygon points="385.8,133 382.8,124 385.8,115 413.8,115 416.8,124 413.8,133" fill="url(#wv36a11fh)"/><polygon points="419.8,133 416.8,124 419.8,115 685.8,115 688.8,124 685.8,133" fill="#bff0a8"/><text x="552.8" y="127.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">CplD данных подряд</text><polygon points="691.8,133 688.8,124 691.8,115 753.8,115 756.8,124 753.8,133" fill="url(#wv36a11fh)"/><polygon points="759.8,133 756.8,124 759.8,115 787.8,115 790.8,124 787.8,133" fill="#fff3a8"/><text x="773.8" y="127.27" font-size="9.33" text-anchor="middle" fill="#222" stroke="none">DB CQ</text><polygon points="793.8,133 790.8,124 793.8,115 889.8,115 892.8,124 889.8,133" fill="url(#wv36a11fh)"/><polygon points="895.8,133 892.8,124 895.8,115 923.8,115 926.8,124 923.8,133" fill="#fff3a8"/><text x="909.8" y="127.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">DB</text><polygon points="929.8,133 926.8,124 929.8,115 957.8,115 960.8,124 957.8,133" fill="url(#wv36a11fh)"/><polygon points="963.8,133 960.8,124 963.8,115 991.8,115 994.8,124 991.8,133" fill="#a8d4ff"/><text x="977.8" y="127.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">SQE</text><polygon points="997.8,133 994.8,124 997.8,115 1025.8,115 1028.8,124 1025.8,133" fill="url(#wv36a11fh)"/><polygon points="1031.8,133 1028.8,124 1031.8,115 1059.8,115 1062.8,124 1059.8,133" fill="#a8f0ee"/><text x="1045.8" y="127.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">PRP</text><polygon points="1065.8,133 1062.8,124 1065.8,115 1093.8,115 1096.8,124 1093.8,133" fill="url(#wv36a11fh)"/><polygon points="1099.8,133 1096.8,124 1099.8,115 1164.8,115 1164.8,133" fill="#bff0a8"/><text x="1130.8" y="127.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">CplD …</text></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M597.8,136 L603.8,112"/><path d="M603.8,136 L609.8,112"/></g><text x="136.8" y="158.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">RX (SSD→FPGA)</text><g mask="url(#wv36a11fm4)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="144.8,163 144.8,145 243.8,145 246.8,154 243.8,163" fill="url(#wv36a11fh)"/><polygon points="249.8,163 246.8,154 249.8,145 277.8,145 280.8,154 277.8,163" fill="#a8d4ff"/><text x="263.8" y="157.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">SQE</text><polygon points="283.8,163 280.8,154 283.8,145 311.8,145 314.8,154 311.8,163" fill="url(#wv36a11fh)"/><polygon points="317.8,163 314.8,154 317.8,145 345.8,145 348.8,154 345.8,163" fill="#a8f0ee"/><text x="331.8" y="157.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">PRP</text><polygon points="351.8,163 348.8,154 351.8,145 379.8,145 382.8,154 379.8,163" fill="url(#wv36a11fh)"/><polygon points="385.8,163 382.8,154 385.8,145 617.8,145 620.8,154 617.8,163" fill="#bff0a8"/><text x="501.8" y="157.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MRd данных, ≤16 в полёте</text><polygon points="623.8,163 620.8,154 623.8,145 719.8,145 722.8,154 719.8,163" fill="url(#wv36a11fh)"/><polygon points="725.8,163 722.8,154 725.8,145 753.8,145 756.8,154 753.8,163" fill="#e3b8f5"/><text x="739.8" y="157.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">CQE</text><polygon points="759.8,163 756.8,154 759.8,145 923.8,145 926.8,154 923.8,163" fill="url(#wv36a11fh)"/><polygon points="929.8,163 926.8,154 929.8,145 957.8,145 960.8,154 957.8,163" fill="#a8d4ff"/><text x="943.8" y="157.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">SQE</text><polygon points="963.8,163 960.8,154 963.8,145 991.8,145 994.8,154 991.8,163" fill="url(#wv36a11fh)"/><polygon points="997.8,163 994.8,154 997.8,145 1025.8,145 1028.8,154 1025.8,163" fill="#a8f0ee"/><text x="1011.8" y="157.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">PRP</text><polygon points="1031.8,163 1028.8,154 1031.8,145 1059.8,145 1062.8,154 1059.8,163" fill="url(#wv36a11fh)"/><polygon points="1065.8,163 1062.8,154 1065.8,145 1164.8,145 1164.8,163" fill="#bff0a8"/><text x="1113.8" y="157.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">MRd …</text></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M597.8,166 L603.8,142"/><path d="M603.8,166 L609.8,142"/></g><text x="136.8" y="188.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">s_axis_tx_tvalid</text><g mask="url(#wv36a11fm5)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M144.8,193 L212.8,193 M212.8,193 L215.8,175 L246.8,175 M246.8,175 L249.8,193 L280.8,193 M280.8,193 L283.8,175 L314.8,175 M314.8,175 L317.8,193 L348.8,193 M348.8,193 L351.8,175 L382.8,175 M382.8,175 L385.8,193 L416.8,193 M416.8,193 L419.8,175 L688.8,175 M688.8,175 L691.8,193 L756.8,193 M756.8,193 L759.8,175 L790.8,175 M790.8,175 L793.8,193 L892.8,193 M892.8,193 L895.8,175 L926.8,175 M926.8,175 L929.8,193 L960.8,193 M960.8,193 L963.8,175 L994.8,175 M994.8,175 L997.8,193 L1028.8,193 M1028.8,193 L1031.8,175 L1062.8,175 M1062.8,175 L1065.8,193 L1096.8,193 M1096.8,193 L1099.8,175 L1164.8,175" fill="none"/></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M597.8,196 L603.8,172"/><path d="M603.8,196 L609.8,172"/></g><text x="136.8" y="233.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)" stroke="none">окно</text><g mask="url(#wv36a11fm7)"><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="144.8,238 144.8,220 413.8,220 416.8,229 413.8,238" fill="url(#wv36a11fh)"/><polygon points="419.8,238 416.8,229 419.8,220 1164.8,220 1164.8,238" fill="#ffd7a8"/><text x="790.8" y="232.85" font-size="11" text-anchor="middle" fill="#222" stroke="none">окно измерения: ratio = Σ tvalid / Σ тактов</text></g></g><g stroke="var(--wave-fg, #222)" stroke-width="1" fill="none"><path d="M597.8,241 L603.8,217"/><path d="M603.8,241 L609.8,217"/></g><g stroke="var(--wave-edge, #2a6fb0)" stroke-width="1.2" fill="none"><path d="M180.3,79 C520.3,79 520.3,79 860.3,79" marker-end="url(#wv36a11fa)"/><rect x="423.9" y="61" width="192.8" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="520.3" y="71" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">16 KiB / 1,6 ГБ/с ≈ 10,2 мкс</text></g><text x="654.8" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">tb_top: команды в установившемся режиме (схематично, время сжато «|»)</text><text x="654.8" y="260" font-size="12" text-anchor="middle" fill="var(--wave-fg, #222)" stroke="none" font-weight="600">TX: DB = MWr в SQ1TDBL, SQE/PRP = CplD с SQE/PRP-списком, DB CQ = MWr в CQ1HDBL; RX: MRd SQE/PRP, MWr CQE</text></svg>
+<figcaption>Рис. 7.8. Окно установившегося режима в tb_top (<code>docs/wave/ch7_steady_window.json</code>), схематично. Источник заполняет слот за ≈ 10,2 мкс. SSD забирает его данные быстрее (шина 2,0 ГБ/с), и до заполнения следующего слота TX простаивает. Отсюда valid-beat ratio 0,914 вместо 1,0.</figcaption>
+</figure>
+
+<div class="box warn"><span class="t">Осторожно с метрикой</span> Valid-beat ratio растёт и тогда, когда CplD становятся <b>мельче</b>: заголовков больше, тактов больше, а полезных байт столько же. В заголовке tb_top оценка «≈ 0,85» была сделана для CplD по 256 B. Измерено 0,914, потому что средний CplD — 136 B. Мерилом пропускной способности служат байты данных в секунду (≈ 1608 MB/s), а valid-beat ratio лишь показывает, есть ли у DUT запас. Подробнее о бюджете — в <a href="06_performance.html">главе 6</a>.</div>
+
+<!-- ============================================================ -->
+<h2 id="s8">7.8. Как запускать</h2>
+
+<h3>7.8.1. Скрипты</h3>
+
+<pre><code># Git Bash: один тест, несколько, или все sim/tb/tb_*.sv
+sim/scripts/run_xsim.sh top
+sim/scripts/run_xsim.sh completer rx_adapt tx_adapt
+sim/scripts/run_xsim.sh
+
+# PowerShell
+powershell -ExecutionPolicy Bypass -File sim\scripts\run_xsim.ps1 models top</code></pre>
+
+<p>Скрипт работает из любого каталога: корень репозитория он вычисляет от своего расположения. Путь к Vivado меняется переменной <code>VIVADO_BIN</code> (по умолчанию <code>C:\Xilinx\Vivado\2022.2\bin</code>). Для каждого теста выполняются три шага:</p>
+<ol>
+<li><code>xvlog -sv -L work -i rtl rtl/nvme_host_pkg.sv &lt;файлы из tb_&lt;name&gt;.f&gt; sim/tb/tb_&lt;name&gt;.sv</code>. Список <code>.f</code> — по пути на строку от корня, <code>#</code> — комментарий. Пакет всегда компилируется первым.</li>
+<li><code>xelab -debug typical -timescale 1ns/1ps tb_&lt;name&gt; -s tb_&lt;name&gt;_sim</code>. Ключ <code>-debug typical</code> нужен, чтобы потом видеть сигналы в осциллограммах.</li>
+<li><code>xsim tb_&lt;name&gt;_sim -R</code> (запустить до конца и выйти).</li>
+</ol>
+<p>Тест считается пройденным, если в логе есть <code>TEST PASSED</code> и нет строк, подходящих под <code>^(Fatal|FATAL|ERROR)|Error:</code>. На экран выводится <code>[top] PASS</code> или <code>[top] FAIL (rc=…, log: …)</code> с первыми строками ошибок, а в конце — <code>ALL PASSED (…)</code> или <code>SOME TESTS FAILED</code>. Код выхода ненулевой при любом сбое, поэтому скрипт годится для CI.</p>
+
+<table>
+<caption>Табл. 7.15. Содержимое <code>sim/work/&lt;name&gt;/</code> после прогона</caption>
+<tr><th>Файл</th><th>Что в нём</th></tr>
+<tr><td><code>run.log</code></td><td>Объединённый вывод xvlog, xelab и xsim. <b>Главный файл для чтения</b></td></tr>
+<tr><td><code>xvlog.log</code>, <code>xelab.log</code>, <code>xsim.log</code></td><td>Собственные логи инструментов (дублируют части run.log)</td></tr>
+<tr><td><code>xsim.dir/tb_&lt;name&gt;_sim/</code></td><td>Скомпилированный снимок (snapshot) с исполняемым ядром симуляции; его можно перезапускать без перекомпиляции</td></tr>
+<tr><td><code>tb_&lt;name&gt;_sim.wdb</code></td><td>База осциллограмм (после <code>-R</code> в ней только то, что было записано через <code>log_wave</code>)</td></tr>
+<tr><td><code>xsim.jou</code>, <code>*.pb</code></td><td>Журнал Tcl-команд, служебные файлы</td></tr>
+</table>
+
+<p>Каждый тест получает свой каталог, поэтому разные тесты можно запускать параллельно в нескольких терминалах. Каталог стирается в начале прогона: если нужен старый лог, скопируйте его.</p>
+
+<h3>7.8.2. Прогон с plusargs</h3>
+<p><code>run_xsim.*</code> запускает тесты без ключей. Варианты tb_top запускаются вручную на уже собранном снимке:</p>
+<pre><code>sim/scripts/run_xsim.sh top                    # собрать снимок (и прогнать базовый вариант)
+cd sim/work/top
+/c/Xilinx/Vivado/2022.2/bin/xsim.bat tb_top_sim -R -testplusarg stress    -log stress.log
+/c/Xilinx/Vivado/2022.2/bin/xsim.bat tb_top_sim -R -testplusarg txstall20 -log txstall20.log
+/c/Xilinx/Vivado/2022.2/bin/xsim.bat tb_top_sim -R -testplusarg nobme     -log nobme.log
+grep -E "TEST PASSED|ratio|Error|Fatal" stress.log</code></pre>
+<p>Для негативных вариантов (<code>+nobme</code>, <code>+negN</code>) в логе <b>обязательно</b> есть строки <code>Error:</code> — это и есть сработавшая проверка. Судите по <code>TEST PASSED</code> в конце, а не по отсутствию ошибок. Поэтому негативные прогоны не включены в автоматический критерий скрипта.</p>
+
+<h3>7.8.3. Осциллограммы в Vivado GUI</h3>
+<p>Интерактивно:</p>
+<pre><code>cd sim/work/top
+/c/Xilinx/Vivado/2022.2/bin/xsim.bat tb_top_sim -gui -testplusarg straddle</code></pre>
+<p>В Tcl-консоли окна xsim:</p>
+<pre><code>add_wave /tb_top/user_clk /tb_top/s_axis_tx_tvalid /tb_top/s_axis_tx_tready /tb_top/s_axis_tx_tdata
+add_wave /tb_top/m_axis_rx_tvalid /tb_top/m_axis_rx_tuser /tb_top/m_axis_rx_tdata
+add_wave /tb_top/status_seq_state
+run 40us          ;# до RUN; затем run 5us, run all ...</code></pre>
+<p>В пакетном режиме, чтобы посмотреть позже:</p>
+<pre><code># wave.tcl
+log_wave -recursive /tb_top/dut
+run all
+quit
+
+xsim.bat tb_top_sim -tclbatch wave.tcl -wdb top_full.wdb -testplusarg stress
+xsim.bat top_full.wdb -gui                     # открыть сохранённую базу</code></pre>
+<p>Не записывайте <code>-recursive *</code> для всего tb_top: 700 мкс по всем сигналам моделей дают базу в гигабайты. Записывайте DUT или нужный модуль.</p>
+
+<h3>7.8.4. Как читать «TEST PASSED» и $fatal</h3>
+<p>Структура вывода одинакова для всех тестов:</p>
+<pre><code>Error: [nvme_ssd_model @19836000] D-2: completion status 1 (UR) for MRd @0000000010000000 len 64 tag 188 ...
+Time: 19836 ns  Iteration: 0  Process: /tb_top/u_ssd/dispatcher  Scope: tb_top.u_ssd.err  File: .../nvme_ssd_model.sv Line: 166
+...
+Fatal: TEST FAILED
+Time: 698708 ns  Iteration: 1  Process: /tb_top/Initial367_201 ...  File: .../tb_top.sv Line: 430</code></pre>
+<ul>
+<li>Строка <code>Error:</code> — сработавшая проверка. В квадратных скобках — кто сообщил (модель ядра, модель SSD, тестбенч) и модельное время в пикосекундах (19 836 000 пс = 19,836 мкс). Дальше — ID правила.</li>
+<li>Строка <code>Time: … Scope:</code> указывает процесс. <code>Scope: tb_top.u_ssd.err</code> значит «функция <code>err()</code> модели SSD». Номер строки указывает на <code>$error</code> внутри <code>err()</code>, поэтому смотрите на ID, а не на номер строки.</li>
+<li><b>Первая</b> ошибка важнее всех остальных. После D-2 модель сообщит «admin SQE fetch failed», затем DUT уйдёт в тайм-аут, и посыплются T-ошибки. Это следствия.</li>
+<li><code>Fatal: TEST FAILED</code> в конце — итог: хотя бы одна проверка сработала. <code>[tb_top] TIMEOUT: seq state …</code> перед <code>$fatal</code> — глобальный тайм-аут 20 мс с диагностикой: состояние секвенсора, счётчики, сколько beat'ов отдал источник.</li>
+</ul>
+
+<h3>7.8.5. Ограничения xsim 2022.2, с которыми мы столкнулись</h3>
+
+<table>
+<caption>Табл. 7.16. Особенности xsim 2022.2 и обходные пути в проекте</caption>
+<tr><th>Проблема</th><th>Симптом</th><th>Обход</th></tr>
+<tr><td>Очереди внутри struct</td><td>Присваивание очереди-аргумента полю структуры (<code>c.data = d</code>, где <code>c</code> — <code>tlp_t</code>) молча теряет данные: payload приходит пустым</td><td>Копировать поэлементно: <code>foreach (d[i]) c.data.push_back(d[i]);</code> (<code>nvme_ssd_model.sv</code>, <code>tb_models.sv</code>). Сложные контейнеры (<code>dma_ctx</code>, <code>nvme_sq</code>, <code>nvme_cq</code>) сделаны классами в пакете — с ними xsim работает надёжнее</td></tr>
+<tr><td><code>$urandom(seed)</code></td><td>По стандарту вызов с аргументом пересевает генератор только <b>текущего потока</b>. Последовательности в потоках, порождённых <code>fork</code>, зависят от порядка их создания. Воспроизводимость «зерном в коде» получается хрупкой</td><td>В коде зерно не задаётся. Прогон xsim детерминирован по умолчанию; другое зерно — ключом запуска <code>xsim … -sv_seed 12345</code></td></tr>
+<tr><td>Plusargs с «=» на Windows</td><td><code>xsim.bat … -testplusarg txstall=20</code>: cmd.exe считает «=» разделителем аргументов, и ключ теряет значение</td><td>Тесты принимают обе формы: <code>$value$plusargs("txstall=%d", n) || $value$plusargs("txstall%d", n)</code>. На Windows пишите <code>+txstall20</code>, <code>+neg3</code></td></tr>
+<tr><td><code>always_ff</code> + <code>initial</code></td><td>Переменная, которую пишет <code>always_ff</code>, присвоена ещё и в <code>initial</code>: по IEEE 1800 (§9.2.2.4) это запрещено, xelab выдаёт ошибку</td><td>В RTL начальные значения задаются только сбросом. В тестбенчах используйте <code>always @(posedge clk)</code>, если переменную нужно инициализировать или менять из нескольких процессов</td></tr>
+<tr><td>Ошибки моделей не останавливают симуляцию</td><td><code>$error</code> только печатает; тест может «доехать» до конца</td><td>Каждая модель считает <code>err_count</code>, а итог проверяется в T-9. В негативных тестах сторож ждёт <code>err_count &gt; 0</code></td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s9">7.9. Что не покрыто и как это закрыть</h2>
+
+<p>Честный список дыр — часть верификации. Всё, что ниже, надо либо проверить на плате, либо закрыть доработкой моделей.</p>
+
+<table>
+<caption>Табл. 7.17. Непокрытые области и способы их закрыть</caption>
+<tr><th>Область</th><th>Почему не покрыто</th><th>Как закрыть</th></tr>
+<tr><td>GT и физический уровень</td><td>Модель стоит над ядром; LTSSM в ней — скрипт из пяти состояний</td><td>На плате: ILA на <code>pl_ltssm_state</code>, <code>pl_sel_lnk_rate/width</code>. В симуляции: example design ядра pcie_7x с моделью Endpoint (PIPE-режим) — медленно, но проверяет обвязку <code>pcie7x_wrapper</code></td></tr>
+<tr><td>PERST# в tb_top</td><td>Тестбенч подменяет <code>link_bringup</code> сигналом <code>link_ready</code>; повторный PERST# модель SSD считает ошибкой («not supported by the model»)</td><td>Научить модель SSD полному сбросу (конфигурация, очереди, <code>lba_mem</code> оставить); сценарий tb_top «DONE → restart» с настоящим <code>link_bringup</code></td></tr>
+<tr><td>Падение линка в RUN</td><td>Покрыто только модульно (tb_link_bringup, tb_host_sequencer S4)</td><td>Ручка <code>force_link_down</code> в модели ядра; ожидать <code>status_error = E_LINK_LOST</code> и корректную остановку</td></tr>
+<tr><td>DSTRD ≠ 0 в системе</td><td>Модель SSD всегда сообщает DSTRD = 0; DSTRD = 2 проверен только в tb_nvme_admin (T2)</td><td>Ручка <code>dstrd</code> в модели SSD; адрес doorbell'а <code>1000h + (2·qid + is_cq)·(4 &lt;&lt; DSTRD)</code></td></tr>
+<tr><td>LBADS = 12 в системе</td><td>Модель SSD: только 512 B; 4 KiB — в tb_nvme_admin T2 и tb_write_engine H2</td><td>Ручка формата LBA; <code>lba_mem</code> и <code>check_range</code> параметризовать размером блока</td></tr>
+<tr><td>Реальные задержки SSD</td><td>Задержка команды в модели — 20…200 тактов, у живого SSD бывают паузы ~10 мс</td><td>Ручка «редкая долгая пауза» (например, 1 % команд по 1 мс): проверить заполнение кольца и <code>stat_stall_cycles</code></td></tr>
+<tr><td>Отравленные TLP, ECRC, режим <code>rx_np_req</code>, MPS 512, отказ от Extended Tags</td><td>Ручки есть (<code>rx_poison_pct</code>, <code>np_req_mode</code>), но tb_top их не включает</td><td>Добавить plusargs и ожидаемое поведение (отбрасывание, счётчик ошибок)</td></tr>
+<tr><td>Конфликт CID</td><td>Модель SSD не проверяет, что CID новой команды не совпадает с CID команды в работе (ошибка LiteNVMe)</td><td>Новая проверка N-11 (задача 2 ниже)</td></tr>
+<tr><td>Временные ограничения и CDC</td><td>Симулятор их не видит</td><td>STA в Vivado; <code>report_cdc</code> для асинхронного FIFO <code>data_ring</code></td></tr>
+<tr><td>Формальная проверка свойств</td><td>Случайная симуляция находит частые ошибки, но не доказывает их отсутствия</td><td>SVA-свойства на интерфейсах (ниже) и формальный инструмент (SymbiYosys, Questa Formal, JasperGold)</td></tr>
+</table>
+
+<h3>7.9.1. Идеи для SVA</h3>
+<p>Многие правила моделей можно переписать как утверждения SystemVerilog (SVA) прямо на портах модулей. Тогда они работают в любом тесте, а формальный инструмент может их <b>доказать</b> для всех входов, а не только для тех, что выпали случайно. xsim поддерживает параллельные (concurrent) утверждения.</p>
+<pre><code>// TX-4: при стойке beat стабилен
+a_tx_stable: assert property (@(posedge user_clk) disable iff (user_rst)
+  s_axis_tx_tvalid &amp;&amp; !s_axis_tx_tready |=&gt;
+    s_axis_tx_tvalid &amp;&amp; $stable({s_axis_tx_tdata, s_axis_tx_tkeep, s_axis_tx_tlast}));
+
+// TX-1: внутри пакета tkeep = FFFF
+a_tx_keep: assert property (@(posedge user_clk) disable iff (user_rst)
+  s_axis_tx_tvalid &amp;&amp; !s_axis_tx_tlast |-&gt; s_axis_tx_tkeep == 16'hFFFF);
+
+// Живучесть completer'а: на каждый принятый MRd первый CplD не позже чем через 64 такта
+// (при tready = 1; ограниченная форма liveness; имена сигналов условные)
+a_cpl_latency: assert property (@(posedge user_clk) disable iff (user_rst)
+  mrd_hdr_accepted &amp;&amp; out_q_empty |-&gt; ##[1:64] cpl_sof);</code></pre>
+<p>Ещё кандидаты: слот не освобождается дважды; SQ tail никогда не догоняет head; фаза, ожидаемая хостом, меняется ровно при переходе head через конец CQ; <code>np_backpressure</code> выставлен всякий раз, когда очередь MRd completer'а заполнена.</p>
+
+<!-- ============================================================ -->
+<h2 id="s10">7.10. Вопросы для самопроверки и задачи</h2>
+
+<div class="box task"><span class="t">Вопросы для самопроверки</span>
+<ol>
+<li>Почему модель поставлена на интерфейс пользователя ядра pcie_7x, а не на последовательные линии GT? Назовите две ошибки, которые при таком выборе принципиально не могут быть найдены в симуляции.</li>
+<li>Модели обмениваются целыми TLP, а не тактами AXI. Какая модель отвечает за порядок байт в payload и почему модели SSD не нужно о нём знать?</li>
+<li>3DW CplD начинается в DW2 такта. В какой линии какого такта лежит первый DW его данных? А у 4DW-пакета, начатого в DW0?</li>
+<li>SSD прочитал 512 B с адреса …0C4h при MPS = 256 B и RCB = 64 B. Сколько CplD вернёт completer, с какими Byte Count и Lower Address?</li>
+<li>Правило RX-1 проверяет пакеты от SSD, а не от DUT. Какую ошибку <b>DUT</b> оно ловит?</li>
+<li>Зачем tb_models существует отдельно от tb_top, если tb_top проверяет «всё сразу»? Что доказывает прогон <code>+neg6</code>?</li>
+<li>При <code>+txstall20</code> valid-beat ratio = 0,992, а accepted = 0,794. Объясните оба числа и почему из них следует, что DUT — не узкое место.</li>
+<li>В логе <code>run.log</code> стоят и <code>TEST PASSED</code>, и строки <code>Error:</code>. Пройден ли тест с точки зрения <code>run_xsim.sh</code>? Когда такая комбинация нормальна?</li>
+</ol>
+</div>
+
+<details><summary>Ответы на вопросы</summary>
+<ol>
+<li>Наш код начинается на AXI-Stream ядра. Всё ниже — проверенный hard block, а его симуляция на уровне символов медленнее в сотни раз. Принципиально не находятся, например, перепутанная полярность или порядок линий на FMC-адаптере и неверная опорная частота GTX (также — нарушения временных ограничений).</li>
+<li>Модель ядра: она переводит big-endian DW шины в байты в порядке памяти и обратно. SSD-модель работает с адресами и байтами, как настоящий контроллер за своим PCIe-ядром.</li>
+<li>В DW1 следующего такта (<code>{D2, D1, D0, H2}</code>). У 4DW, начатого в DW0, — в DW0 следующего такта.</li>
+<li>Три CplD: …0C4–…0FF (60 B, BC = 512, LA = 44h), …100–…1FF (256 B, BC = 452, LA = 00h), …200–…2C3 (196 B, BC = 196, LA = 00h). Первая граница определяется по адресу (…100h), а не по началу запроса. Все точки разбиения кратны RCB.</li>
+<li>Не настроенный DevCtl.MPS Root Port'а (через cfg_mgmt) при настроенном MPS SSD. SSD шлёт MWr Identify по 256 B, а «ядро» отбрасывает их как malformed.</li>
+<li>Чтобы ошибки моделей не путались с ошибками DUT и чтобы доказать, что проверки моделей срабатывают. <code>+neg6</code> доказывает, что D-1 ловит хост, забывший BME в Command накопителя.</li>
+<li>Valid 0,992: почти в каждом такте окна у DUT готов beat — он успевает за источником с запасом. Accepted ≈ (1 − 0,2) × 0,992 = 0,794: ядро принимает данные лишь в 80 % тактов. Без стоек valid = 0,914 — столько тактов нужно, чтобы передать 1,6 ГБ/с данных с заголовками. Если бы DUT был медленнее источника, valid не мог бы вырасти выше этого значения.</li>
+<li>Нет: скрипт требует отсутствия <code>Error:</code>. Такая комбинация нормальна для негативных прогонов (<code>+nobme</code>, <code>+negN</code>): строки <code>Error:</code> там — сработавшая проверка, а <code>TEST PASSED</code> печатает сторож. Поэтому их запускают вручную и оценивают по последней строке.</li>
+</ol>
+</details>
+
+<h3>Задачи</h3>
+
+<p><b>Задача 1. Новый plusarg-сценарий.</b> Добавьте в tb_top ключ <code>+slowssd</code>: SSD обрабатывает одну команду за раз и «думает» над каждой до 5000 тактов. Что должно произойти с кольцом данных и источником? Какие проверки и метрики подтвердят, что хост корректно отработал обратное давление?</p>
+<details><summary>Решение</summary>
+<p>В <code>apply_plusargs()</code>:</p>
+<pre><code>if ($test$plusargs("slowssd")) begin
+  u_ssd.concurrent_cmds = 1;
+  u_ssd.cmd_latency_min = 2000;
+  u_ssd.cmd_latency_max = 5000;
+  $display("[tb_top] knob: slow SSD (1 command, 2000..5000 cycles latency)");
+end</code></pre>
+<p>SSD станет медленнее источника. Кольцо из 4 слотов заполнится, <code>data_ring</code> снимет <code>s_data_tready</code>, и источник встанет. Тестбенч учитывает только принятые beat'ы, поэтому данные не теряются. Должны пройти все T-1…T-9 без изменений. Дополнительно стоит проверить <code>stat_stall_cycles &gt; 0</code> (обратное давление действительно было) и <code>stat_max_latency</code> не меньше 2000. Valid-beat ratio упадёт: TX простаивает, пока SSD «думает». Оценка времени: 64 × (≈ 3500 + ≈ 1100) тактов ≈ 2,4 мс — в пределах глобального тайм-аута 20 мс.</p>
+</details>
+
+<p><b>Задача 2. Новая проверка в модели.</b> Добавьте в модель SSD правило N-11: «I/O-команда выбрана с CID, который уже занят командой в работе». По NVMe контроллер может ответить статусом Command ID Conflict (SCT 0, SC 03h). Как доказать, что новая проверка умеет срабатывать?</p>
+<details><summary>Решение</summary>
+<pre><code>bit cid_busy [int];                        // в модуле nvme_ssd_model
+
+// io_engine(), перед fork для каждой команды k:
+if (cid_busy.exists(cid_k)) err($sformatf("N-11: CID %0d reused while still in flight", cid_k));
+cid_busy[cid_k] = 1;
+
+// run_io_cmd(), непосредственно перед post_cqe():
+cid_busy.delete(cid);</code></pre>
+<p>Освобождать CID нужно в момент выставления CQE: после этого хост вправе использовать CID снова. Доказательство по методологии раздела 7.5: добавьте в tb_models <code>+neg9</code>, при котором мини-хост подаёт две Write с одинаковым CID, пока первая не завершена. Без проверки тест должен завершиться <code>$fatal</code> («models did NOT flag»), с проверкой — <code>TEST PASSED</code>. После этого tb_top обязан остаться зелёным: в нашем хосте CID равен номеру слота, а слот не переиспользуется до CQE.</p>
+</details>
+
+<p><b>Задача 3. Где упала инициализация?</b> Ниже — фрагмент лога tb_top (сконструирован для задачи). Определите по нему, на каком шаге и на какой команде остановилась инициализация, и предложите следующий шаг диагностики.</p>
+<pre><code>[tb_top @8260000] link_ready asserted (LTSSM 16, Gen2 x4)
+[nvme_ssd_model @11556000] captured bus/device number: BDF = 0100
+[nvme_ssd_model @18860000] CSTS.RDY=1 (ASQ 0000000010000000 x32, ACQ 0000000010001000 x32)
+[nvme_ssd_model @31724000] I/O CQ1 created: base 0000000010004000, 64 entries
+Warning: [nvme_ssd_model] admin opc 01 cid 4 completed with status 0102 (SCT 1 SC 02)
+[tb_top @34196000] sequencer state 15, status_error 03/24, bytes 0, cmds 0, cmd_errors 0, max_latency 0, unexpected_cpl 0
+Error: [tb_top @34196000] T-1: 1048576 data bytes differ in LBAs 0..2047
+...</code></pre>
+<details><summary>Решение</summary>
+<ul>
+<li><code>sequencer state 15</code> — ST_ERROR; <code>status_error 03</code> — E_ADMIN: упала инициализация NVMe (<code>host_sequencer.sv</code>). Линк (LINK), нумерация (ENUM, BDF захвачен) и cfg_mgmt (RPCFG) прошли.</li>
+<li><code>status_error_detail = 24h</code> — это <code>fail_step</code> модуля <code>nvme_admin</code>: <code>F_CMD_STATUS (20h) | CID[4:0]</code>, то есть CQE с ненулевым статусом у команды CID 4. CID идут по порядку с нуля: 0 — Identify Controller, 1 — Identify Namespace, 2 — Set Features, 3 — Create I/O CQ, <b>4 — Create I/O SQ</b>.</li>
+<li>Это подтверждают строки модели: CQ1 создана, затем admin opc 01h (Create I/O SQ) с CID 4 получила SCT 1 / SC 02h — Invalid Queue Size.</li>
+<li>Ошибка T-1 и все последующие — следствия: до RUN дело не дошло.</li>
+<li>Дальше: перезапустить с <code>+verbose</code> и найти MWr SQE команды CID 4 в ASQ. Проверить CDW10 (QSIZE, 0's based: для 64 записей должно быть 3Fh, а не 40h) и сравнить с CAP.MQES. Модульный тест tb_nvme_admin сверяет CDW10 каждой команды — стоит посмотреть, почему он это пропустил.</li>
+</ul>
+</details>
+
+<!-- ============================================================ -->
+<h2 id="s11">7.11. Ссылки</h2>
+<ul>
+<li>Файлы проекта: <code>ARCHITECTURE.md</code> §7 (стратегия верификации), §8 (бюджет); <code>sim/models/</code> (модели), <code>sim/tb/</code> (тесты), <code>sim/scripts/</code> (запуск); заголовок каждого файла перечисляет ручки и ID проверок.</li>
+<li>Xilinx PG054 «7 Series FPGAs Integrated Block for PCI Express» v3.3: Table 2-9 и 2-10 (интерфейсы TX/RX), Tables 3-4…3-9 и Fig. 3-49 (кадрирование 128-битного RX), Table 3-12 (диспозиции приёма), Table 3-25 (Command в режиме Root Port), Table 3-42 (проверки ядра), pp. 112–113 (cfg_mgmt). Выжимка — <code>research/03_pcie_7x_root_port_brief.md</code>.</li>
+<li>PCI Express Base Specification 2.1: §2.2 (правила TLP), §2.2.7 (запросы), §2.3.1.1 и §2.3.2 (completion: Byte Count, Lower Address, RCB).</li>
+<li>NVM Express Base Specification 1.4: §4.6 (CQE и фаза), §4.3 (PRP), §7.6 (инициализация и shutdown).</li>
+<li>IEEE 1800-2017 (SystemVerilog): §9.2.2.4 (<code>always_ff</code>), §16 (утверждения), §18.13 (<code>$urandom</code>), §21.6 (<code>$test$plusargs</code>, <code>$value$plusargs</code>).</li>
+<li>Xilinx UG900 «Vivado Design Suite User Guide: Logic Simulation»: xvlog, xelab, xsim, ключи <code>-testplusarg</code>, <code>-sv_seed</code>, <code>-tclbatch</code>, команды <code>add_wave</code> и <code>log_wave</code>.</li>
+<li>Ошибки открытых проектов (LiteNVMe, mcrl/NVMe, pl-nvme, Design Gateway) — <code>research/01_open_source_survey.md</code>, разделы 1 и 6.</li>
+</ul>
+
+<div class="pager"><a href="06_performance.html">← Глава 6. Пропускная способность</a><a href="08_lab.html">Глава 8. Лабораторные задания →</a></div>
+<footer>Учебный проект «NVMe-хост на голой Kintex-7». Исходники: <a href="https://github.com/alexander-hdl/NVME">github.com/alexander-hdl/NVME</a>.</footer>
+</main>
+</div>
+</body>
+</html>
