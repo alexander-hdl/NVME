@@ -1,0 +1,1154 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Глава 1. PCI Express с нуля</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="layout">
+<!-- NAV:BEGIN -->
+<nav class="side">
+  <h2>NVMe-хост на Kintex-7</h2>
+  <ul>
+    <li><a href="index.html">Введение и цели</a></li>
+    <li><a href="01_pcie_basics.html" class="cur">1. PCIe с нуля</a></li>
+    <li><a href="02_nvme_basics.html">2. NVMe с нуля</a></li>
+    <li><a href="03_architecture.html">3. Архитектура хоста</a></li>
+    <li><a href="04_modules.html">4. Модули и интерфейсы</a></li>
+    <li><a href="05_bringup.html">5. Запуск: от PERST# до первой записи</a></li>
+    <li><a href="06_performance.html">6. Пропускная способность</a></li>
+    <li><a href="07_verification.html">7. Верификация и симуляция</a></li>
+    <li><a href="08_lab.html">8. Лабораторные задания</a></li>
+    <li><a href="glossary.html">Глоссарий</a></li>
+  </ul>
+</nav>
+<!-- NAV:END -->
+<main>
+<h1>Глава 1. PCI Express с нуля</h1>
+<p class="lead">От топологии и физического уровня до байтов в заголовке TLP: всё, что нужно знать о PCI Express, чтобы ПЛИС без процессора стала корневым комплексом, нашла SSD, настроила его и прокачала через линк Gen2 x4 почти 2 ГБ/с.</p>
+
+<p>План главы:</p>
+<ol>
+<li><a href="#s1">Зачем PCIe и как устроена топология</a></li>
+<li><a href="#s2">Физический уровень: lanes, скорости, кодирование, сброс и обучение линка</a></li>
+<li><a href="#s3">Три уровня протокола: TLP, DLLP, ACK/NAK и кредиты</a></li>
+<li><a href="#s4">TLP во всех деталях: заголовки и шестнадцатеричные примеры</a></li>
+<li><a href="#s5">Конфигурационное пространство и ручной enumeration</a></li>
+<li><a href="#s6">DMA: кто чью память читает</a></li>
+<li><a href="#s7">Расчёт пропускной способности</a></li>
+<li><a href="#s8">PCIe «изнутри ПЛИС»</a></li>
+<li><a href="#s9">Вопросы и мини-задачи</a></li>
+<li><a href="#s10">Литература</a></li>
+</ol>
+
+<div class="box"><span class="t">Соглашения главы</span>
+Числа с префиксом <code>0x</code> шестнадцатеричные; подчёркивание в <code>0xC000_1008</code> только для удобства чтения. DW (double word) = 4 байта. Биты в DW нумеруются от 31 (старший) до 0. «ГБ/с» = 10<sup>9</sup> байт/с, «КиБ» = 1024 байта. B:D.F = bus:device.function. Мы описываем PCIe Base Specification ревизий 2.x/3.0, т.е. то, что умеет hard-блок Kintex-7 (Gen1/Gen2).</div>
+
+<!-- ============================================================ 1 -->
+<h2 id="s1">1.1. Зачем PCIe и как устроена топология</h2>
+
+<p>Старая шина PCI была параллельной и общей: 32 или 64 провода данных, все устройства висят на одних и тех же проводах, тактирование общее, частота упёрлась в 66–133 МГц из-за перекоса (skew) между линиями. PCI Express (PCIe) сохранил <em>программную модель</em> PCI — адресное пространство памяти, конфигурационное пространство, номера bus/device/function, — но заменил физику на последовательные дифференциальные соединения «точка-точка» со встроенной синхронизацией. Поэтому драйверы старого мира работают без изменений, а скорость выросла на порядки.</p>
+
+<p>Ключевая идея: в PCIe нет «шины» в электрическом смысле. Есть <b>дерево</b> соединений точка-точка, а данные ходят пакетами — как в сети. Узлы дерева бывают трёх видов.</p>
+
+<ul>
+<li><b>Root Complex</b> (корневой комплекс, RC) — корень дерева. В ПК это часть процессора/чипсета: он связывает CPU и оперативную память с иерархией PCIe, генерирует конфигурационные запросы и выполняет обращения устройств к памяти хоста.</li>
+<li><b>Root Port</b> (корневой порт) — выход RC, к которому подключается один линк. У RC может быть несколько портов. Программно каждый Root Port выглядит как мост PCI-to-PCI (заголовок Type 1, см. раздел <a href="#s5">1.5</a>).</li>
+<li><b>Switch</b> (коммутатор) — разветвитель: один восходящий порт (upstream) и несколько нисходящих (downstream). Внутри — набор виртуальных мостов PCI-to-PCI на внутренней шине.</li>
+<li><b>Endpoint</b> (оконечное устройство) — лист дерева: видеокарта, сетевая карта, NVMe SSD. У Endpoint заголовок конфигурации Type 0 и регистры, отображаемые в память через BAR.</li>
+</ul>
+
+<p>Каждое устройство адресуется тройкой <b>Bus/Device/Function</b> (BDF): 8 бит номера шины, 5 бит номера устройства, 3 бита номера функции. Упакованная в 16 бит, эта тройка называется <b>ID</b> — Requester ID у того, кто посылает запрос, и Completer ID у того, кто отвечает:</p>
+
+<div class="bits"><span style="flex:8">Bus[7:0]<small>15:8</small></span><span style="flex:5">Device[4:0]<small>7:3</small></span><span style="flex:3">Function[2:0]<small>2:0</small></span></div>
+
+<p>Например, 01:00.0 → <code>0x0100</code>, а 03:1F.7 → <code>(0x03&lt;&lt;8)|(0x1F&lt;&lt;3)|7 = 0x03FF</code>. Номера шин раздаёт программа перечисления (enumeration): шина 0 — внутренняя шина RC, каждый линк за мостом получает свой номер. Поскольку линк соединяет ровно два устройства, на шине за Root Port живёт ровно одно устройство с номером Device 0. Многофункциональное устройство (например, двухпортовая сетевая карта) отвечает на функции 0…7 одного Device.</p>
+
+<figure>
+<svg viewBox="0 0 760 320" width="760" height="320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Топология PCIe: типичный ПК и наш проект" font-family="sans-serif" font-size="13">
+<g fill="var(--fg)" text-anchor="middle" font-size="14" font-weight="bold">
+<text x="190" y="18">а) Типичный ПК</text>
+<text x="580" y="18">б) Наш проект</text>
+</g>
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="20" y="30" width="340" height="112" rx="8" fill="var(--note-bg)"/>
+<rect x="40" y="58" width="110" height="34" rx="4" fill="var(--code-bg)"/>
+<rect x="200" y="58" width="140" height="34" rx="4" fill="var(--code-bg)"/>
+<line x1="150" y1="75" x2="200" y2="75"/>
+<line x1="95" y1="92" x2="95" y2="110"/>
+<line x1="270" y1="92" x2="270" y2="110"/>
+<rect x="40" y="110" width="120" height="26" rx="4" fill="var(--code-bg)"/>
+<rect x="210" y="110" width="130" height="26" rx="4" fill="var(--code-bg)"/>
+<line x1="100" y1="136" x2="100" y2="190" stroke-width="3"/>
+<line x1="275" y1="136" x2="275" y2="180" stroke-width="3"/>
+<rect x="40" y="190" width="120" height="44" rx="4" fill="var(--ok-bg)"/>
+<rect x="195" y="180" width="160" height="50" rx="4" fill="var(--warn-bg)"/>
+<line x1="245" y1="230" x2="190" y2="268" stroke-width="3"/>
+<line x1="305" y1="230" x2="330" y2="268" stroke-width="3"/>
+<rect x="130" y="268" width="120" height="44" rx="4" fill="var(--ok-bg)"/>
+<rect x="270" y="268" width="120" height="44" rx="4" fill="var(--ok-bg)"/>
+<rect x="420" y="30" width="320" height="162" rx="8" fill="var(--note-bg)"/>
+<rect x="440" y="58" width="280" height="30" rx="4" fill="var(--code-bg)"/>
+<rect x="440" y="96" width="280" height="30" rx="4" fill="var(--code-bg)"/>
+<line x1="580" y1="126" x2="580" y2="148"/>
+<rect x="440" y="148" width="280" height="34" rx="4" fill="var(--code-bg)"/>
+<line x1="580" y1="182" x2="580" y2="250" stroke-width="3"/>
+<rect x="470" y="250" width="220" height="56" rx="4" fill="var(--ok-bg)"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="30" y="48" text-anchor="start" font-weight="bold">Root Complex</text>
+<text x="350" y="48" text-anchor="end" font-size="11" fill="var(--muted)">шина 0</text>
+<text x="95" y="80">CPU</text>
+<text x="270" y="80">Память (DRAM)</text>
+<text x="100" y="128" font-size="12">Root Port A</text>
+<text x="275" y="128" font-size="12">Root Port B</text>
+<text x="106" y="168" text-anchor="start" font-size="11" fill="var(--muted)">шина 1</text>
+<text x="281" y="162" text-anchor="start" font-size="11" fill="var(--muted)">шина 2</text>
+<text x="100" y="209">Endpoint</text>
+<text x="100" y="226" font-size="11">(видеокарта) 01:00.0</text>
+<text x="275" y="200">Switch</text>
+<text x="275" y="218" font-size="11">внутр. шина 3</text>
+<text x="194" y="258" text-anchor="end" font-size="11" fill="var(--muted)">шина 4</text>
+<text x="332" y="256" text-anchor="start" font-size="11" fill="var(--muted)">шина 5</text>
+<text x="190" y="287">Endpoint</text>
+<text x="190" y="304" font-size="11">(сеть) 04:00.0</text>
+<text x="330" y="287">Endpoint</text>
+<text x="330" y="304" font-size="11">(SSD) 05:00.0</text>
+<text x="430" y="48" text-anchor="start" font-weight="bold">FPGA Kintex-7 = Root Complex</text>
+<text x="730" y="48" text-anchor="end" font-size="11" fill="var(--muted)">шина 0</text>
+<text x="580" y="78">NVMe-хост: конечные автоматы, без CPU</text>
+<text x="580" y="116">«Память хоста»: BRAM / DDR3</text>
+<text x="580" y="170">Root Port 00:00.0 (hard-блок PCIe)</text>
+<text x="590" y="222" text-anchor="start" font-size="12">линк x4 Gen2</text>
+<text x="590" y="238" text-anchor="start" font-size="11" fill="var(--muted)">шина 1</text>
+<text x="580" y="273" font-weight="bold">M.2 NVMe SSD</text>
+<text x="580" y="293">Endpoint 01:00.0</text>
+</g>
+</svg>
+<figcaption>Рис. 1.1. Топология PCIe. Слева — дерево типичного ПК с коммутатором; толстые линии — линки, у каждого линка свой номер шины. Справа — наш проект: вся «корневая» сторона живёт в ПЛИС, а SSD — единственный Endpoint на шине 1.</figcaption>
+</figure>
+
+<h3>Что значит «FPGA — это Root Complex, SSD — Endpoint»</h3>
+
+<p>В обычной жизни ПЛИС с PCIe — это плата-ускоритель, которую вставляют в ПК: ПЛИС работает как Endpoint, а всё сложное (обучение линка со стороны хоста, перечисление, назначение адресов, драйвер) делает ПК. В нашем проекте наоборот: процессора нет, SSD вставлен в разъём M.2 на плате с ПЛИС, и ПЛИС обязана выполнять все обязанности корня:</p>
+<ul>
+<li>держать сигнал сброса PERST# и подать опорную частоту REFCLK на разъём;</li>
+<li>сконфигурировать собственный Root Port (номера шин, окна адресов, разрешения);</li>
+<li>выполнить перечисление: прочитать конфигурационное пространство SSD, определить размер BAR0 и назначить ему адрес, выставить MPS/MRRS и разрешения в регистре Command;</li>
+<li>обращаться к регистрам NVMe-контроллера SSD (запросы <b>MWr/MRd</b> в BAR0) — здесь ПЛИС <em>requester</em>;</li>
+<li>обслуживать обращения SSD к «памяти хоста» (очередям и буферам данных) — здесь ПЛИС <em>completer</em>, и отвечать нужно быстро, потому что от этого напрямую зависит скорость (раздел <a href="#s7">1.7</a>).</li>
+</ul>
+
+<p>Роль задаётся при генерации IP-ядра: hard-блок PCIe в Kintex-7 умеет работать и как Endpoint, и как Root Port. Электрически линк симметричен; разница — в том, кто управляет сбросом и опорной частотой, кто инициирует конфигурацию и какой заголовок (Type 0 или Type 1) у собственного конфигурационного пространства порта.</p>
+
+<!-- ============================================================ 2 -->
+<h2 id="s2">1.2. Физический уровень</h2>
+
+<h3>Lanes и link</h3>
+
+<p><b>Lane</b> (линия) — это две дифференциальные пары: одна на передачу (TX), одна на приём (RX). Каждая пара передаёт последовательный поток бит без отдельного тактового сигнала: приёмник восстанавливает частоту из переходов данных (CDR, clock and data recovery). <b>Link</b> (линк) — связь двух портов из 1, 2, 4, 8, 12, 16 или 32 lanes; ширину обозначают x1, x4 и т.д. Линк x4 — это 16 проводников данных. Байты пакета разбрасываются по lanes по очереди (striping), а на приёме собираются обратно; выравнивание между lanes (deskew) делает физический уровень.</p>
+
+<figure>
+<svg viewBox="0 0 760 300" width="760" height="300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Линк x4: четыре lane, REFCLK и PERST#" font-family="sans-serif" font-size="13">
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="20" y="25" width="150" height="205" rx="6" fill="var(--note-bg)"/>
+<rect x="590" y="25" width="150" height="205" rx="6" fill="var(--ok-bg)"/>
+<rect x="330" y="244" width="100" height="26" rx="4" fill="var(--code-bg)"/>
+</g>
+<g stroke="var(--accent)" stroke-width="1.5" fill="none">
+<path d="M170,45 H580 M170,49 H580 M170,87 H580 M170,91 H580 M170,129 H580 M170,133 H580 M170,171 H580 M170,175 H580"/>
+</g>
+<g fill="var(--accent)">
+<polygon points="580,42 590,47 580,52"/><polygon points="580,84 590,89 580,94"/><polygon points="580,126 590,131 580,136"/><polygon points="580,168 590,173 580,178"/>
+</g>
+<g stroke="var(--accent2)" stroke-width="1.5" fill="none">
+<path d="M180,61 H590 M180,65 H590 M180,103 H590 M180,107 H590 M180,145 H590 M180,149 H590 M180,187 H590 M180,191 H590"/>
+</g>
+<g fill="var(--accent2)">
+<polygon points="180,58 170,63 180,68"/><polygon points="180,100 170,105 180,110"/><polygon points="180,142 170,147 180,152"/><polygon points="180,184 170,189 180,194"/>
+</g>
+<g stroke="var(--fg)" stroke-width="1.5" fill="none">
+<path d="M330,257 H95 V230 M430,257 H665 V230"/>
+<path d="M170,214 H582" stroke-dasharray="6,4"/>
+</g>
+<polygon points="580,209 590,214 580,219" fill="var(--fg)"/>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="95" y="110" font-weight="bold">Root Port</text>
+<text x="95" y="128" font-size="11">(ПЛИС, GTX)</text>
+<text x="665" y="110" font-weight="bold">Endpoint</text>
+<text x="665" y="128" font-size="11">(SSD)</text>
+<text x="380" y="40" font-size="11">Lane 0: TX+/TX− → | ← RX+/RX−</text>
+<text x="380" y="82" font-size="11">Lane 1</text>
+<text x="380" y="124" font-size="11">Lane 2</text>
+<text x="380" y="166" font-size="11">Lane 3</text>
+<text x="380" y="209" font-size="11">PERST# (сброс, управляет хост)</text>
+<text x="380" y="262" font-size="12">100 МГц</text>
+<text x="380" y="290" font-size="11" fill="var(--muted)">REFCLK: одна опорная частота на обе стороны (common clock)</text>
+</g>
+</svg>
+<figcaption>Рис. 1.2. Линк x4. Каждая lane — пара «туда» (синяя) и пара «обратно» (оранжевая), обе дифференциальные. Опорная частота REFCLK и сброс PERST# идут от хоста; в нашем проекте их формирует плата с ПЛИС.</figcaption>
+</figure>
+
+<h3>Скорости и кодирование</h3>
+
+<p>Скорость lane измеряют в <b>GT/s</b> (гигатрансферах в секунду) — это скорость передачи <em>канальных</em> символов (битов на проводе) до декодирования. Чтобы приёмник мог восстановить тактовую частоту, поток должен содержать достаточно переходов и не иметь постоянной составляющей (DC balance). Для этого данные кодируются:</p>
+<ul>
+<li><b>8b/10b</b> (Gen1, Gen2): каждый байт превращается в 10-битный символ. Полезная доля 8/10 = 80 %. Кроме 256 символов данных (D-коды) есть служебные K-символы: COM (K28.5), STP (K27.7, начало TLP), SDP (K28.2, начало DLLP), END (K29.7), EDB (K30.7, «плохой конец»), SKP (K28.0) и др.</li>
+<li><b>128b/130b</b> (Gen3 и выше): 128 бит данных + 2-битный заголовок блока; доля 98.46 %. Кадрирование другое (токены вместо K-символов) — нам не понадобится.</li>
+</ul>
+<p>Дополнительно данные скремблируются LFSR-генератором (полином x<sup>16</sup>+x<sup>5</sup>+x<sup>4</sup>+x<sup>3</sup>+1 для 8b/10b), чтобы размазать спектр излучения; на полезную скорость это не влияет.</p>
+
+<table>
+<caption>Таблица 1.1. Скорости поколений PCIe (в каждую сторону)</caption>
+<tr><th>Поколение</th><th class="num">GT/s на lane</th><th>Кодирование</th><th class="num">МБ/с на lane</th><th class="num">x4, ГБ/с</th></tr>
+<tr><td>Gen1 (PCIe 1.x)</td><td class="num">2.5</td><td>8b/10b</td><td class="num">250</td><td class="num">1.00</td></tr>
+<tr><td><b>Gen2 (PCIe 2.x)</b></td><td class="num"><b>5.0</b></td><td>8b/10b</td><td class="num"><b>500</b></td><td class="num"><b>2.00</b></td></tr>
+<tr><td>Gen3 (PCIe 3.x)</td><td class="num">8.0</td><td>128b/130b</td><td class="num">984.6</td><td class="num">3.94</td></tr>
+<tr><td>Gen4 (PCIe 4.0)</td><td class="num">16.0</td><td>128b/130b</td><td class="num">1969</td><td class="num">7.88</td></tr>
+</table>
+
+<p>Наш случай, Gen2 x4, по шагам:</p>
+<pre><code>сырые биты:      5.0 Гбит/с × 4 lanes        = 20 Гбит/с  (в каждую сторону)
+после 8b/10b:    20 Гбит/с × 8/10            = 16 Гбит/с
+в байтах:        16 Гбит/с / 8               = 2.0 ГБ/с   (в каждую сторону, одновременно)
+длительность символа на lane: 10 бит / 5 ГГц = 2 нс → x4 переносит 4 байта за 2 нс</code></pre>
+
+<p>Эти 2.0 ГБ/с — скорость <em>символов данных</em> на линке. Из них ещё вычитаются кадрирование пакетов, заголовки TLP и служебные DLLP (раздел <a href="#s7">1.7</a>), так что реальный потолок для данных — 1.7–1.8 ГБ/с. Линк дуплексный: в обе стороны одновременно идут независимые потоки по 2.0 ГБ/с.</p>
+
+<div class="box"><span class="t">Почему Gen2, если SSD умеет Gen3/Gen4?</span>
+Hard-блок PCIe в Kintex-7 поддерживает максимум Gen2 (трансиверы GTX 7-й серии и сам блок). Любое устройство PCIe обязано поддерживать все младшие скорости, поэтому SSD Gen3/Gen4 честно договорится о 5 GT/s.</div>
+
+<h3>REFCLK, common clock и PERST#</h3>
+
+<p><b>REFCLK</b> — опорная частота 100 МГц (дифференциальная, HCSL) с допуском ±300 ppm. Из неё PLL трансиверов получают частоту бит 2.5 или 5 ГГц. Разъёмы PCIe и M.2 получают REFCLK от хоста. Если обе стороны тактируются <em>от одного источника</em>, это схема <b>common clock</b>; тогда частоты передатчика и приёмника совпадают точно, а разница фаз отрабатывается CDR и эластичными буферами. В нашей плате один генератор 100 МГц через буфер раздаётся на разъём M.2 и на вход опорной частоты GTX. То, что у обеих сторон общий источник, программа сообщает битом Common Clock Configuration в Link Control (раздел <a href="#s5">1.5</a>).</p>
+
+<p><b>PERST#</b> (PCIe Reset, активный низкий) — фундаментальный сброс устройства от хоста. Последовательность включения по спецификации CEM: питание стабильно → не менее 100 мс → снятие PERST#; при этом REFCLK должен быть стабилен не менее 100 мкс до снятия PERST#. После снятия сброса устройство обязано начать обучение линка (войти в Detect) в течение 20 мс, а программа должна выждать не менее 100 мс, прежде чем слать устройству конфигурационные запросы. Если устройство ещё не готово, оно отвечает статусом CRS (Configuration Request Retry Status), и запрос надо повторить (вплоть до 1 с).</p>
+
+<h3>LTSSM: как линк «поднимается»</h3>
+
+<p>Обучением линка управляет автомат <b>LTSSM</b> (Link Training and Status State Machine) в каждом из двух портов. В <b>Detect</b> передатчик проверяет, есть ли на другом конце нагрузка 50 Ом: он меняет синфазное напряжение и измеряет время заряда — так определяется, какие lanes вообще подключены. В <b>Polling</b> стороны обмениваются упорядоченными наборами TS1/TS2 (Training Sequences, по 16 символов): приёмники ловят битовую и символьную синхронизацию по COM, при необходимости инвертируют полярность пары, а из полей TS узнают поддерживаемые партнёром скорости. В <b>Configuration</b> договариваются о ширине линка (x4, если все четыре lane живы), нумерации lanes (возможен разворот, lane reversal) и номере линка. Затем — <b>L0</b>, рабочее состояние, в котором идут TLP и DLLP. После входа в L0 канальный уровень инициализирует кредиты потока (InitFC, раздел <a href="#s3">1.3</a>), и только тогда линк считается поднятым на канальном уровне: флаг <i>DL_Active</i>, в ядре Xilinx — сигнал <code>user_lnk_up</code>.</p>
+
+<p>Обучение <em>всегда</em> начинается на 2.5 GT/s: это единственная скорость, которую гарантированно поддерживают все устройства, а партнёры ещё ничего не знают друг о друге. Узнав из TS1/TS2, что обе стороны умеют 5 GT/s, порт (обычно нисходящий, т.е. наш Root Port) инициирует смену скорости: уходит в <b>Recovery</b>, в TS1 выставляет бит speed change, обе стороны переключают PLL и CDR на 5 GT/s, заново ловят синхронизацию и возвращаются в L0 — уже Gen2. Recovery используется также при ошибках синхронизации и при программной переобучке (бит Retrain Link). В зависимости от настроек ядра смена скорости происходит автоматически или программно: Target Link Speed = 2 в Link Control 2 и затем Retrain Link в Link Control корневого порта. Состояния энергосбережения (L0s, L1, L2) мы отключаем.</p>
+
+<figure>
+<svg viewBox="0 0 760 180" width="760" height="180" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Упрощённая диаграмма LTSSM" font-family="sans-serif" font-size="13">
+<defs><marker id="f13a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="20" y="40" width="120" height="40" rx="14" fill="var(--code-bg)"/>
+<rect x="180" y="40" width="120" height="40" rx="14" fill="var(--code-bg)"/>
+<rect x="340" y="40" width="140" height="40" rx="14" fill="var(--code-bg)"/>
+<rect x="520" y="40" width="120" height="40" rx="14" fill="var(--ok-bg)"/>
+<rect x="520" y="115" width="120" height="40" rx="14" fill="var(--warn-bg)"/>
+</g>
+<g stroke="var(--fg)" stroke-width="1.5" fill="none" marker-end="url(#f13a)">
+<line x1="140" y1="60" x2="178" y2="60"/>
+<line x1="300" y1="60" x2="338" y2="60"/>
+<line x1="480" y1="60" x2="518" y2="60"/>
+<line x1="560" y1="80" x2="560" y2="113"/>
+<line x1="600" y1="115" x2="600" y2="82"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="80" y="65" font-weight="bold">Detect</text>
+<text x="240" y="65" font-weight="bold">Polling</text>
+<text x="410" y="65" font-weight="bold">Configuration</text>
+<text x="580" y="65" font-weight="bold">L0</text>
+<text x="580" y="140" font-weight="bold">Recovery</text>
+<text x="80" y="100" font-size="11">поиск нагрузки 50 Ом</text>
+<text x="240" y="100" font-size="11">TS1/TS2, bit lock,</text>
+<text x="240" y="114" font-size="11">symbol lock, полярность</text>
+<text x="410" y="100" font-size="11">ширина, номера lanes,</text>
+<text x="410" y="114" font-size="11">номер линка</text>
+<text x="650" y="57" font-size="11" text-anchor="start">обычная работа:</text>
+<text x="650" y="72" font-size="11" text-anchor="start">TLP и DLLP</text>
+<text x="650" y="132" font-size="11" text-anchor="start">смена скорости,</text>
+<text x="650" y="147" font-size="11" text-anchor="start">переобучение</text>
+<text x="20" y="172" font-size="11" text-anchor="start" fill="var(--muted)">Detect → Polling → Configuration проходят на 2.5 GT/s; переход на 5 GT/s — через L0 → Recovery → L0.</text>
+</g>
+</svg>
+<figcaption>Рис. 1.3. Упрощённый автомат LTSSM: только состояния, через которые проходит наш линк при старте.</figcaption>
+</figure>
+
+<figure class="wave">
+<svg xmlns="http://www.w3.org/2000/svg" width="793.8" height="282" viewBox="0 0 793.8 282" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wvbc1dd6h" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wvbc1dd6a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker></defs><path d="M105.8,34 V274 M139.8,34 V274 M173.8,34 V274 M207.8,34 V274 M241.8,34 V274 M275.8,34 V274 M309.8,34 V274 M343.8,34 V274 M377.8,34 V274 M411.8,34 V274 M445.8,34 V274 M479.8,34 V274 M513.8,34 V274 M547.8,34 V274 M581.8,34 V274 M615.8,34 V274 M649.8,34 V274 M683.8,34 V274 M717.8,34 V274 M751.8,34 V274 M785.8,34 V274" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="97.8" y="53.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">питание</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M105.8,58 L139.8,58 M139.8,58 L142.8,40 L785.8,40" fill="none"/></g><text x="97.8" y="83.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">REFCLK</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M105.8,88 L139.8,88 M139.8,88 L142.8,70 L156.8,70 L159.8,88 L173.8,88 M173.8,88 L176.8,70 L190.8,70 L193.8,88 L207.8,88 M207.8,88 L210.8,70 L224.8,70 L227.8,88 L241.8,88 M241.8,88 L244.8,70 L258.8,70 L261.8,88 L275.8,88 M275.8,88 L278.8,70 L292.8,70 L295.8,88 L309.8,88 M309.8,88 L312.8,70 L326.8,70 L329.8,88 L343.8,88 M343.8,88 L346.8,70 L360.8,70 L363.8,88 L377.8,88 M377.8,88 L380.8,70 L394.8,70 L397.8,88 L411.8,88 M411.8,88 L414.8,70 L428.8,70 L431.8,88 L445.8,88 M445.8,88 L448.8,70 L462.8,70 L465.8,88 L479.8,88 M479.8,88 L482.8,70 L496.8,70 L499.8,88 L513.8,88 M513.8,88 L516.8,70 L530.8,70 L533.8,88 L547.8,88 M547.8,88 L550.8,70 L564.8,70 L567.8,88 L581.8,88 M581.8,88 L584.8,70 L598.8,70 L601.8,88 L615.8,88 M615.8,88 L618.8,70 L632.8,70 L635.8,88 L649.8,88 M649.8,88 L652.8,70 L666.8,70 L669.8,88 L683.8,88 M683.8,88 L686.8,70 L700.8,70 L703.8,88 L717.8,88 M717.8,88 L720.8,70 L734.8,70 L737.8,88 L751.8,88 M751.8,88 L754.8,70 L768.8,70 L771.8,88 L785.8,88" fill="none"/></g><text x="97.8" y="113.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">PERST#</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M105.8,118 L241.8,118 M241.8,118 L244.8,100 L785.8,100" fill="none"/></g><text x="97.8" y="158.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">LTSSM</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="105.8,163 105.8,145 272.8,145 275.8,154 272.8,163" fill="url(#wvbc1dd6h)"/><polygon points="278.8,163 275.8,154 278.8,145 340.8,145 343.8,154 340.8,163" fill="#ffd7a8"/><text x="309.8" y="157.85" font-size="11" text-anchor="middle" fill="#222">Detect</text><polygon points="346.8,163 343.8,154 346.8,145 408.8,145 411.8,154 408.8,163" fill="#a8d4ff"/><text x="377.8" y="157.85" font-size="11" text-anchor="middle" fill="#222">Polling</text><polygon points="414.8,163 411.8,154 414.8,145 476.8,145 479.8,154 476.8,163" fill="#a8f0ee"/><text x="445.8" y="157.85" font-size="11" text-anchor="middle" fill="#222">Config</text><polygon points="482.8,163 479.8,154 482.8,145 578.8,145 581.8,154 578.8,163" fill="#bff0a8"/><text x="530.8" y="157.85" font-size="11" text-anchor="middle" fill="#222">L0</text><polygon points="584.8,163 581.8,154 584.8,145 646.8,145 649.8,154 646.8,163" fill="#e3b8f5"/><text x="615.8" y="157.85" font-size="11" text-anchor="middle" fill="#222">Recovery</text><polygon points="652.8,163 649.8,154 652.8,145 785.8,145 785.8,163" fill="#bff0a8"/><text x="717.8" y="157.85" font-size="11" text-anchor="middle" fill="#222">L0</text></g><text x="97.8" y="188.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">скорость</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="105.8,193 105.8,175 272.8,175 275.8,184 272.8,193" fill="url(#wvbc1dd6h)"/><polygon points="278.8,193 275.8,184 278.8,175 612.8,175 615.8,184 612.8,193" fill="#e4e4e4"/><text x="445.8" y="187.85" font-size="11" text-anchor="middle" fill="#222">2.5 GT/s (Gen1)</text><polygon points="618.8,193 615.8,184 618.8,175 785.8,175 785.8,193" fill="#e4e4e4"/><text x="700.8" y="187.85" font-size="11" text-anchor="middle" fill="#222">5.0 GT/s (Gen2)</text></g><text x="97.8" y="218.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">DL_Active</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M105.8,223 L513.8,223 M513.8,223 L516.8,205 L785.8,205" fill="none"/></g><text x="97.8" y="263.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">хост (ПЛИС)</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="105.8,268 105.8,250 238.8,250 241.8,259 238.8,268" fill="#e4e4e4"/><text x="173.8" y="262.85" font-size="11" text-anchor="middle" fill="#222">сброс</text><polygon points="244.8,268 241.8,259 244.8,250 680.8,250 683.8,259 680.8,268" fill="#fff3a8"/><text x="462.8" y="262.85" font-size="11" text-anchor="middle" fill="#222">ждём ≥ 100 мс после PERST# (возможен CRS)</text><polygon points="686.8,268 683.8,259 686.8,250 785.8,250 785.8,268" fill="#a8d4ff"/><text x="734.8" y="262.85" font-size="11" text-anchor="middle" fill="#222">CfgRd…</text></g><g stroke="var(--wave-edge, #2a6fb0)" stroke-width="1.2" fill="none"><path d="M141.3,49 C192.3,49 192.3,109 243.3,109" marker-end="url(#wvbc1dd6a)"/><rect x="165.2" y="58" width="54.2" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="192.3" y="68" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">≥100 мс</text><path d="M243.3,109 C260.3,109 260.3,154 277.3,154" marker-end="url(#wvbc1dd6a)"/><rect x="236.5" y="118" width="47.6" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="260.3" y="128" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">&lt;20 мс</text></g><text x="445.8" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" font-weight="600">Подъём линка: сброс, обучение на Gen1, переход на Gen2 (масштаб условный)</text></svg>
+<figcaption>Рис. 1.4. Временная последовательность подъёма линка (масштаб условный, разрывов не показано). Обучение идёт на Gen1, затем Recovery переводит линк на Gen2; DL_Active (<code>user_lnk_up</code>) не падает во время Recovery. Первый CfgRd к SSD — не раньше чем через 100 мс после снятия PERST#.</figcaption>
+</figure>
+
+<div class="box warn"><span class="t">Типичная ошибка</span>
+Слать CfgRd к SSD сразу после <code>user_lnk_up</code>. Линк уже поднят, но контроллер SSD может ещё грузить прошивку: в лучшем случае придёт CRS, в худшем — UR или тайм-аут. Выдерживайте 100 мс после снятия PERST# и обрабатывайте CRS повтором.</div>
+
+<!-- ============================================================ 3 -->
+<h2 id="s3">1.3. Три уровня протокола</h2>
+
+<p>PCIe устроен как стек из трёх уровней, каждый из которых решает свою задачу и добавляет к пакету свои поля.</p>
+<ul>
+<li><b>Transaction Layer</b> (уровень транзакций) формирует и разбирает <b>TLP</b> (Transaction Layer Packet): запросы чтения и записи памяти, конфигурационные запросы, ответы (completions), сообщения. Здесь же — учёт кредитов потока (flow control) и правила упорядочивания.</li>
+<li><b>Data Link Layer</b> (канальный уровень) гарантирует доставку TLP <em>по одному линку</em> без потерь и в порядке отправки: нумерует TLP (sequence number), добавляет LCRC, хранит копии в retry buffer и повторяет при ошибках. Сам он обменивается короткими служебными пакетами <b>DLLP</b> (Data Link Layer Packet): ACK, NAK, UpdateFC и др.</li>
+<li><b>Physical Layer</b> (физический уровень) — кадрирование (STP/SDP … END), распределение по lanes, скремблирование, 8b/10b, сериализация; электрическая часть — трансиверы и LTSSM.</li>
+</ul>
+
+<figure>
+<svg viewBox="0 0 760 320" width="760" height="320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Уровни PCIe" font-family="sans-serif" font-size="13">
+<defs><marker id="f15a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="20" y="30" width="220" height="36" rx="4" fill="var(--code-bg)"/>
+<rect x="20" y="86" width="220" height="50" rx="4" fill="var(--note-bg)"/>
+<rect x="20" y="156" width="220" height="50" rx="4" fill="var(--ok-bg)"/>
+<rect x="20" y="226" width="220" height="50" rx="4" fill="var(--warn-bg)"/>
+<rect x="520" y="30" width="220" height="36" rx="4" fill="var(--code-bg)"/>
+<rect x="520" y="86" width="220" height="50" rx="4" fill="var(--note-bg)"/>
+<rect x="520" y="156" width="220" height="50" rx="4" fill="var(--ok-bg)"/>
+<rect x="520" y="226" width="220" height="50" rx="4" fill="var(--warn-bg)"/>
+</g>
+<g stroke="var(--fg)" stroke-width="1.5" fill="none" marker-end="url(#f15a)">
+<line x1="130" y1="66" x2="130" y2="84"/>
+<line x1="130" y1="136" x2="130" y2="154"/>
+<line x1="130" y1="206" x2="130" y2="224"/>
+<line x1="630" y1="224" x2="630" y2="208"/>
+<line x1="630" y1="154" x2="630" y2="138"/>
+<line x1="630" y1="84" x2="630" y2="68"/>
+</g>
+<path d="M130,276 V302 H630 V278" stroke="var(--accent)" stroke-width="3" fill="none"/>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="130" y="20" font-size="12" fill="var(--muted)">передающая сторона</text>
+<text x="630" y="20" font-size="12" fill="var(--muted)">принимающая сторона</text>
+<text x="130" y="53">Пользовательская логика</text>
+<text x="630" y="53">Пользовательская логика</text>
+<text x="130" y="108" font-weight="bold">Transaction Layer</text>
+<text x="130" y="126" font-size="11">уровень транзакций</text>
+<text x="630" y="108" font-weight="bold">Transaction Layer</text>
+<text x="630" y="126" font-size="11">уровень транзакций</text>
+<text x="130" y="178" font-weight="bold">Data Link Layer</text>
+<text x="130" y="196" font-size="11">канальный уровень</text>
+<text x="630" y="178" font-weight="bold">Data Link Layer</text>
+<text x="630" y="196" font-size="11">канальный уровень</text>
+<text x="130" y="248" font-weight="bold">Physical Layer</text>
+<text x="130" y="266" font-size="11">физический уровень</text>
+<text x="630" y="248" font-weight="bold">Physical Layer</text>
+<text x="630" y="266" font-size="11">физический уровень</text>
+<text x="380" y="106" font-size="12">TLP = Header (12/16 B)</text>
+<text x="380" y="122" font-size="12">+ Data (0…4096 B) [+ ECRC]</text>
+<text x="380" y="176" font-size="12">+ Seq# (2 B) + LCRC (4 B);</text>
+<text x="380" y="192" font-size="12">DLLP: ACK/NAK, UpdateFC</text>
+<text x="380" y="246" font-size="12">+ STP / END; скремблер,</text>
+<text x="380" y="262" font-size="12">8b/10b, striping по lanes</text>
+<text x="380" y="296" font-size="12" fill="var(--accent)">линк</text>
+</g>
+</svg>
+<figcaption>Рис. 1.5. Стек уровней PCIe. На передающей стороне (слева, сверху вниз) пакет «обрастает» полями; на принимающей (справа, снизу вверх) они снимаются в обратном порядке.</figcaption>
+</figure>
+
+<h3>Кадрирование TLP на линке</h3>
+
+<p>Пройдя все три уровня, TLP превращается в последовательность символов:</p>
+
+<figure>
+<svg viewBox="0 0 760 195" width="760" height="195" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Кадрирование TLP" font-family="sans-serif" font-size="13">
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="20" y="50" width="50" height="40" fill="var(--warn-bg)"/>
+<rect x="70" y="50" width="80" height="40" fill="var(--ok-bg)"/>
+<rect x="150" y="50" width="170" height="40" fill="var(--note-bg)"/>
+<rect x="320" y="50" width="200" height="40" fill="var(--note-bg)"/>
+<rect x="520" y="50" width="70" height="40" fill="var(--note-bg)" stroke-dasharray="5,3"/>
+<rect x="590" y="50" width="80" height="40" fill="var(--ok-bg)"/>
+<rect x="670" y="50" width="50" height="40" fill="var(--warn-bg)"/>
+</g>
+<g stroke="var(--fg)" stroke-width="1.2" fill="none">
+<path d="M150,98 V106 H590 V98"/>
+<path d="M70,128 V136 H670 V128"/>
+<path d="M20,158 V166 H720 V158"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="45" y="40" font-size="11" fill="var(--muted)">1</text>
+<text x="110" y="40" font-size="11" fill="var(--muted)">2</text>
+<text x="235" y="40" font-size="11" fill="var(--muted)">12 (3DW) / 16 (4DW)</text>
+<text x="420" y="40" font-size="11" fill="var(--muted)">0 … 4096</text>
+<text x="555" y="40" font-size="11" fill="var(--muted)">0 / 4</text>
+<text x="630" y="40" font-size="11" fill="var(--muted)">4</text>
+<text x="695" y="40" font-size="11" fill="var(--muted)">1</text>
+<text x="20" y="22" font-size="11" text-anchor="start" fill="var(--muted)">байт:</text>
+<text x="45" y="75">STP</text>
+<text x="110" y="75">Seq #</text>
+<text x="235" y="75">Header</text>
+<text x="420" y="75">Data (payload)</text>
+<text x="555" y="75">ECRC</text>
+<text x="630" y="75">LCRC</text>
+<text x="695" y="75">END</text>
+<text x="370" y="122" font-size="12">TLP — Transaction Layer</text>
+<text x="370" y="152" font-size="12">Data Link Layer: + Seq# + LCRC = 6 байт</text>
+<text x="370" y="184" font-size="12">Physical Layer: + STP + END = 2 символа. Итого накладные: 20 B (3DW) / 24 B (4DW)</text>
+</g>
+</svg>
+<figcaption>Рис. 1.6. TLP на линке Gen1/Gen2. Пунктир — необязательный ECRC (только при TD = 1, мы его не используем). Поле Seq# — 4 зарезервированных бита и 12-битный номер.</figcaption>
+</figure>
+
+<p>Накладные расходы на один TLP без ECRC:</p>
+<pre><code>STP 1 + Seq# 2 + Header 12 + LCRC 4 + END 1 = 20 байт  (3DW-заголовок: MRd32, MWr32, Cpl, CplD, Cfg)
+STP 1 + Seq# 2 + Header 16 + LCRC 4 + END 1 = 24 байта (4DW-заголовок: MRd64, MWr64)</code></pre>
+<p>Итак, запись 4 байт (одного DW) по 32-битному адресу занимает на линке 24 байта, а ответ с 256 байтами данных — 276 байт. Каждый DLLP — это SDP + 6 байт (тип, поля, CRC-16) + END = 8 байт.</p>
+
+<p>Как 24 байта записи MWr32 (пример (а) из раздела <a href="#s4">1.4</a>) ложатся на четыре lane: байт <i>k</i> идёт в lane <i>k</i> mod 4. Для x4 символ STP всегда стоит в lane 0, а так как длина любого TLP на линке кратна 4 байтам (20 + 4·n), END всегда попадает в lane 3.</p>
+
+<figure>
+<svg viewBox="0 0 760 260" width="760" height="260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Распределение байтов TLP по четырём lane" font-family="sans-serif" font-size="12">
+<g fill="var(--fg)" text-anchor="middle" font-weight="bold">
+<text x="220" y="38">Lane 0</text><text x="350" y="38">Lane 1</text><text x="480" y="38">Lane 2</text><text x="610" y="38">Lane 3</text>
+</g>
+<g stroke="var(--fg)" stroke-width="1">
+<rect x="160" y="50" width="120" height="26" fill="var(--warn-bg)"/><rect x="290" y="50" width="120" height="26" fill="var(--ok-bg)"/><rect x="420" y="50" width="120" height="26" fill="var(--ok-bg)"/><rect x="550" y="50" width="120" height="26" fill="var(--note-bg)"/>
+<rect x="160" y="80" width="120" height="26" fill="var(--note-bg)"/><rect x="290" y="80" width="120" height="26" fill="var(--note-bg)"/><rect x="420" y="80" width="120" height="26" fill="var(--note-bg)"/><rect x="550" y="80" width="120" height="26" fill="var(--note-bg)"/>
+<rect x="160" y="110" width="120" height="26" fill="var(--note-bg)"/><rect x="290" y="110" width="120" height="26" fill="var(--note-bg)"/><rect x="420" y="110" width="120" height="26" fill="var(--note-bg)"/><rect x="550" y="110" width="120" height="26" fill="var(--note-bg)"/>
+<rect x="160" y="140" width="120" height="26" fill="var(--note-bg)"/><rect x="290" y="140" width="120" height="26" fill="var(--note-bg)"/><rect x="420" y="140" width="120" height="26" fill="var(--note-bg)"/><rect x="550" y="140" width="120" height="26" fill="var(--code-bg)"/>
+<rect x="160" y="170" width="120" height="26" fill="var(--code-bg)"/><rect x="290" y="170" width="120" height="26" fill="var(--code-bg)"/><rect x="420" y="170" width="120" height="26" fill="var(--code-bg)"/><rect x="550" y="170" width="120" height="26" fill="var(--ok-bg)"/>
+<rect x="160" y="200" width="120" height="26" fill="var(--ok-bg)"/><rect x="290" y="200" width="120" height="26" fill="var(--ok-bg)"/><rect x="420" y="200" width="120" height="26" fill="var(--ok-bg)"/><rect x="550" y="200" width="120" height="26" fill="var(--warn-bg)"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle" font-family="monospace">
+<text x="220" y="68">STP (K27.7)</text><text x="350" y="68">Seq[11:8]</text><text x="480" y="68">Seq[7:0]</text><text x="610" y="68">H0 = 40</text>
+<text x="220" y="98">H1 = 00</text><text x="350" y="98">H2 = 00</text><text x="480" y="98">H3 = 01</text><text x="610" y="98">H4 = 00</text>
+<text x="220" y="128">H5 = 00</text><text x="350" y="128">H6 = 00</text><text x="480" y="128">H7 = 0F</text><text x="610" y="128">H8 = C0</text>
+<text x="220" y="158">H9 = 00</text><text x="350" y="158">H10 = 10</text><text x="480" y="158">H11 = 08</text><text x="610" y="158">D0 = 01</text>
+<text x="220" y="188">D1 = 00</text><text x="350" y="188">D2 = 00</text><text x="480" y="188">D3 = 00</text><text x="610" y="188">LCRC 0</text>
+<text x="220" y="218">LCRC 1</text><text x="350" y="218">LCRC 2</text><text x="480" y="218">LCRC 3</text><text x="610" y="218">END (K29.7)</text>
+</g>
+<g fill="var(--muted)" text-anchor="end" font-size="11">
+<text x="150" y="68">t = 0 нс</text><text x="150" y="98">2 нс</text><text x="150" y="128">4 нс</text><text x="150" y="158">6 нс</text><text x="150" y="188">8 нс</text><text x="150" y="218">10 нс</text>
+</g>
+<text x="380" y="250" text-anchor="middle" font-size="11" fill="var(--muted)">24 байта = 6 символьных тактов по 2 нс (Gen2): запись одного DW занимает линк на 12 нс</text>
+</svg>
+<figcaption>Рис. 1.7. Striping TLP MWr32 (запись 0x0000_0001 по адресу 0xC000_1008) по линку x4. H — байты заголовка (старший байт DW первым), D — байты данных (в порядке возрастания адреса), Seq и LCRC добавляет канальный уровень.</figcaption>
+</figure>
+
+<h3>Канальный уровень: ACK/NAK и retry buffer</h3>
+
+<p>Физический канал не идеален: вероятность битовой ошибки на линке порядка 10<sup>−12</sup>, и при 20 Гбит/с это одна ошибка раз в минуту. Канальный уровень делает линк надёжным так:</p>
+<ol>
+<li>Передатчик присваивает каждому TLP 12-битный номер <b>Seq#</b> (NEXT_TRANSMIT_SEQ, по модулю 4096), считает 32-битный <b>LCRC</b> по Seq# и TLP, отправляет пакет и <em>кладёт копию в retry buffer</em>.</li>
+<li>Приёмник проверяет LCRC и номер. Если всё верно и номер равен ожидаемому (NEXT_RCV_SEQ), TLP передаётся на уровень транзакций, а приёмник (не на каждый пакет, а периодически, по таймеру AckNak_Latency) отправляет DLLP <b>ACK n</b>: «всё до номера n включительно принято».</li>
+<li>Получив ACK n, передатчик удаляет из retry buffer все TLP с номерами ≤ n.</li>
+<li>При ошибке LCRC приёмник отбрасывает пакет и отправляет <b>NAK n</b>, где n — номер последнего <em>правильно</em> принятого TLP. Все последующие пакеты с «неожиданными» номерами он тоже отбрасывает.</li>
+<li>Получив NAK n, передатчик освобождает TLP ≤ n и <em>повторяет (replay)</em> всё содержимое retry buffer по порядку. Если ни ACK, ни NAK не пришли за время REPLAY_TIMER, повтор запускается по тайм-ауту; после четырёх безуспешных повторов подряд порт уводит линк в Recovery.</li>
+</ol>
+
+<figure>
+<svg viewBox="0 0 760 430" width="760" height="430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Протокол ACK/NAK" font-family="sans-serif" font-size="12">
+<defs>
+<marker id="f18a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent)"/></marker>
+<marker id="f18b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent2)"/></marker>
+</defs>
+<g stroke="var(--muted)" stroke-width="2"><line x1="230" y1="42" x2="230" y2="415"/><line x1="530" y1="42" x2="530" y2="415"/></g>
+<g stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f18a)">
+<line x1="230" y1="60" x2="528" y2="85"/>
+<line x1="230" y1="95" x2="528" y2="120"/>
+<line x1="230" y1="180" x2="528" y2="205"/>
+<line x1="230" y1="215" x2="528" y2="240"/>
+<line x1="230" y1="300" x2="528" y2="325"/>
+<line x1="230" y1="335" x2="528" y2="360"/>
+</g>
+<g stroke="var(--accent2)" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#f18b)">
+<line x1="530" y1="135" x2="232" y2="160"/>
+<line x1="530" y1="255" x2="232" y2="280"/>
+<line x1="530" y1="375" x2="232" y2="400"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="230" y="30" font-weight="bold" font-size="13">Передатчик (Root Port)</text>
+<text x="530" y="30" font-weight="bold" font-size="13">Приёмник (SSD)</text>
+<text x="380" y="64" fill="var(--accent)">TLP seq 5</text>
+<text x="380" y="99" fill="var(--accent)">TLP seq 6</text>
+<text x="380" y="140" fill="var(--accent2)">ACK 6 (DLLP)</text>
+<text x="380" y="184" fill="var(--accent)">TLP seq 7</text>
+<text x="380" y="219" fill="var(--accent)">TLP seq 8</text>
+<text x="380" y="260" fill="var(--accent2)">NAK 6 (DLLP)</text>
+<text x="380" y="304" fill="var(--accent)">TLP seq 7 (повтор)</text>
+<text x="380" y="339" fill="var(--accent)">TLP seq 8 (повтор)</text>
+<text x="380" y="380" fill="var(--accent2)">ACK 8 (DLLP)</text>
+<text x="540" y="212" font-size="22" fill="var(--accent2)">×</text>
+</g>
+<g fill="var(--fg)" text-anchor="end" font-size="11">
+<text x="220" y="100">retry buffer: [5, 6]</text>
+<text x="220" y="164">ACK 6 → удалить 5, 6</text>
+<text x="220" y="220">retry buffer: [7, 8]</text>
+<text x="220" y="284">NAK 6 → повторить 7, 8</text>
+<text x="220" y="404">ACK 8 → буфер пуст</text>
+</g>
+<g fill="var(--fg)" text-anchor="start" font-size="11">
+<text x="545" y="89">ok, ждём 6</text>
+<text x="545" y="124">ok, ждём 7</text>
+<text x="560" y="209">ошибка LCRC → отброшен</text>
+<text x="545" y="244">seq 8 ≠ 7 → отброшен</text>
+<text x="545" y="329">ok, ждём 8</text>
+<text x="545" y="364">ok, ждём 9</text>
+</g>
+</svg>
+<figcaption>Рис. 1.8. ACK/NAK и retry buffer. TLP 7 искажён на линии; приёмник отбрасывает его и все следующие, отвечает NAK с номером последнего хорошего пакета; передатчик повторяет содержимое retry buffer. Для уровня транзакций всё прозрачно: он получает 5, 6, 7, 8 ровно по одному разу и по порядку.</figcaption>
+</figure>
+
+<p>Следствие для разработчика: в ПЛИС всё это делает hard-блок. Пользователь не видит ни Seq#, ни LCRC, ни повторов — только замечает, что иногда пропускная способность чуть падает. Но размер retry buffer и задержка ACK ограничивают, сколько TLP может быть «в полёте», — это одна из причин, почему реальная скорость ниже 2.0 ГБ/с.</p>
+
+<h3>Кредиты потока (flow control) на пальцах</h3>
+
+<p>ACK/NAK защищает от <em>искажений</em>, но не от <em>переполнения</em>: если приёмнику некуда положить пакет, повтор не поможет. Поэтому в PCIe передатчик никогда не посылает TLP, для которого у приёмника нет места. Приёмник заранее сообщает, сколько у него свободного буфера, в единицах — <b>кредитах</b> (credits):</p>
+<ul>
+<li>1 кредит заголовка (H) — место под один заголовок TLP;</li>
+<li>1 кредит данных (D) — 16 байт (4 DW) полезной нагрузки.</li>
+</ul>
+<p>Кредиты ведутся раздельно для трёх классов TLP — <b>Posted</b> (P: MWr, Msg), <b>Non-Posted</b> (NP: MRd, CfgRd, CfgWr) и <b>Completion</b> (Cpl: Cpl, CplD), — итого шесть счётчиков: PH, PD, NPH, NPD, CplH, CplD. После L0 стороны обмениваются DLLP InitFC1/InitFC2 с начальными значениями. Передатчик ведёт для каждого типа CREDIT_LIMIT (сколько всего разрешено) и CREDITS_CONSUMED (сколько израсходовано) и посылает TLP, только если хватает кредитов обоих видов. Приёмник, освободив буфер (TLP ушёл на уровень транзакций и был обработан), шлёт DLLP <b>UpdateFC</b> с новым пределом. Значение 0 в InitFC означает «бесконечно» — так Endpoint и RC обычно объявляют кредиты для Completion: запрашивающий сам обязан заранее зарезервировать место под ответы на свои чтения.</p>
+
+<figure>
+<svg viewBox="0 0 760 290" width="760" height="290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Кредиты потока" font-family="sans-serif" font-size="12">
+<defs>
+<marker id="f19a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent)"/></marker>
+<marker id="f19b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent2)"/></marker>
+</defs>
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="20" y="30" width="230" height="180" rx="6" fill="var(--note-bg)"/>
+<rect x="510" y="30" width="230" height="180" rx="6" fill="var(--ok-bg)"/>
+</g>
+<g stroke="var(--fg)" stroke-width="1" fill="var(--bg)">
+<rect x="527" y="70" width="26" height="100"/><rect x="563" y="70" width="26" height="100"/><rect x="599" y="70" width="26" height="100"/><rect x="635" y="70" width="26" height="100"/><rect x="671" y="70" width="26" height="100"/><rect x="707" y="70" width="26" height="100"/>
+</g>
+<g fill="var(--accent)" opacity="0.45">
+<rect x="527" y="140" width="26" height="30"/><rect x="563" y="110" width="26" height="60"/><rect x="599" y="160" width="26" height="10"/><rect x="671" y="150" width="26" height="20"/><rect x="707" y="120" width="26" height="50"/>
+</g>
+<g stroke="var(--accent)" stroke-width="1.5" marker-end="url(#f19a)"><line x1="250" y1="80" x2="508" y2="80"/></g>
+<g stroke="var(--accent2)" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#f19b)"><line x1="510" y1="170" x2="252" y2="170"/></g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="135" y="52" font-weight="bold" font-size="13">Передатчик</text>
+<text x="625" y="52" font-weight="bold" font-size="13">Приёмник: буферы</text>
+<text x="540" y="186" font-size="10">PH</text><text x="576" y="186" font-size="10">PD</text><text x="612" y="186" font-size="10">NPH</text><text x="648" y="186" font-size="10">NPD</text><text x="684" y="186" font-size="10">CplH</text><text x="720" y="186" font-size="10">CplD</text>
+<text x="625" y="202" font-size="10" fill="var(--muted)">закрашено — занято</text>
+<text x="380" y="72" fill="var(--accent)">TLP MWr, 256 B данных</text>
+<text x="380" y="98" font-size="11">расходует 1 PH + 16 PD</text>
+<text x="380" y="162" fill="var(--accent2)">UpdateFC(P): PD limit = 80</text>
+<text x="380" y="188" font-size="11">буфер освободился на 16 кредитов</text>
+</g>
+<g fill="var(--fg)" text-anchor="start" font-family="monospace" font-size="12">
+<text x="34" y="82">для PD:</text>
+<text x="34" y="104">CREDIT_LIMIT     = 64</text>
+<text x="34" y="124">CREDITS_CONSUMED = 40</text>
+<text x="34" y="144">свободно = 24 кр.</text>
+<text x="34" y="164">        = 384 байта</text>
+<text x="34" y="192" font-family="sans-serif" font-size="11">256 B = 16 кр. ≤ 24 → можно</text>
+</g>
+<g fill="var(--fg)" text-anchor="start" font-size="12">
+<text x="20" y="236">1 кредит заголовка (H) = один TLP-заголовок; 1 кредит данных (D) = 16 байт (4 DW).</text>
+<text x="20" y="256">Классы: Posted (MWr, Msg), Non-Posted (MRd, Cfg), Completion (Cpl, CplD) — у каждого свои H и D.</text>
+<text x="20" y="276">Правило: TLP уходит, только если CREDITS_CONSUMED + нужное ≤ CREDIT_LIMIT (по модулю счётчика).</text>
+</g>
+</svg>
+<figcaption>Рис. 1.9. Кредитное управление потоком. Передатчик «тратит» кредиты при отправке, приёмник «возвращает» их DLLP UpdateFC. При нехватке кредитов передатчик ждёт — в интерфейсе ядра это выглядит как снятый <code>tready</code>.</figcaption>
+</figure>
+
+<div class="box"><span class="t">Почему это важно для нас</span>
+Если SSD выставил мало кредитов NPH, наш хост не сможет отправить ему много запросов подряд; если наш completer медленно забирает MRd из буфера приёма, SSD не получит обратно кредиты NPH для следующих чтений. Кредиты — это «встроенный закон Литтла»: они ограничивают число TLP в полёте.</div>
+
+<!-- ============================================================ 4 -->
+<h2 id="s4">1.4. TLP во всех деталях</h2>
+
+<p>Заголовок TLP состоит из 3 или 4 двойных слов. На линке байты заголовка идут в порядке «байт 0 первым», а внутри DW байт 0 — старший (биты 31:24), т.е. заголовок записывается в <em>big-endian</em>. Данные (payload) идут в порядке возрастания адресов: байт по адресу A, затем A+1 и т.д. Поскольку хосты обычно little-endian, 32-битное значение <code>0x0000_0001</code>, записанное по адресу A, на линке выглядит как байты <code>01 00 00 00</code>.</p>
+
+<h3>Общая часть: DW0 и заголовок запроса к памяти</h3>
+
+<figure>
+<svg viewBox="0 0 760 270" width="760" height="270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Заголовок TLP запроса к памяти" font-family="sans-serif" font-size="11">
+<g fill="var(--fg)" text-anchor="middle" font-size="12">
+<text x="128" y="22">Байт 0</text><text x="304" y="22">Байт 1</text><text x="480" y="22">Байт 2</text><text x="656" y="22">Байт 3</text>
+</g>
+<g fill="var(--muted)" text-anchor="middle" font-size="9" font-family="monospace">
+<text x="51" y="46">31</text><text x="205" y="46">24</text><text x="227" y="46">23</text><text x="381" y="46">16</text><text x="403" y="46">15</text><text x="557" y="46">8</text><text x="579" y="46">7</text><text x="733" y="46">0</text>
+</g>
+<g stroke="var(--fg)" stroke-width="1">
+<rect x="40" y="52" width="66" height="36" fill="var(--warn-bg)"/>
+<rect x="106" y="52" width="110" height="36" fill="var(--warn-bg)"/>
+<rect x="216" y="52" width="22" height="36" fill="var(--code-bg)"/>
+<rect x="238" y="52" width="66" height="36" fill="var(--note-bg)"/>
+<rect x="304" y="52" width="88" height="36" fill="var(--code-bg)"/>
+<rect x="392" y="52" width="22" height="36" fill="var(--note-bg)"/>
+<rect x="414" y="52" width="22" height="36" fill="var(--note-bg)"/>
+<rect x="436" y="52" width="44" height="36" fill="var(--note-bg)"/>
+<rect x="480" y="52" width="44" height="36" fill="var(--code-bg)"/>
+<rect x="524" y="52" width="220" height="36" fill="var(--ok-bg)"/>
+<rect x="40" y="97" width="352" height="36" fill="var(--note-bg)"/>
+<rect x="392" y="97" width="176" height="36" fill="var(--ok-bg)"/>
+<rect x="568" y="97" width="88" height="36" fill="var(--warn-bg)"/>
+<rect x="656" y="97" width="88" height="36" fill="var(--warn-bg)"/>
+<rect x="40" y="142" width="660" height="36" fill="var(--code-bg)"/>
+<rect x="700" y="142" width="44" height="36" fill="var(--bg)"/>
+<rect x="40" y="187" width="660" height="36" fill="var(--code-bg)" stroke-dasharray="5,3"/>
+<rect x="700" y="187" width="44" height="36" fill="var(--bg)" stroke-dasharray="5,3"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="73" y="74">Fmt</text><text x="161" y="74">Type</text><text x="227" y="74" font-size="9">R</text><text x="271" y="74">TC</text><text x="348" y="74">R*</text>
+<text x="403" y="74" font-size="9">TD</text><text x="425" y="74" font-size="9">EP</text><text x="458" y="74">Attr</text><text x="502" y="74">AT</text><text x="634" y="74">Length [9:0] (в DW)</text>
+<text x="216" y="119">Requester ID (Bus 8 | Device 5 | Function 3)</text><text x="480" y="119">Tag</text><text x="612" y="119">Last DW BE</text><text x="700" y="119">First DW BE</text>
+<text x="370" y="164">Address [31:2]   (в 4DW здесь Address [63:32], все 32 бита)</text><text x="722" y="164" font-size="9">R</text>
+<text x="370" y="209">Address [31:2] — только в 4DW-формате (MRd64 / MWr64)</text><text x="722" y="209" font-size="9">R</text>
+</g>
+<g fill="var(--fg)" text-anchor="end" font-size="12" font-weight="bold">
+<text x="34" y="74">DW0</text><text x="34" y="119">DW1</text><text x="34" y="164">DW2</text><text x="34" y="209">DW3</text>
+</g>
+<text x="40" y="252" font-size="11" fill="var(--muted)">R* — в ревизии 2.x зарезервировано; в 3.0+ это T8/Attr[2]/LN/TH (расширения). R — зарезервировано. Мы везде пишем 0.</text>
+</svg>
+<figcaption>Рис. 1.10. Заголовок запроса к памяти (MRd/MWr). DW0 общий для всех TLP. 3DW-формат — DW0…DW2 с 32-битным адресом; 4DW-формат добавляет DW3, и тогда DW2 содержит старшие 32 бита адреса.</figcaption>
+</figure>
+
+<p>Поля DW0, общие для всех TLP:</p>
+<ul>
+<li><b>Fmt[2:0]</b> (биты 31:29) — формат: 000 = 3DW без данных, 001 = 4DW без данных, 010 = 3DW с данными, 011 = 4DW с данными, 100 = TLP-префикс (не используем).</li>
+<li><b>Type[4:0]</b> (биты 28:24) — тип транзакции; вместе с Fmt однозначно определяет TLP (таблица 1.2).</li>
+<li><b>TC[2:0]</b> (биты 22:20) — Traffic Class, класс трафика для QoS. У нас всегда 0.</li>
+<li><b>TD</b> (бит 15) — TLP Digest: 1 = в конце есть ECRC. У нас 0.</li>
+<li><b>EP</b> (бит 14) — Poisoned: данные испорчены (например, ошибка ECC в памяти completer’а). Получатель не должен их использовать.</li>
+<li><b>Attr[1:0]</b> (биты 13:12) — атрибуты: бит 13 — Relaxed Ordering (RO, разрешает нарушать часть правил упорядочивания), бит 12 — No Snoop (не нужно проверять кэши CPU). У нас 00.</li>
+<li><b>AT[1:0]</b> (биты 11:10) — Address Type для ATS; 00.</li>
+<li><b>Length[9:0]</b> (биты 9:0) — длина <em>полезной нагрузки</em> в DW (для чтения — сколько DW запрошено). Значение 0 означает 1024 DW = 4096 байт. Для TLP без данных (кроме чтений) поле зарезервировано.</li>
+</ul>
+
+<table>
+<caption>Таблица 1.2. Коды Fmt/Type основных TLP и значение байта 0 заголовка</caption>
+<tr><th>TLP</th><th>Назначение</th><th>Fmt</th><th>Type</th><th class="num">Байт 0</th><th>Класс</th></tr>
+<tr><td>MRd32</td><td>чтение памяти, 32-битный адрес</td><td>000</td><td>0 0000</td><td class="num">0x00</td><td>Non-posted</td></tr>
+<tr><td>MRd64</td><td>чтение памяти, 64-битный адрес</td><td>001</td><td>0 0000</td><td class="num">0x20</td><td>Non-posted</td></tr>
+<tr><td>MWr32</td><td>запись памяти, 32-битный адрес</td><td>010</td><td>0 0000</td><td class="num">0x40</td><td>Posted</td></tr>
+<tr><td>MWr64</td><td>запись памяти, 64-битный адрес</td><td>011</td><td>0 0000</td><td class="num">0x60</td><td>Posted</td></tr>
+<tr><td>CfgRd0</td><td>чтение конфигурации, Type 0</td><td>000</td><td>0 0100</td><td class="num">0x04</td><td>Non-posted</td></tr>
+<tr><td>CfgWr0</td><td>запись конфигурации, Type 0</td><td>010</td><td>0 0100</td><td class="num">0x44</td><td>Non-posted</td></tr>
+<tr><td>CfgRd1 / CfgWr1</td><td>конфигурация, Type 1 (за мостом)</td><td>000 / 010</td><td>0 0101</td><td class="num">0x05 / 0x45</td><td>Non-posted</td></tr>
+<tr><td>Cpl</td><td>ответ без данных</td><td>000</td><td>0 1010</td><td class="num">0x0A</td><td>Completion</td></tr>
+<tr><td>CplD</td><td>ответ с данными</td><td>010</td><td>0 1010</td><td class="num">0x4A</td><td>Completion</td></tr>
+<tr><td>Msg / MsgD</td><td>сообщение (r[2:0] — маршрутизация)</td><td>001 / 011</td><td>1 0rrr</td><td class="num">0x30–0x37 / 0x70–0x77</td><td>Posted</td></tr>
+</table>
+
+<h3>Запросы к памяти: DW1 и адрес</h3>
+<ul>
+<li><b>Requester ID</b> (DW1[31:16]) — BDF отправителя запроса. По нему completer адресует ответ.</li>
+<li><b>Tag</b> (DW1[15:8]) — номер незавершённого запроса у данного requester’а. Пара (Requester ID, Tag) уникально идентифицирует non-posted запрос, пока на него не пришёл последний ответ. По умолчанию используются только 5 младших бит (32 одновременных запроса); с битом Extended Tag Field Enable в Device Control — все 8 бит (256). Для posted-записей tag никем не проверяется, но поле есть.</li>
+<li><b>First DW BE / Last DW BE</b> (DW1[3:0] / DW1[7:4]) — маски разрешения байтов в первом и последнем DW (бит i = байт i внутри DW, т.е. адрес 4k+i). Если Length = 1, то Last BE обязан быть 0000. Если Length ≥ 2, Last BE ненулевой. Для обычных выровненных передач First BE = Last BE = 1111.</li>
+<li><b>Address</b> — адрес первого DW; два младших бита адреса не передаются (байтовая точность — через First BE). Если адрес ниже 4 ГиБ, requester <em>обязан</em> использовать 3DW-формат (MRd32/MWr32); 4DW допустим только для адресов ≥ 4 ГиБ.</li>
+</ul>
+
+<div class="box"><span class="t">Posted и non-posted</span>
+<b>Posted</b> (MWr, Msg) — «отправил и забыл»: ответа нет, отправитель не узнает, дошла ли запись. Поэтому запись быстрая: следующую можно слать сразу. <b>Non-posted</b> (MRd, CfgRd, CfgWr, IO) — требуют ответа (Completion): Cpl или CplD. Даже CfgWr — non-posted: Cpl без данных подтверждает, что запись выполнена. Чтение памяти, таким образом, стоит минимум круг «запрос → ответ», и именно латентность этого круга будет определять скорость в разделе <a href="#s7">1.7</a>.</div>
+
+<p>Правила упорядочивания (при RO = 0) в одном направлении: posted-запрос не обгоняет предыдущий posted; non-posted и completion не обгоняют предыдущий posted. Отсюда классическая гарантия «производитель-потребитель»: если устройство сначала записало данные (MWr), а затем запись в очередь завершений (MWr), то хост увидит запись в очереди не раньше данных.</p>
+
+<h3>Пример (а): MWr32, 1 DW — запись в doorbell</h3>
+
+<p>Хост (наш Root Port 00:00.0, ID = 0x0000) пишет значение 0x0000_0001 по адресу 0xC000_1008. Если BAR0 контроллера NVMe назначен на 0xC000_0000, то смещение 0x1008 при CAP.DSTRD = 0 — это doorbell хвоста очереди отправки №1 (SQ1 Tail, глава 2).</p>
+
+<pre><code>DW0 = 0x4000_0001   Fmt=010 (3DW, с данными) Type=00000 (MWr) TC=0 TD=0 EP=0 Attr=00 Length=1
+DW1 = 0x0000_000F   Requester ID=0x0000 (00:00.0) Tag=0x00 LastBE=0000 FirstBE=1111
+DW2 = 0xC000_1008   Address[31:2] = 0xC000_1008 >> 2, биты 1:0 = 00
+Data = 0x0000_0001  на линке байты: 01 00 00 00
+
+На линке: STP | Seq | 40 00 00 01 | 00 00 00 0F | C0 00 10 08 | 01 00 00 00 | LCRC×4 | END  (24 байта)</code></pre>
+
+<h3>Пример (б): MRd32 на 512 байт — SSD читает память хоста</h3>
+
+<p>SSD (01:00.0, ID = 0x0100) читает 512 байт по адресу 0x4002_0000 (буфер данных в нашей «памяти хоста»), используя тег 0x15. Length = 512 / 4 = 128 = 0x080 DW.</p>
+
+<pre><code>DW0 = 0x0000_0080   Fmt=000 (3DW, без данных) Type=00000 (MRd) Length=0x080 (128 DW)
+DW1 = 0x0100_15FF   Requester ID=0x0100 (01:00.0) Tag=0x15 LastBE=1111 FirstBE=1111
+DW2 = 0x4002_0000   Address = 0x4002_0000</code></pre>
+<p>Чтобы SSD мог выдать такой запрос, его MRRS (Max Read Request Size) должен быть ≥ 512 байт.</p>
+
+<h3>Заголовок Completion</h3>
+
+<p>Ответ (Cpl или CplD) имеет 3DW-заголовок со своими полями в DW1 и DW2:</p>
+
+<div class="bits"><span style="flex:16">Completer ID<small>DW1 31:16</small></span><span style="flex:3">Cpl Status<small>15:13</small></span><span style="flex:1">BCM<small>12</small></span><span style="flex:12">Byte Count<small>11:0</small></span></div>
+<div class="bits"><span style="flex:16">Requester ID<small>DW2 31:16</small></span><span style="flex:8">Tag<small>15:8</small></span><span style="flex:1">R<small>7</small></span><span style="flex:7">Lower Address<small>6:0</small></span></div>
+
+<ul>
+<li><b>Completer ID</b> — BDF того, кто отвечает.</li>
+<li><b>Completion Status</b> — результат (таблица 1.3).</li>
+<li><b>BCM</b> (Byte Count Modified) — используется только мостами PCI-X; у нас 0.</li>
+<li><b>Byte Count</b> — сколько байт <em>осталось вернуть</em> по этому запросу, <em>включая</em> данные текущего completion. Значение 0 означает 4096. Для первого completion это полный размер запроса; для последнего — длина его собственных данных. Для ответов на CfgRd/CfgWr Byte Count = 4.</li>
+<li><b>Requester ID</b> и <b>Tag</b> — копируются из запроса; по ним requester находит, на какой из незавершённых запросов пришёл ответ.</li>
+<li><b>Lower Address</b> — 7 младших бит байтового адреса первого байта данных <em>в этом</em> completion. Для ответов не на чтение памяти — 0.</li>
+</ul>
+
+<table>
+<caption>Таблица 1.3. Коды Completion Status</caption>
+<tr><th>Код</th><th>Имя</th><th>Смысл</th></tr>
+<tr><td>000</td><td>SC — Successful Completion</td><td>успешно</td></tr>
+<tr><td>001</td><td>UR — Unsupported Request</td><td>запрос не поддерживается (нет такого адреса, функции, типа; устройство отключено битом MSE и т.п.)</td></tr>
+<tr><td>010</td><td>CRS — Configuration Request Retry Status</td><td>только для Cfg: устройство ещё инициализируется, повторите позже</td></tr>
+<tr><td>100</td><td>CA — Completer Abort</td><td>completer понял запрос, но не может его выполнить (внутренняя ошибка)</td></tr>
+</table>
+
+<h3>Разбиение ответа: MPS, RCB и порядок</h3>
+
+<p>Один запрос на чтение может вернуться несколькими CplD. Ограничения:</p>
+<ul>
+<li><b>MPS</b> (Max Payload Size) — максимальный размер данных в любом TLP (MWr или CplD), который порт имеет право <em>отправить</em>. Значение программируется в Device Control (биты 7:5) и должно быть одинаковым на обоих концах линка — минимум из того, что поддерживают оба (поле MPSS в Device Capabilities). Типично 128 или 256 байт.</li>
+<li><b>MRRS</b> (Max Read Request Size) — максимальный размер одного запроса чтения, который функция имеет право выдать; Device Control, биты 14:12. MRRS может быть больше MPS: тогда ответ обязательно придёт несколькими CplD.</li>
+<li><b>RCB</b> (Read Completion Boundary) — 64 или 128 байт. Если completer делит ответ на части, каждая часть, кроме последней, должна заканчиваться на адресе, кратном RCB. Для Root Complex RCB = 64 или 128 (свойство RC), для Endpoint задаётся битом RCB в Link Control (0 = 64, 1 = 128).</li>
+<li>Completions на один запрос (один Tag) приходят <em>по возрастанию адресов</em>; ответы на <em>разные</em> теги могут перемешиваться.</li>
+</ul>
+
+<table>
+<caption>Таблица 1.4. Кодирование MPS (Device Control[7:5], MPSS в Device Capabilities[2:0]) и MRRS (Device Control[14:12])</caption>
+<tr><th>Код</th><th class="num">000</th><th class="num">001</th><th class="num">010</th><th class="num">011</th><th class="num">100</th><th class="num">101</th></tr>
+<tr><td>Байт</td><td class="num">128</td><td class="num">256</td><td class="num">512</td><td class="num">1024</td><td class="num">2048</td><td class="num">4096</td></tr>
+</table>
+<p>Значения по умолчанию после сброса: MPS = 000 (128 байт), MRRS = 010 (512 байт).</p>
+
+<h3>Пример (в): ответ на MRd из примера (б) двумя CplD по 256 байт</h3>
+
+<p>Наш completer (ID = 0x0000) отвечает при MPS = 256 двумя CplD. Каждый несёт 64 DW. Адрес начала второй части 0x4002_0100 кратен и 64, и 128 — правило RCB соблюдено.</p>
+
+<pre><code>CplD №1 (байты 0x4002_0000 … 0x4002_00FF):
+DW0 = 0x4A00_0040   Fmt=010 Type=01010 (CplD) Length=0x040 (64 DW = 256 B)
+DW1 = 0x0000_0200   Completer ID=0x0000 Status=000 (SC) BCM=0 Byte Count=0x200 (512: осталось всё)
+DW2 = 0x0100_1500   Requester ID=0x0100 Tag=0x15 Lower Address=0x00 (0x4002_0000 &amp; 0x7F)
++ 256 байт данных
+
+CplD №2 (байты 0x4002_0100 … 0x4002_01FF):
+DW0 = 0x4A00_0040   Length=64 DW
+DW1 = 0x0000_0100   Byte Count=0x100 (256: осталось только это)
+DW2 = 0x0100_1500   Tag=0x15 Lower Address=0x00 (0x4002_0100 &amp; 0x7F)
++ 256 байт данных</code></pre>
+
+<p>Requester (SSD) понимает, что запрос завершён, когда Byte Count текущего completion равен длине его данных (Length × 4 с поправкой на невыровненные края): 256 = 64 × 4. Смещение данных очередной части от начала запроса однозначно следует из Byte Count: смещение = (полный размер запроса − Byte Count). Lower Address дублирует младшие биты адреса этой части и служит проверкой; кроме того, он нужен, когда первый байт не выровнен на DW (First BE ≠ 1111).</p>
+
+<div class="box warn"><span class="t">Типичная ошибка</span>
+Писать в Byte Count длину <em>текущего</em> completion. Правильно — остаток, включая текущий. При неверном Byte Count SSD сочтёт запрос завершённым раньше времени (и выдаст Unexpected Completion на следующую часть) или будет вечно ждать данных до тайм-аута (Completion Timeout).</div>
+
+<h3>Конфигурационные запросы: DW2 с BDF и номером регистра</h3>
+
+<p>У CfgRd0/CfgWr0 DW0 и DW1 такие же, как у запроса к памяти, но Length всегда 1, TC = 0, Attr = 00, Last BE = 0000. DW2 вместо адреса содержит BDF получателя и номер регистра:</p>
+
+<div class="bits"><span style="flex:8">Bus<small>31:24</small></span><span style="flex:5">Device<small>23:19</small></span><span style="flex:3">Function<small>18:16</small></span><span style="flex:4">R<small>15:12</small></span><span style="flex:4">Ext Reg<small>11:8</small></span><span style="flex:6">Register Number<small>7:2</small></span><span style="flex:2">R<small>1:0</small></span></div>
+
+<p>Register Number — номер DW в конфигурационном пространстве (256 байт = 64 DW); Extended Register Number добавляет ещё 4 бита для расширенного пространства до 4 КиБ. Удобно: биты 11:2 DW2 — это просто байтовое смещение регистра, выровненное на DW. <b>Type 0</b> адресован устройству прямо на шине за портом; <b>Type 1</b> — устройству где-то дальше по иерархии (мосты превращают его в Type 0, когда номер шины совпадает с их Secondary Bus).</p>
+
+<h3>Пример (г): CfgRd0 регистра 0x00 устройства 01:00.0 и ответ</h3>
+
+<pre><code>CfgRd0:
+DW0 = 0x0400_0001   Fmt=000 Type=00100 (CfgRd0) Length=1
+DW1 = 0x0000_010F   Requester ID=0x0000 Tag=0x01 LastBE=0000 FirstBE=1111
+DW2 = 0x0100_0000   Bus=0x01 Device=0 Function=0 Register=0x00
+
+CplD:
+DW0 = 0x4A00_0001   CplD, Length=1
+DW1 = 0x0100_0004   Completer ID=0x0100 (01:00.0) Status=SC Byte Count=4
+DW2 = 0x0000_0100   Requester ID=0x0000 Tag=0x01 Lower Address=0
+Data = 0xA808_144D  Device ID=0xA808, Vendor ID=0x144D; на линке байты 4D 14 08 A8</code></pre>
+
+<p>Vendor ID 0x144D (Samsung) и Device ID 0xA808 приведены для примера; ваш SSD вернёт свои. Если устройства нет, Root Port вернёт UR (а в ПК программа прочитала бы 0xFFFF_FFFF). Если устройство ещё не готово — CRS.</p>
+
+<div class="box task"><span class="t">Проверьте себя</span>
+Как будет выглядеть DW2 запроса CfgRd0 к регистру BAR0 (смещение 0x10) того же устройства? <details><summary>Ответ</summary><code>0x0100_0010</code>: Register Number = 4, в битах 7:2 это и есть 0x10.</details></div>
+
+<!-- ============================================================ 5 -->
+<h2 id="s5">1.5. Конфигурационное пространство</h2>
+
+<p>У каждой функции PCIe есть <b>конфигурационное пространство</b> (configuration space) — 4 КиБ регистров, доступных через CfgRd/CfgWr ещё до того, как устройству назначены какие-либо адреса памяти. Первые 64 байта (0x00–0x3F) — стандартный заголовок, совместимый с PCI; 0x40–0xFF — список capabilities; 0x100–0xFFF — расширенные capabilities PCIe (AER и др.). Заголовок бывает двух типов: <b>Type 0</b> (Endpoint) и <b>Type 1</b> (мост: Root Port, порт коммутатора).</p>
+
+<table>
+<caption>Таблица 1.5. Заголовок Type 0 (Endpoint). Каждая строка — один DW; в столбцах — байты от старшего к младшему</caption>
+<tr><th class="num">Смещ.</th><th>Байт 3</th><th>Байт 2</th><th>Байт 1</th><th>Байт 0</th></tr>
+<tr><td class="num">0x00</td><td colspan="2">Device ID</td><td colspan="2">Vendor ID</td></tr>
+<tr><td class="num">0x04</td><td colspan="2">Status</td><td colspan="2">Command</td></tr>
+<tr><td class="num">0x08</td><td colspan="3">Class Code (0x0B базовый класс, 0x0A подкласс, 0x09 интерфейс); NVMe = 0x010802</td><td>Revision ID</td></tr>
+<tr><td class="num">0x0C</td><td>BIST</td><td>Header Type (0x00)</td><td>Latency Timer</td><td>Cache Line Size</td></tr>
+<tr><td class="num">0x10</td><td colspan="4">BAR0 (для NVMe — младшие 32 бита 64-битного BAR регистров контроллера)</td></tr>
+<tr><td class="num">0x14</td><td colspan="4">BAR1 (для NVMe — старшие 32 бита BAR0)</td></tr>
+<tr><td class="num">0x18–0x24</td><td colspan="4">BAR2 … BAR5</td></tr>
+<tr><td class="num">0x28</td><td colspan="4">Cardbus CIS Pointer (не используется)</td></tr>
+<tr><td class="num">0x2C</td><td colspan="2">Subsystem ID</td><td colspan="2">Subsystem Vendor ID</td></tr>
+<tr><td class="num">0x30</td><td colspan="4">Expansion ROM Base Address</td></tr>
+<tr><td class="num">0x34</td><td colspan="3">Reserved</td><td>Capabilities Pointer</td></tr>
+<tr><td class="num">0x38</td><td colspan="4">Reserved</td></tr>
+<tr><td class="num">0x3C</td><td>Max_Lat</td><td>Min_Gnt</td><td>Interrupt Pin</td><td>Interrupt Line</td></tr>
+</table>
+
+<p>Class Code 0x010802 расшифровывается как: 0x01 — Mass Storage Controller, 0x08 — Non-Volatile Memory Controller, 0x02 — интерфейс NVM Express. Чтение DW по смещению 0x08 у NVMe SSD даёт <code>0x0108_02xx</code>, где xx — ревизия. Header Type: биты 6:0 — тип заголовка (0x00 или 0x01), бит 7 — многофункциональное устройство.</p>
+
+<h3>Command и Status</h3>
+
+<table>
+<caption>Таблица 1.6. Важные биты регистра Command (0x04, 16 бит)</caption>
+<tr><th class="num">Бит</th><th>Имя</th><th>Смысл</th><th>У нас</th></tr>
+<tr><td class="num">0</td><td>I/O Space Enable</td><td>отвечать на IO-запросы</td><td>0</td></tr>
+<tr><td class="num">1</td><td><b>MSE</b> — Memory Space Enable</td><td>отвечать на MRd/MWr в свои BAR; при 0 — UR</td><td>1</td></tr>
+<tr><td class="num">2</td><td><b>BME</b> — Bus Master Enable</td><td>разрешить функции <em>самой</em> выдавать запросы к памяти (DMA). У моста — пропускать запросы снизу вверх</td><td>1</td></tr>
+<tr><td class="num">6</td><td>Parity Error Response</td><td>реакция на ошибки чётности/poisoned</td><td>0</td></tr>
+<tr><td class="num">8</td><td>SERR# Enable</td><td>разрешить сообщения о фатальных ошибках</td><td>0</td></tr>
+<tr><td class="num">10</td><td><b>Interrupt Disable</b></td><td>запретить INTx (эмулируемые прерывания)</td><td>1</td></tr>
+</table>
+<p>Итоговое значение Command для SSD: <code>0x0406</code>. В регистре Status (0x06) полезны бит 4 Capabilities List (всегда 1 у PCIe), бит 13 Received Master Abort (получен UR), бит 12 Received Target Abort (получен CA), бит 3 Interrupt Status.</p>
+
+<h3>BAR: базовые адреса и определение размера</h3>
+
+<p><b>BAR</b> (Base Address Register) задаёт, по какому адресу в пространстве памяти хоста лежит окно регистров (или памяти) устройства. Младшие биты BAR — только для чтения и описывают тип окна:</p>
+
+<div class="bits"><span style="flex:28">Base Address<small>31:4 (младшие биты, соответствующие размеру, — RO 0)</small></span><span style="flex:3">Prefetchable<small>3</small></span><span style="flex:4">Type<small>2:1</small></span><span style="flex:3">Mem/IO<small>0</small></span></div>
+
+<ul>
+<li>бит 0: 0 = память, 1 = IO (у NVMe — всегда память);</li>
+<li>биты 2:1: 00 = 32-битный BAR, 10 = 64-битный BAR (занимает два соседних регистра: BARn — младшие 32 бита, BARn+1 — старшие);</li>
+<li>бит 3: prefetchable — чтение не имеет побочных эффектов, можно читать с упреждением и объединять. Регистры NVMe — <em>не</em> prefetchable (чтение некоторых регистров имеет смысл только один раз, запись doorbell нельзя объединять).</li>
+</ul>
+
+<p><b>Определение размера.</b> Размер окна — всегда степень двойки, и окно выровнено по своему размеру. Поэтому устройство делает младшие биты адреса неизменяемыми нулями. Алгоритм: записать в BAR <code>0xFFFF_FFFF</code>, прочитать, обнулить 4 младших бита типа, инвертировать и прибавить 1. Для 64-битного BAR то же делают и со старшей половиной.</p>
+<pre><code>записали 0xFFFF_FFFF в BAR0, прочитали 0xFFFF_C004
+тип: биты 3:0 = 0100 → память, 64-битный, не prefetchable
+маска: 0xFFFF_C004 &amp; 0xFFFF_FFF0 = 0xFFFF_C000
+размер: ~0xFFFF_C000 + 1 = 0x0000_4000 = 16 КиБ   (если BAR1 после записи 0xFFFF_FFFF читается как 0xFFFF_FFFF)</code></pre>
+<p>Затем в BAR записывают выбранный адрес, кратный размеру (например, BAR0 = 0xC000_0000, BAR1 = 0x0000_0000). На время определения размера бит MSE должен быть сброшен, иначе устройство на мгновение «откроет» окно по адресу 0xFFFF_C000.</p>
+
+<h3>Заголовок Type 1: наш Root Port</h3>
+
+<table>
+<caption>Таблица 1.7. Отличающиеся регистры заголовка Type 1 (мост, Root Port)</caption>
+<tr><th class="num">Смещ.</th><th>Байт 3</th><th>Байт 2</th><th>Байт 1</th><th>Байт 0</th></tr>
+<tr><td class="num">0x08</td><td colspan="3">Class Code = 0x060400 (PCI-to-PCI bridge)</td><td>Revision ID</td></tr>
+<tr><td class="num">0x0C</td><td>BIST</td><td>Header Type (0x01)</td><td>Latency Timer</td><td>Cache Line Size</td></tr>
+<tr><td class="num">0x10, 0x14</td><td colspan="4">BAR0, BAR1 (у Root Port обычно отключены)</td></tr>
+<tr><td class="num">0x18</td><td>Sec. Latency Timer</td><td><b>Subordinate Bus</b></td><td><b>Secondary Bus</b></td><td><b>Primary Bus</b></td></tr>
+<tr><td class="num">0x1C</td><td colspan="2">Secondary Status</td><td>I/O Limit</td><td>I/O Base</td></tr>
+<tr><td class="num">0x20</td><td colspan="2"><b>Memory Limit</b> [15:4] = адрес[31:20]</td><td colspan="2"><b>Memory Base</b> [15:4] = адрес[31:20]</td></tr>
+<tr><td class="num">0x24</td><td colspan="2">Prefetchable Memory Limit</td><td colspan="2">Prefetchable Memory Base</td></tr>
+<tr><td class="num">0x28 / 0x2C</td><td colspan="4">Prefetchable Base / Limit Upper 32 Bits</td></tr>
+<tr><td class="num">0x34</td><td colspan="3">Reserved</td><td>Capabilities Pointer</td></tr>
+<tr><td class="num">0x3C</td><td colspan="2">Bridge Control</td><td>Interrupt Pin</td><td>Interrupt Line</td></tr>
+</table>
+
+<p><b>Primary/Secondary/Subordinate Bus</b> определяют, какие конфигурационные запросы мост пропускает: Secondary — номер шины сразу за мостом, Subordinate — наибольший номер шины в его поддереве. Для нашего Root Port: Primary = 0, Secondary = 1, Subordinate = 1, т.е. DW по смещению 0x18 = <code>0x0001_0100</code>. <b>Memory Base/Limit</b> задают окно адресов (гранулярность 1 МиБ), которое мост пропускает вниз: для окна 0xC000_0000–0xC00F_FFFF Base = Limit = 0xC000, DW по 0x20 = <code>0xC000_C000</code>. Command Root Port’а тоже нужен: MSE разрешает пересылку запросов вниз в окно, BME — пересылку запросов памяти от SSD вверх, к нашему completer’у.</p>
+
+<h3>Capabilities и PCI Express Capability</h3>
+
+<p>Capabilities Pointer (0x34) указывает на первую структуру в односвязном списке. Каждая структура начинается с байта Capability ID и байта Next Pointer; 0x00 в Next — конец списка. Порядок и смещения в каждом устройстве свои, поэтому список всегда <em>обходят</em>, а не читают по жёстким адресам.</p>
+
+<figure>
+<svg viewBox="0 0 760 130" width="760" height="130" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Цепочка capabilities" font-family="sans-serif" font-size="12">
+<defs><marker id="f111a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="10" y="30" width="130" height="56" rx="4" fill="var(--code-bg)"/>
+<rect x="160" y="30" width="130" height="56" rx="4" fill="var(--note-bg)"/>
+<rect x="310" y="30" width="130" height="56" rx="4" fill="var(--note-bg)"/>
+<rect x="460" y="30" width="130" height="56" rx="4" fill="var(--ok-bg)"/>
+<rect x="610" y="30" width="130" height="56" rx="4" fill="var(--note-bg)"/>
+</g>
+<g stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f111a)">
+<line x1="140" y1="58" x2="158" y2="58"/><line x1="290" y1="58" x2="308" y2="58"/><line x1="440" y1="58" x2="458" y2="58"/><line x1="590" y1="58" x2="608" y2="58"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle" font-family="monospace">
+<text x="75" y="53">0x34</text><text x="75" y="73">Cap Ptr=0x40</text>
+<text x="225" y="53">0x40: ID 0x01</text><text x="225" y="73">PM, Next=0x50</text>
+<text x="375" y="53">0x50: ID 0x05</text><text x="375" y="73">MSI, Next=0x70</text>
+<text x="525" y="53">0x70: ID 0x10</text><text x="525" y="73">PCIe, Next=0xB0</text>
+<text x="675" y="53">0xB0: ID 0x11</text><text x="675" y="73">MSI-X, Next=0</text>
+</g>
+<text x="380" y="114" text-anchor="middle" font-size="11" fill="var(--muted)">Пример цепочки; реальные смещения у каждого SSD свои. Нам нужна структура с ID 0x10 (PCI Express Capability).</text>
+</svg>
+<figcaption>Рис. 1.11. Список capabilities: Power Management (0x01), MSI (0x05), PCI Express (0x10), MSI-X (0x11).</figcaption>
+</figure>
+
+<table>
+<caption>Таблица 1.8. Регистры PCI Express Capability (ID 0x10), смещения от начала структуры</caption>
+<tr><th class="num">Смещ.</th><th>Регистр</th><th>Поля, которые нам нужны</th></tr>
+<tr><td class="num">+0x00</td><td>Cap ID / Next / PCIe Capabilities</td><td>[7:0] ID = 0x10; [15:8] Next; [19:16] версия; [23:20] тип порта (0000 Endpoint, 0100 Root Port)</td></tr>
+<tr><td class="num">+0x04</td><td>Device Capabilities</td><td>[2:0] <b>MPSS</b> — максимальный поддерживаемый payload (код как в табл. 1.4); [5] <b>ETFS</b> — поддержка 8-битных тегов</td></tr>
+<tr><td class="num">+0x08</td><td>Device Control (16 бит)</td><td>[3:0] разрешения отчётов об ошибках; [4] Relaxed Ordering Enable; [7:5] <b>MPS</b>; [8] <b>ETE</b> — Extended Tag Field Enable; [11] No Snoop Enable; [14:12] <b>MRRS</b>; [15] Initiate FLR (у Endpoint)</td></tr>
+<tr><td class="num">+0x0A</td><td>Device Status (16 бит)</td><td>[0..3] обнаруженные ошибки (W1C); [5] Transactions Pending</td></tr>
+<tr><td class="num">+0x0C</td><td>Link Capabilities</td><td>[3:0] Max Link Speed (1 = 2.5, 2 = 5.0, 3 = 8.0 GT/s); [9:4] Max Link Width; [11:10] поддержка ASPM; [31:24] Port Number</td></tr>
+<tr><td class="num">+0x10</td><td>Link Control (16 бит)</td><td>[1:0] <b>ASPM Control</b> (00 = выключено); [3] RCB (0 = 64, 1 = 128 B); [4] Link Disable; [5] <b>Retrain Link</b> (только у нисходящего порта); [6] Common Clock Configuration</td></tr>
+<tr><td class="num">+0x12</td><td>Link Status (16 бит)</td><td>[3:0] <b>Current Link Speed</b>; [9:4] <b>Negotiated Link Width</b>; [11] Link Training (идёт обучение); [12] Slot Clock Configuration; [13] Data Link Layer Link Active</td></tr>
+<tr><td class="num">+0x2C</td><td>Link Capabilities 2</td><td>[7:1] вектор поддерживаемых скоростей (бит 1 = 2.5, бит 2 = 5.0, бит 3 = 8.0 GT/s)</td></tr>
+<tr><td class="num">+0x30</td><td>Link Control 2 (16 бит)</td><td>[3:0] <b>Target Link Speed</b>; [5] Hardware Autonomous Speed Disable</td></tr>
+</table>
+
+<p>Например, Link Status = <code>0x1042</code> означает: Current Link Speed = 2 (5.0 GT/s), Negotiated Link Width = 4 (x4), Slot Clock Configuration = 1, обучение не идёт. Device Control для MPS = 256, MRRS = 512 и 8-битных тегов: поля [7:5] = 001, [14:12] = 010, [8] = 1 → <code>0x2120</code> (если остальные биты обнулить; аккуратнее делать чтение-модификацию-запись).</p>
+
+<h3>Перечисление «вручную»: один Endpoint за Root Port</h3>
+
+<p>В ПК перечисление делает BIOS/ОС рекурсивным обходом дерева. У нас дерево из одного листа, и всю процедуру выполняет конечный автомат в ПЛИС. Регистры собственного Root Port’а доступны локально (через интерфейс управления конфигурацией ядра, глава 4), а регистры SSD — через TLP CfgRd0/CfgWr0.</p>
+
+<ol>
+<li><b>Дождаться линка.</b> Снять PERST#, дождаться <code>user_lnk_up</code> (DL_Active), выдержать 100 мс от снятия PERST#. При необходимости перевести линк на Gen2: в Root Port Link Control 2 Target Link Speed = 2, затем Retrain Link = 1; ждать сброса Link Training и проверить Link Status: speed = 2, width = 4.</li>
+<li><b>Настроить Root Port.</b> Primary/Secondary/Subordinate = 0/1/1 (0x18 ← 0x0001_0100), окно памяти Memory Base/Limit под будущий BAR0 (0x20 ← 0xC000_C000), Command ← MSE | BME (0x0006).</li>
+<li><b>Найти устройство.</b> CfgRd0 01:00.0 рег. 0x00. CRS — повторять; UR — устройства нет. Иначе получаем Vendor ID / Device ID.</li>
+<li><b>Убедиться, что это NVMe.</b> CfgRd0 рег. 0x08: биты 31:8 = 0x010802. Рег. 0x0C: Header Type = 0x00.</li>
+<li><b>Определить размер BAR0.</b> CfgWr0 0x10 ← 0xFFFF_FFFF, CfgRd0 0x10 → например 0xFFFF_C004 (64-бит, 16 КиБ); то же для 0x14.</li>
+<li><b>Назначить адрес.</b> CfgWr0 0x10 ← 0xC000_0000, 0x14 ← 0x0000_0000 (адрес ниже 4 ГиБ — значит, к регистрам пойдут 3DW-TLP).</li>
+<li><b>Настроить PCIe Capability.</b> Прочитать 0x34 и пройти список до ID 0x10. Из Device Capabilities взять MPSS; выбрать MPS = min(MPSS SSD, MPSS Root Port) и записать его в Device Control <em>обоих</em> концов линка; в Device Control SSD задать также MRRS и ETE. Обнулить ASPM Control в Link Control.</li>
+<li><b>Включить устройство.</b> CfgWr0 Command (0x04) ← 0x0406: MSE + BME + Interrupt Disable. Теперь регистры NVMe доступны через MRd/MWr по адресам 0xC000_0000…0xC000_3FFF, а SSD может сам обращаться к нашей памяти.</li>
+</ol>
+
+<div class="box warn"><span class="t">Типичная ошибка</span>
+Записать в Device Control SSD MPS = 256, а в Root Port оставить 128. SSD пришлёт MWr с 256 байтами, Root Port сочтёт его Malformed TLP — фатальная ошибка. MPS на обоих концах линка должен быть одинаковым.</div>
+
+<!-- ============================================================ 6 -->
+<h2 id="s6">1.6. Как хост видит память Endpoint и как Endpoint видит память хоста</h2>
+
+<p>В PCIe любое устройство может быть и requester’ом, и completer’ом. Направления «вниз» и «вверх» в NVMe используются оба:</p>
+<ul>
+<li><b>Хост → регистры SSD.</b> Хост пишет (MWr) и читает (MRd) регистры NVMe-контроллера в окне BAR0: CAP, CC, CSTS, AQA, doorbell’ы. Здесь хост — requester, SSD — completer. Это редкие короткие обращения.</li>
+<li><b>SSD → память хоста.</b> Всё объёмное делает сам SSD: он читает команды из очередей отправки (Submission Queue, SQ), читает данные для записи на NAND, пишет записи в очередь завершений (Completion Queue, CQ). Такой режим называется <b>bus mastering</b> или DMA (Direct Memory Access): устройство само выдаёт MRd/MWr, а хост — completer. Разрешает его бит BME в Command.</li>
+</ul>
+
+<p>В ПК «память хоста» — это DRAM за контроллером памяти процессора, и RC отвечает на MRd устройства сам, без участия программы. В нашей ПЛИС процессора нет, поэтому «память хоста» — это просто BRAM или DDR3 за логикой, которую мы назовём <b>completer</b>: она принимает TLP от SSD, декодирует адрес, читает память и формирует CplD (с правильными Byte Count, Lower Address и разбиением по MPS/RCB), а на MWr — пишет в память. Адреса этой «памяти» мы выбираем сами (например, 0x4000_0000 и выше) и сообщаем SSD в командах NVMe; SSD не знает и не должен знать, что за ними нет DRAM.</p>
+
+<figure>
+<svg viewBox="0 0 760 340" width="760" height="340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Направления транзакций между ПЛИС и SSD" font-family="sans-serif" font-size="12">
+<defs>
+<marker id="f112a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent)"/></marker>
+<marker id="f112b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--accent2)"/></marker>
+</defs>
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="20" y="20" width="280" height="300" rx="8" fill="var(--note-bg)"/>
+<rect x="36" y="50" width="248" height="44" rx="4" fill="var(--code-bg)"/>
+<rect x="36" y="108" width="248" height="56" rx="4" fill="var(--code-bg)"/>
+<rect x="36" y="178" width="248" height="56" rx="4" fill="var(--code-bg)"/>
+<rect x="36" y="262" width="248" height="40" rx="4" fill="var(--warn-bg)"/>
+<rect x="480" y="20" width="260" height="300" rx="8" fill="var(--ok-bg)"/>
+<rect x="496" y="50" width="228" height="56" rx="4" fill="var(--code-bg)"/>
+<rect x="496" y="122" width="228" height="56" rx="4" fill="var(--code-bg)"/>
+<rect x="496" y="194" width="228" height="40" rx="4" fill="var(--code-bg)"/>
+<line x1="160" y1="164" x2="160" y2="178"/>
+</g>
+<g stroke-width="1.8">
+<line x1="300" y1="72" x2="478" y2="72" stroke="var(--accent)" marker-end="url(#f112a)"/>
+<line x1="480" y1="132" x2="302" y2="132" stroke="var(--accent2)" marker-end="url(#f112b)"/>
+<line x1="300" y1="192" x2="478" y2="192" stroke="var(--accent)" marker-end="url(#f112a)"/>
+<line x1="480" y1="252" x2="302" y2="252" stroke="var(--accent2)" marker-end="url(#f112b)"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="160" y="40" font-weight="bold" font-size="13">ПЛИС = Root Complex</text>
+<text x="160" y="69">NVMe-хост (автоматы)</text>
+<text x="160" y="85" font-size="11">requester: MWr/MRd в BAR0 SSD</text>
+<text x="160" y="129">Completer</text>
+<text x="160" y="145" font-size="11">MRd от SSD → CplD,</text>
+<text x="160" y="159" font-size="11">MWr от SSD → запись в память</text>
+<text x="160" y="199">BRAM / DDR3 = «память хоста»</text>
+<text x="160" y="217" font-size="11">SQ, CQ, буферы данных</text>
+<text x="160" y="287">Root Port (hard-блок PCIe)</text>
+<text x="610" y="40" font-weight="bold" font-size="13">M.2 SSD = Endpoint</text>
+<text x="610" y="73">BAR0: регистры NVMe</text>
+<text x="610" y="91" font-size="11">CAP, CC, CSTS, doorbells</text>
+<text x="610" y="145">DMA-движок</text>
+<text x="610" y="163" font-size="11">bus master (нужен BME = 1)</text>
+<text x="610" y="219">FTL + NAND</text>
+<text x="390" y="66" fill="var(--accent)">① MWr: doorbell</text>
+<text x="390" y="126" fill="var(--accent2)">② MRd: SQ / данные</text>
+<text x="390" y="186" fill="var(--accent)">③ CplD: данные</text>
+<text x="390" y="246" fill="var(--accent2)">④ MWr: запись в CQ</text>
+<text x="390" y="300" font-size="11" fill="var(--muted)">все TLP физически идут</text>
+<text x="390" y="314" font-size="11" fill="var(--muted)">через Root Port и линк x4</text>
+</g>
+</svg>
+<figcaption>Рис. 1.12. Кто кому что посылает при записи на SSD. ① хост сообщает о новой команде записью в doorbell; ② SSD сам читает команду и данные из нашей памяти; ③ наш completer возвращает данные в CplD — это основной поток, от него зависит скорость; ④ SSD сообщает о завершении записью в CQ.</figcaption>
+</figure>
+
+<p>Обратите внимание на асимметрию: данные при записи на SSD едут от хоста к устройству, но <em>инициатор</em> — устройство. Поэтому основной поток — это CplD, а не MWr, и его скорость зависит от того, как быстро наш completer отвечает на MRd (раздел <a href="#s7">1.7</a>).</p>
+
+<h3>Прерывания: INTx и MSI — и почему мы их не используем</h3>
+
+<p>Классический способ, которым устройство сообщает о событии, — прерывание. В PCIe физических линий INTA#…INTD# нет: <b>INTx</b> эмулируется сообщениями Assert_INTx / Deassert_INTx (Msg-TLP). <b>MSI</b> (Message Signaled Interrupts, capability 0x05) и <b>MSI-X</b> (0x11) — это просто MWr: устройство пишет заданное значение (Message Data) по заданному адресу (Message Address), а контроллер прерываний CPU превращает такую запись в прерывание.</p>
+<p>У нас нет CPU и нет контроллера прерываний, поэтому мы ставим Interrupt Disable, не включаем MSI/MSI-X и <b>опрашиваем CQ</b> (polling): SSD пишет запись завершения в нашу BRAM, а логика хоста следит за битом фазы (Phase Tag, глава 2). Более того, completer видит MWr в диапазон адресов CQ в момент прихода — это «бесплатное прерывание» на уровне железа.</p>
+
+<!-- ============================================================ 7 -->
+<h2 id="s7">1.7. Расчёт пропускной способности</h2>
+
+<p>Посчитаем потолок записи на SSD. Данные идут от ПЛИС к SSD в CplD (направление «вниз»), поэтому считаем эффективность именно этих TLP. Каждый CplD с MPS байт данных занимает на линке MPS + 20 байт (3DW-заголовок + кадрирование). Сырая скорость символов данных — 2.0 ГБ/с.</p>
+
+<table>
+<caption>Таблица 1.9. Потолок потока CplD для Gen2 x4 в зависимости от MPS</caption>
+<tr><th class="num">MPS, B</th><th class="num">Байт на линке на CplD</th><th class="num">Доля данных</th><th class="num">Потолок по TLP, ГБ/с</th><th class="num">С учётом DLLP и SKP (≈2–3 %), ГБ/с</th><th class="num">CplD на 4 КиБ</th></tr>
+<tr><td class="num">128</td><td class="num">148</td><td class="num">86.5 %</td><td class="num">1.730</td><td class="num">≈1.68</td><td class="num">32</td></tr>
+<tr><td class="num">256</td><td class="num">276</td><td class="num">92.8 %</td><td class="num">1.855</td><td class="num">≈1.81</td><td class="num">16</td></tr>
+<tr><td class="num">512</td><td class="num">532</td><td class="num">96.2 %</td><td class="num">1.925</td><td class="num">≈1.88</td><td class="num">8</td></tr>
+</table>
+
+<p>Откуда ещё 2–3 %? В том же направлении, что и CplD, наш порт посылает DLLP: ACK на MRd и MWr от SSD и UpdateFC, возвращающие SSD кредиты (каждый DLLP — 8 байт). Кроме того, раз в 1180–1538 символьных тактов физический уровень обязан вставить SKP Ordered Set (COM + 3 SKP, 4 символа) для компенсации разницы частот — это ещё ≈0.3 %. Наконец, MRd от SSD тоже не бесплатны, но они идут в обратном направлении и почти не мешают: 20 байт на каждые 512 байт данных.</p>
+
+<p>Типичные M.2 SSD поддерживают MPS 256 (иногда 512), так что реалистичный потолок для нашего линка — <b>1.7–1.8 ГБ/с</b>. Но это потолок <em>линка</em>. Достигнем ли мы его, решает задержка.</p>
+
+<h3>Латентность и закон Литтла</h3>
+
+<p><b>Закон Литтла</b> (Little’s law): в установившемся режиме среднее число заявок в системе N равно интенсивности потока X, умноженной на среднее время пребывания заявки T: N = X · T. Для чтений по PCIe: заявка — это один MRd размером S байт, «в полёте» он находится от выдачи запроса до прихода последнего байта ответа. SSD держит не более N незавершённых чтений (ограничено числом тегов, кредитами и внутренними буферами SSD), поэтому</p>
+
+<pre><code>X = min( BW,  N · S / T ),   где T = L + S / BW
+L  — латентность: от выдачи MRd до прихода первого байта CplD (линк туда-обратно + реакция completer’а)
+S / BW — время передачи самих данных одного запроса по линку</code></pre>
+
+<p><b>Числовой пример.</b> BW = 1.8 ГБ/с = 1.8 байт/нс, S = 512 B → S/BW = 284 нс.</p>
+<ul>
+<li>L = 1 мкс: T = 1284 нс. Чтобы держать полный поток, нужно N ≥ BW · T / S = 1.8 · 1284 / 512 ≈ 4.5, т.е. <b>5</b> одновременных чтений. При N = 4: X = 4 · 512 / 1284 ≈ 1.60 ГБ/с.</li>
+<li>L = 3 мкс (медленный completer, например, DDR3 с арбитражем): T = 3284 нс, нужно N ≥ 11.5 → 12 тегов. Если SSD держит только 8 чтений, X = 8 · 512 / 3284 ≈ 1.25 ГБ/с — потеряна треть скорости при идеальном линке.</li>
+</ul>
+
+<figure>
+<svg viewBox="0 0 760 235" width="760" height="235" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Закон Литтла: окно из четырёх чтений" font-family="sans-serif" font-size="12">
+<defs><marker id="f113a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+<g fill="var(--fg)" text-anchor="end" font-size="12">
+<text x="110" y="64">MRd (теги)</text>
+<text x="110" y="129">CplD на линке</text>
+</g>
+<g stroke="var(--fg)" stroke-width="1">
+<rect x="120" y="50" width="10" height="20" fill="var(--note-bg)"/><rect x="132" y="50" width="10" height="20" fill="var(--ok-bg)"/><rect x="144" y="50" width="10" height="20" fill="var(--warn-bg)"/><rect x="156" y="50" width="10" height="20" fill="var(--code-bg)"/>
+<rect x="372" y="50" width="10" height="20" fill="var(--note-bg)"/><rect x="429" y="50" width="10" height="20" fill="var(--ok-bg)"/><rect x="486" y="50" width="10" height="20" fill="var(--warn-bg)"/><rect x="543" y="50" width="10" height="20" fill="var(--code-bg)"/><rect x="629" y="50" width="10" height="20" fill="var(--note-bg)"/><rect x="686" y="50" width="10" height="20" fill="var(--ok-bg)"/>
+<rect x="320" y="112" width="56.8" height="26" fill="var(--note-bg)"/><rect x="376.8" y="112" width="56.8" height="26" fill="var(--ok-bg)"/><rect x="433.6" y="112" width="56.8" height="26" fill="var(--warn-bg)"/><rect x="490.4" y="112" width="56.8" height="26" fill="var(--code-bg)"/>
+<rect x="576.8" y="112" width="56.8" height="26" fill="var(--note-bg)"/><rect x="633.6" y="112" width="56.8" height="26" fill="var(--ok-bg)"/><rect x="690.4" y="112" width="29.6" height="26" fill="var(--warn-bg)"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle" font-size="11">
+<text x="348.4" y="129">0</text><text x="405.2" y="129">1</text><text x="462" y="129">2</text><text x="518.8" y="129">3</text><text x="605.2" y="129">0</text><text x="662" y="129">1</text><text x="705" y="129">2</text>
+<text x="143" y="44">0 1 2 3</text>
+<text x="562" y="156" fill="var(--accent2)">простой</text>
+<text x="236" y="118">L = 1 мкс</text>
+</g>
+<line x1="125" y1="72" x2="318" y2="110" stroke="var(--fg)" stroke-width="1.2" marker-end="url(#f113a)"/>
+<line x1="377" y1="70" x2="377" y2="110" stroke="var(--muted)" stroke-dasharray="3,3"/>
+<g stroke="var(--fg)" stroke-width="1"><line x1="120" y1="180" x2="730" y2="180"/>
+<line x1="120" y1="176" x2="120" y2="184"/><line x1="220" y1="176" x2="220" y2="184"/><line x1="320" y1="176" x2="320" y2="184"/><line x1="420" y1="176" x2="420" y2="184"/><line x1="520" y1="176" x2="520" y2="184"/><line x1="620" y1="176" x2="620" y2="184"/><line x1="720" y1="176" x2="720" y2="184"/></g>
+<g fill="var(--muted)" text-anchor="middle" font-size="10">
+<text x="120" y="196">0</text><text x="220" y="196">0.5</text><text x="320" y="196">1.0</text><text x="420" y="196">1.5</text><text x="520" y="196">2.0</text><text x="620" y="196">2.5</text><text x="720" y="196">3.0 мкс</text>
+</g>
+<text x="380" y="224" text-anchor="middle" font-size="11" fill="var(--fg)">N = 4 тега × 512 B, L = 1 мкс, S/BW = 284 нс: X = 4 · 512 B / 1.284 мкс ≈ 1.6 ГБ/с</text>
+</svg>
+<figcaption>Рис. 1.13. Почему латентность определяет скорость. Четыре чтения выданы сразу; данные приходят через L. Тег освобождается только после последнего байта ответа, следующий запрос с ним уходит лишь тогда, и линк простаивает, пока не придёт ответ на него (промежуток «простой»).</figcaption>
+</figure>
+
+<div class="box ok"><span class="t">Вывод для проектирования</span>
+Совет «сделайте completer быстрым» — количественный. Каждые 100 нс задержки ответа на MRd при N = 8 и S = 512 B стоят десятки МБ/с. Поэтому в проекте данные для записи лежат в BRAM (ответ за десятки тактов), а MRd обрабатываются конвейерно: CplD на следующий запрос начинает формироваться, пока передаётся предыдущий.</div>
+
+<!-- ============================================================ 8 -->
+<h2 id="s8">1.8. Как PCIe выглядит «изнутри ПЛИС»</h2>
+
+<p>В Kintex-7 есть встроенный (hard) блок <b>7 Series Integrated Block for PCI Express</b> (документация — PG054). Вместе с четырьмя трансиверами GTX он реализует физический уровень (8b/10b, скремблер, LTSSM, deskew), весь канальный уровень (Seq#, LCRC, retry buffer, ACK/NAK, DLLP flow control) и часть уровня транзакций: учёт кредитов, обработку собственного конфигурационного пространства, проверку корректности принятых TLP. Сборку и разбор TLP делает пользователь: блок отдаёт и принимает <em>готовые TLP без кадрирования, Seq# и LCRC</em> по интерфейсу AXI4-Stream шириной 64 бита (250 МГц) или 128 бит (125 МГц) для Gen2 x4.</p>
+
+<figure>
+<svg viewBox="0 0 760 190" width="760" height="190" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Hard-блок PCIe внутри ПЛИС" font-family="sans-serif" font-size="12">
+<defs><marker id="f114a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--fg)"/></marker></defs>
+<path d="M125,40 V32 H570 V40" stroke="var(--fg)" fill="none"/>
+<g stroke="var(--fg)" stroke-width="1.5">
+<rect x="10" y="50" width="100" height="70" rx="4" fill="var(--ok-bg)"/>
+<rect x="125" y="50" width="100" height="70" rx="4" fill="var(--warn-bg)"/>
+<rect x="240" y="50" width="100" height="70" rx="4" fill="var(--warn-bg)"/>
+<rect x="355" y="50" width="100" height="70" rx="4" fill="var(--warn-bg)"/>
+<rect x="470" y="50" width="100" height="70" rx="4" fill="var(--warn-bg)"/>
+<rect x="640" y="50" width="110" height="70" rx="4" fill="var(--note-bg)"/>
+</g>
+<g stroke="var(--fg)" stroke-width="1.5">
+<line x1="110" y1="85" x2="125" y2="85" stroke-width="4"/>
+<line x1="225" y1="85" x2="240" y2="85"/><line x1="340" y1="85" x2="355" y2="85"/><line x1="455" y1="85" x2="470" y2="85"/>
+</g>
+<g stroke="var(--fg)" stroke-width="1.5" marker-end="url(#f114a)">
+<line x1="640" y1="78" x2="572" y2="78"/>
+<line x1="570" y1="100" x2="638" y2="100"/>
+</g>
+<g fill="var(--fg)" text-anchor="middle">
+<text x="347" y="24" font-size="12">Integrated Block for PCI Express (hard IP) + GTX</text>
+<text x="60" y="80" font-weight="bold">M.2 SSD</text><text x="60" y="98" font-size="11">x4 Gen2</text>
+<text x="175" y="76" font-weight="bold">GTX ×4</text><text x="175" y="93" font-size="11">SerDes, CDR,</text><text x="175" y="107" font-size="11">8b/10b</text>
+<text x="290" y="76" font-weight="bold">Physical</text><text x="290" y="93" font-size="11">LTSSM, deskew,</text><text x="290" y="107" font-size="11">скремблер</text>
+<text x="405" y="76" font-weight="bold">Data Link</text><text x="405" y="93" font-size="11">ACK/NAK, retry,</text><text x="405" y="107" font-size="11">DLLP, FC</text>
+<text x="520" y="76" font-weight="bold">Transaction</text><text x="520" y="93" font-size="11">(частично):</text><text x="520" y="107" font-size="11">cfg, кредиты</text>
+<text x="695" y="80" font-weight="bold">Ваша логика</text><text x="695" y="98" font-size="11">NVMe-хост</text>
+<text x="605" y="72" font-size="10">s_axis_tx</text><text x="605" y="114" font-size="10">m_axis_rx</text>
+<text x="605" y="150" font-size="11">AXI4-Stream 128 бит @ 125 МГц</text>
+<text x="380" y="178" font-size="11" fill="var(--muted)">пользователь собирает и разбирает TLP (заголовок + данные); всё ниже уровня транзакций — внутри hard-блока</text>
+</g>
+</svg>
+<figcaption>Рис. 1.14. Разделение работы между hard-блоком PCIe и пользовательской логикой.</figcaption>
+</figure>
+
+<p>Заметим: 128 бит × 125 МГц = 16 байт × 125 МГц = 2.0 ГБ/с — ровно скорость символов данных линка Gen2 x4. Запаса нет: каждый такт, в который ваша логика не выдаёт данные (<code>tvalid</code> = 0) или вставляет «дырку» между TLP, — прямая потеря скорости. На передаче каждый TLP начинается с границы 128-битного слова: заголовок DW0 — в <code>tdata[31:0]</code>, DW1 — в <code>[63:32]</code> и т.д.; последнее слово помечается <code>tlast</code>, а <code>tkeep</code> показывает, какие байты в нём действительны. Подробности (порядок байт, сигналы <code>tuser</code>, приём со «стыкующимися» TLP, интерфейс конфигурации) — в главе 4.</p>
+
+<figure class="wave">
+<svg xmlns="http://www.w3.org/2000/svg" width="831.6" height="281" viewBox="0 0 831.6 281" font-family="monospace" role="img" style="max-width:100%;height:auto"><defs><pattern id="wv5af792h" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" stroke="var(--wave-x, #888)" stroke-width="1"/></pattern><marker id="wv5af792a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--wave-edge, #2a6fb0)" stroke="none"/></marker></defs><path d="M135.6,48 V273 M221.6,48 V273 M307.6,48 V273 M393.6,48 V273 M479.6,48 V273 M565.6,48 V273 M651.6,48 V273 M737.6,48 V273 M823.6,48 V273" stroke="var(--wave-grid, rgba(128,128,128,.3))" stroke-width="1" stroke-dasharray="2,3" fill="none"/><text x="178.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)">0</text><text x="264.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)">1</text><text x="350.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)">2</text><text x="436.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)">3</text><text x="522.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)">4</text><text x="608.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)">5</text><text x="694.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)">6</text><text x="780.6" y="44" font-size="9" text-anchor="middle" fill="var(--wave-fg, #222)">7</text><text x="127.6" y="67.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">user_clk</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,72 L138.6,54 L178.6,54 L181.6,72 L221.6,72 M221.6,72 L224.6,54 L264.6,54 L267.6,72 L307.6,72 M307.6,72 L310.6,54 L350.6,54 L353.6,72 L393.6,72 M393.6,72 L396.6,54 L436.6,54 L439.6,72 L479.6,72 M479.6,72 L482.6,54 L522.6,54 L525.6,72 L565.6,72 M565.6,72 L568.6,54 L608.6,54 L611.6,72 L651.6,72 M651.6,72 L654.6,54 L694.6,54 L697.6,72 L737.6,72 M737.6,72 L740.6,54 L780.6,54 L783.6,72 L823.6,72" fill="none"/></g><text x="127.6" y="97.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">tvalid</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,102 L221.6,102 M221.6,102 L224.6,84 L565.6,84 M565.6,84 L568.6,102 L823.6,102" fill="none"/></g><text x="127.6" y="127.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">tready</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,114 L393.6,114 M393.6,114 L396.6,132 L479.6,132 M479.6,132 L482.6,114 L823.6,114" fill="none"/></g><text x="127.6" y="157.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">tdata[127:0]</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="135.6,162 135.6,144 218.6,144 221.6,153 218.6,162" fill="url(#wv5af792h)"/><polygon points="224.6,162 221.6,153 224.6,144 304.6,144 307.6,153 304.6,162" fill="#ffd7a8"/><text x="264.6" y="156.85" font-size="11" text-anchor="middle" fill="#222">H0 H1 H2 D0</text><polygon points="310.6,162 307.6,153 310.6,144 390.6,144 393.6,153 390.6,162" fill="#a8d4ff"/><text x="350.6" y="156.85" font-size="11" text-anchor="middle" fill="#222">H0 H1 H2 D0</text><polygon points="396.6,162 393.6,153 396.6,144 562.6,144 565.6,153 562.6,162" fill="#a8f0ee"/><text x="479.6" y="156.85" font-size="11" text-anchor="middle" fill="#222">D1 D2 D3 --</text><polygon points="568.6,162 565.6,153 568.6,144 823.6,144 823.6,162" fill="url(#wv5af792h)"/></g><text x="127.6" y="187.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">tkeep[15:0]</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><polygon points="135.6,192 135.6,174 218.6,174 221.6,183 218.6,192" fill="url(#wv5af792h)"/><polygon points="224.6,192 221.6,183 224.6,174 304.6,174 307.6,183 304.6,192" fill="#fff3a8"/><text x="264.6" y="186.85" font-size="11" text-anchor="middle" fill="#222">FFFF</text><polygon points="310.6,192 307.6,183 310.6,174 390.6,174 393.6,183 390.6,192" fill="#fff3a8"/><text x="350.6" y="186.85" font-size="11" text-anchor="middle" fill="#222">FFFF</text><polygon points="396.6,192 393.6,183 396.6,174 562.6,174 565.6,183 562.6,192" fill="#ffd7a8"/><text x="479.6" y="186.85" font-size="11" text-anchor="middle" fill="#222">0FFF</text><polygon points="568.6,192 565.6,183 568.6,174 823.6,174 823.6,192" fill="url(#wv5af792h)"/></g><text x="127.6" y="217.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">tlast</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,222 L221.6,222 M221.6,222 L224.6,204 L307.6,204 M307.6,204 L310.6,222 L393.6,222 M393.6,222 L396.6,204 L565.6,204 M565.6,204 L568.6,222 L823.6,222" fill="none"/></g><text x="127.6" y="262.55" font-size="13" text-anchor="end" fill="var(--wave-fg, #222)">передача</text><g stroke="var(--wave-fg, #222)" stroke-width="1.5" stroke-linejoin="round"><path d="M135.6,267 L221.6,267 M221.6,267 L224.6,249 L393.6,249 M393.6,249 L396.6,267 L479.6,267 M479.6,267 L482.6,249 L565.6,249 M565.6,249 L568.6,267 L823.6,267" fill="none"/></g><path d="M28,81 H24 V225 H28" stroke="var(--wave-fg, #222)" stroke-width="1.2" fill="none"/><text x="16" y="157" font-size="11" text-anchor="middle" fill="var(--wave-fg, #222)" transform="rotate(-90 16 153)">TX AXI-ST</text><g stroke="var(--wave-edge, #2a6fb0)" stroke-width="1.2" fill="none"><path d="M395.1,93 C438.1,93 438.1,123 481.1,123" marker-end="url(#wv5af792a)"/><rect x="387.9" y="102" width="100.4" height="12" rx="3" fill="var(--wave-page-bg, #fff)" stroke="none"/><text x="438.1" y="112" font-size="11" text-anchor="middle" fill="var(--wave-edge, #2a6fb0)" stroke="none">tready=0: ждём</text></g><text x="479.6" y="24" font-size="14" text-anchor="middle" fill="var(--wave-fg, #222)" font-weight="600">128-битный AXI-Stream: MWr32 с 1 DW (1 такт) и MWr32 с 4 DW (2 такта)</text></svg>
+<figcaption>Рис. 1.15. Передача двух TLP по 128-битному AXI-Stream (TX). Такт 1: MWr32 с 1 DW данных целиком в одном слове (3 DW заголовка + 1 DW данных = 128 бит, <code>tkeep</code> = 0xFFFF, <code>tlast</code> = 1). Такты 2–4: MWr32 с 4 DW данных занимает два слова; во втором действительны 3 DW (<code>tkeep</code> = 0x0FFF). В такте 3 ядро сняло <code>tready</code> (например, нет кредитов) — слово удерживается до такта 4. Подписи в <code>tdata</code> перечислены от <code>[31:0]</code> к <code>[127:96]</code>.</figcaption>
+</figure>
+
+<!-- ============================================================ 9 -->
+<h2 id="s9">1.9. Вопросы для самопроверки и мини-задачи</h2>
+
+<div class="box task"><span class="t">Вопросы для самопроверки</span>
+<ol>
+<li>Почему в нашей системе ПЛИС — Root Complex, а не Endpoint? Какие обязанности из этого следуют?
+<details><summary>Ответ</summary>Процессора нет, SSD — Endpoint по своей природе, значит, корнем может быть только ПЛИС. Она управляет PERST# и REFCLK, конфигурирует Root Port, перечисляет SSD (BAR, MPS/MRRS, Command), выдаёт запросы к регистрам SSD и обслуживает его DMA-запросы к «памяти хоста».</details></li>
+<li>Чем lane отличается от link? Сколько дифференциальных пар в линке x4?
+<details><summary>Ответ</summary>Lane — пара TX + пара RX; link — связь двух портов из нескольких lanes. В x4 — 8 дифференциальных пар (16 проводников).</details></li>
+<li>Почему у Gen2 x4 полезные 2.0 ГБ/с, а не 2.5?
+<details><summary>Ответ</summary>20 Гбит/с — скорость символов на проводе; 8b/10b превращает каждые 10 бит в 8 бит данных: 20 × 0.8 = 16 Гбит/с = 2.0 ГБ/с.</details></li>
+<li>Зачем линк сначала обучается на 2.5 GT/s и как он попадает на 5 GT/s?
+<details><summary>Ответ</summary>2.5 GT/s поддерживает любое устройство, а о возможностях партнёра стороны узнают только из TS1/TS2. После L0 нисходящий порт инициирует смену скорости через Recovery (автоматически или по Target Link Speed + Retrain Link).</details></li>
+<li>Какой уровень повторяет TLP при ошибке LCRC и где хранится копия пакета?
+<details><summary>Ответ</summary>Data Link Layer передатчика; копия хранится в retry buffer до получения ACK с номером ≥ Seq# пакета.</details></li>
+<li>Что произойдёт, если у приёмника кончились кредиты NPH?
+<details><summary>Ответ</summary>Передатчик не отправит ни одного non-posted TLP (MRd, Cfg), пока не придёт UpdateFC. Posted и completion при этом могут идти — классы независимы. В AXI-интерфейсе это выглядит как задержка/снятие tready.</details></li>
+<li>Какие из TLP MRd, MWr, CfgWr0, Msg, CplD — posted?
+<details><summary>Ответ</summary>MWr и Msg. MRd и CfgWr0 — non-posted (на CfgWr приходит Cpl). CplD — отдельный класс Completion.</details></li>
+<li>Почему чтение по адресу 0x8000_0000 нельзя кодировать MRd64, а по 0x1_0000_0000 — можно только MRd64?
+<details><summary>Ответ</summary>Спецификация требует 3DW-формат для адресов ниже 4 ГиБ; адрес ≥ 4 ГиБ не помещается в 32 бита и требует 4DW.</details></li>
+<li>Что означает Byte Count в CplD и почему он не всегда равен Length × 4?
+<details><summary>Ответ</summary>Это число оставшихся байт по запросу, включая текущий completion. Для всех частей, кроме последней, он больше длины данных части; кроме того, при невыровненных краях (First/Last BE ≠ 1111) полезных байт меньше, чем Length × 4.</details></li>
+<li>Что будет, если не установить в Command SSD бит BME? А бит MSE?
+<details><summary>Ответ</summary>Без BME SSD не сможет выдавать MRd/MWr: не прочитает команды из SQ и не запишет CQ — команды «зависнут». Без MSE SSD ответит UR на обращения к BAR0, и хост не сможет даже прочитать регистр CAP.</details></li>
+</ol>
+</div>
+
+<h3>Мини-задачи</h3>
+
+<div class="box task"><span class="t">Задача 1. Разбиение чтения на completions</span>
+SSD читает 1024 байта начиная с адреса 0x8000_0040 (MRRS = 1024). MPS = 128 байт. Completer делит ответ на максимально большие части. Найдите число CplD, Length, Byte Count и Lower Address каждого для (а) RCB = 64 и (б) RCB = 128.
+<details><summary>Ответ</summary>
+<p>(а) RCB = 64. Первая часть 0x40–0xBF (128 B) заканчивается на 0xC0, кратном 64, — допустимо. Всего 8 CplD по 32 DW:</p>
+<table>
+<caption>Таблица 1.10. Ответ к задаче 1а (RCB = 64)</caption>
+<tr><th class="num">№</th><th class="num">Адрес</th><th class="num">Length, DW</th><th class="num">Byte Count</th><th class="num">Lower Address</th></tr>
+<tr><td class="num">1</td><td class="num">0x8000_0040</td><td class="num">32</td><td class="num">1024 (0x400)</td><td class="num">0x40</td></tr>
+<tr><td class="num">2</td><td class="num">0x8000_00C0</td><td class="num">32</td><td class="num">896 (0x380)</td><td class="num">0x40</td></tr>
+<tr><td class="num">3</td><td class="num">0x8000_0140</td><td class="num">32</td><td class="num">768 (0x300)</td><td class="num">0x40</td></tr>
+<tr><td class="num">4</td><td class="num">0x8000_01C0</td><td class="num">32</td><td class="num">640 (0x280)</td><td class="num">0x40</td></tr>
+<tr><td class="num">5</td><td class="num">0x8000_0240</td><td class="num">32</td><td class="num">512 (0x200)</td><td class="num">0x40</td></tr>
+<tr><td class="num">6</td><td class="num">0x8000_02C0</td><td class="num">32</td><td class="num">384 (0x180)</td><td class="num">0x40</td></tr>
+<tr><td class="num">7</td><td class="num">0x8000_0340</td><td class="num">32</td><td class="num">256 (0x100)</td><td class="num">0x40</td></tr>
+<tr><td class="num">8</td><td class="num">0x8000_03C0</td><td class="num">32</td><td class="num">128 (0x080)</td><td class="num">0x40</td></tr>
+</table>
+<p>(б) RCB = 128. Первая часть обязана закончиться на 0x80: 64 байта. Дальше по 128 байт до 0x400, последняя часть 0x400–0x43F — 64 байта. Всего 9 CplD: Length = 16, 32×7, 16 DW; Byte Count = 1024, 960, 832, 704, 576, 448, 320, 192, 64; Lower Address = 0x40, затем 0x00 у всех остальных.</p>
+</details></div>
+
+<div class="box task"><span class="t">Задача 2. Размер BAR</span>
+После записи 0xFFFF_FFFF в BAR0 прочитано 0xFFFF_C004, в BAR1 — 0xFFFF_FFFF. Какого типа и размера окно? Какие адреса можно ему назначить?
+<details><summary>Ответ</summary>Память, 64-битный BAR (биты 2:1 = 10), не prefetchable (бит 3 = 0). Размер ~0xFFFF_C000 + 1 = 0x4000 = 16 КиБ. Адрес должен быть кратен 0x4000, например 0xC000_0000 (BAR0 ← 0xC000_0000, BAR1 ← 0).</details></div>
+
+<div class="box task"><span class="t">Задача 3. ID и номер регистра</span>
+(а) Чему равен Requester ID устройства 03:1F.7? (б) Какое BDF у ID 0x0108? (в) Каким будет DW2 запроса CfgRd0 к регистру Device Control SSD 01:00.0, если PCI Express Capability начинается со смещения 0x70?
+<details><summary>Ответ</summary>(а) 0x03FF. (б) Bus 1, Device 1, Function 0 (01:01.0). (в) Device Control лежит в DW по смещению 0x70 + 0x08 = 0x78 (младшие 16 бит), DW2 = 0x0100_0078.</details></div>
+
+<div class="box task"><span class="t">Задача 4. Расшифровка заголовка</span>
+Расшифруйте TLP с заголовком <code>0x6000_0080 0x0100_21FF 0x0000_0001 0x8000_0000</code>.
+<details><summary>Ответ</summary>Байт 0 = 0x60: Fmt = 011, Type = 00000 → MWr64 (4DW, с данными). Length = 0x080 = 128 DW = 512 байт. Requester ID = 0x0100 (01:00.0), Tag = 0x21, Last BE = First BE = 1111. Адрес = 0x0000_0001_8000_0000 (выше 4 ГиБ, поэтому 4DW законен). Это SSD пишет 512 байт в память хоста.</details></div>
+
+<div class="box task"><span class="t">Задача 5. Сколько тегов нужно?</span>
+MPS = 256, MRRS = 512, потолок линка 1.8 ГБ/с, латентность ответа нашего completer’а L = 2 мкс. Сколько одновременных чтений должен держать SSD, чтобы выйти на потолок? Какая будет скорость при 8 чтениях?
+<details><summary>Ответ</summary>S/BW = 512 / 1.8 ≈ 284 нс, T = 2284 нс. N ≥ 1.8 · 2284 / 512 ≈ 8.03 → 9 чтений. При N = 8: X = 8 · 512 / 2284 ≈ 1.79 ГБ/с — почти потолок, но любое увеличение L сразу снизит скорость.</details></div>
+
+<div class="box task"><span class="t">Задача 6. Link Status и Device Control</span>
+(а) Link Status SSD читается как 0x1041. Какая скорость и ширина? Что, вероятно, пошло не так? (б) Какое значение записать в поля Device Control для MPS = 256, MRRS = 1024 без расширенных тегов?
+<details><summary>Ответ</summary>(а) Speed = 1 (2.5 GT/s), width = 4: линк x4 остался на Gen1 — не выполнена смена скорости (Target Link Speed + Retrain Link) или один из партнёров не объявил 5 GT/s. (б) [7:5] = 001, [14:12] = 011, [8] = 0 → поля дают 0x3020.</details></div>
+
+<!-- ============================================================ 10 -->
+<h2 id="s10">1.10. Литература</h2>
+<ol>
+<li>PCI-SIG. <i>PCI Express Base Specification</i>, Revision 2.1 (2009) и 3.0 (2010). Гл. 2 — Transaction Layer: §2.2 форматы TLP, §2.2.9 правила Completion, §2.3.1.1 возврат данных чтения (RCB), §2.4 упорядочивание, §2.6 кредиты (flow control). Гл. 3 — Data Link Layer (§3.5 ACK/NAK, retry). Гл. 4 — Physical Layer (§4.2.6 LTSSM). Гл. 7 — конфигурационное пространство (§7.5 PCI-совместимые регистры, §7.8 PCI Express Capability).</li>
+<li>PCI-SIG. <i>PCI Local Bus Specification</i>, Revision 3.0 — заголовки Type 0/1, BAR, Command/Status.</li>
+<li>PCI-SIG. <i>PCI Express Card Electromechanical Specification</i>, Rev. 2.0 — PERST#, REFCLK, временные параметры включения. PCI-SIG. <i>PCI Express M.2 Specification</i> — разъём M.2.</li>
+<li>Xilinx (AMD). <i>PG054: 7 Series FPGAs Integrated Block for PCI Express</i>, v3.3 — режим Root Port, интерфейсы AXI4-Stream и конфигурации.</li>
+<li>Xilinx (AMD). <i>UG476: 7 Series FPGAs GTX/GTH Transceivers</i>.</li>
+<li>Xilinx. <i>WP350: Understanding Performance of PCI Express Systems</i> — расчёт эффективности TLP, влияние MPS/MRRS и задержек.</li>
+<li>R. Budruk, D. Anderson, T. Shanley. <i>PCI Express System Architecture</i>. MindShare / Addison-Wesley, 2003 — подробное и доступное изложение всех уровней.</li>
+<li>NVM Express. <i>NVM Express Base Specification</i>, Rev. 1.4 / 2.0 — class code 0x010802, регистры контроллера и doorbell’ы (подробно в главе 2).</li>
+<li>Исходный код Linux: <code>drivers/pci/probe.c</code>, <code>drivers/pci/setup-bus.c</code> — эталонная реализация перечисления и назначения BAR.</li>
+</ol>
+
+<div class="pager"><a href="index.html">← Введение и цели</a><a href="02_nvme_basics.html">2. NVMe с нуля →</a></div>
+<footer>Учебный проект «NVMe-хост на голой Kintex-7». Исходники: <a href="https://github.com/alexander-hdl/NVME">github.com/alexander-hdl/NVME</a>.</footer>
+</main>
+</div>
+</body>
+</html>
