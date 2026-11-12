@@ -8,6 +8,8 @@
 #                              reports in fpga/build/reports/
 #           impl             : synth + impl_1 up to route_design (post-route reports)
 #           bit              : synth + impl + write_bitstream (fpga/build/nvme_host_top.bit)
+#   board=kc705|ax7a200b : target board (default kc705); ax7a200b -> project nvme_host_ax7a200b,
+#                          reports in fpga/build/reports_ax7a200b/
 #   jobs=N  parallel runs (default 4)
 #   recreate  : always re-run create_project.tcl (default: re-use fpga/build/nvme_host/nvme_host.xpr)
 #   top=<name>: kc705_top (default, board top, all pins assigned: a bitstream needs no loose_io) or
@@ -26,13 +28,12 @@
 set script_dir [file dirname [file normalize [info script]]]
 set repo_root  [file normalize [file join $script_dir .. ..]]
 set build_dir  [file join $repo_root fpga build]
-set xpr        [file join $build_dir nvme_host nvme_host.xpr]
 set rpt_dir    [file join $build_dir reports]
 
 # vivado.bat splits 'key=value' into 'key value': merge them back
 set argv_m {}
 foreach a $argv {
-    if {[llength $argv_m] && [lindex $argv_m end] in {top jobs}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
+    if {[llength $argv_m] && [lindex $argv_m end] in {top jobs board}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
 }
 set argv $argv_m
 
@@ -40,7 +41,8 @@ set stage    synth
 set jobs     4
 set recreate 0
 set loose_io 0
-set top_name kc705_top
+set top_name {}
+set board    kc705
 foreach a $argv {
     switch -glob -- $a {
         synth - impl - bit { set stage $a }
@@ -48,9 +50,18 @@ foreach a $argv {
         recreate           { set recreate 1 }
         loose_io           { set loose_io 1 }
         top=*              { set top_name [string range $a 4 end] }
+        board=*            { set board    [string range $a 6 end] }
         default            { puts "WARNING: ignoring unknown argument '$a'" }
     }
 }
+switch -- $board {
+    kc705    { set proj_name nvme_host;          if {$top_name eq ""} { set top_name kc705_top } }
+    ax7a200b { set proj_name nvme_host_ax7a200b; if {$top_name eq ""} { set top_name ax7a200b_top } }
+    default  { error "board=$board : must be kc705 or ax7a200b" }
+}
+set xpr [file join $build_dir $proj_name ${proj_name}.xpr]
+# per-board report directory (kc705 keeps fpga/build/reports)
+if {$board ne "kc705"} { set rpt_dir [file join $build_dir reports_$board] }
 file mkdir $rpt_dir
 
 if {$recreate || ![file exists $xpr]} {
@@ -67,7 +78,7 @@ if {$recreate || ![file exists $xpr]} {
 proc check_run {run} {
     set st [get_property STATUS [get_runs $run]]
     puts "INFO: run $run status: $st"
-    if {![string match "*Complete*" $st] || [string match "*ERROR*" $st]} {
+    if {(![string match "*Complete*" $st] && ![string match "*cached IP results*" $st]) || [string match "*ERROR*" $st]} {
         error "run $run did not complete successfully ($st)"
     }
 }
@@ -119,7 +130,7 @@ report_drc            -file [file join $rpt_dir route_drc.rpt]
 report_power          -file [file join $rpt_dir route_power.rpt]
 write_checkpoint -force [file join $build_dir ${top_name}_routed.dcp]
 if {$stage eq "bit"} {
-    set bit [glob -nocomplain [file join $build_dir nvme_host nvme_host.runs impl_1 *.bit]]
+    set bit [glob -nocomplain [file join $build_dir $proj_name ${proj_name}.runs impl_1 *.bit]]
     if {[llength $bit]} { file copy -force [lindex $bit 0] [file join $build_dir ${top_name}.bit] }
 }
 puts "INFO: $stage finished, reports in $rpt_dir"

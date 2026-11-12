@@ -352,31 +352,39 @@ module pcie7x_rx_adapt #(
   seq_t seq_q;
   logic pay_err_q;
   logic out_fire;
+  // sequencer output q_* -> OUTPUT SLICE (axis_skid) -> m_tlp_*.  The slice cuts the path
+  // header-FIFO LUTRAM read -> sequencer -> tlp_rx_demux -> hostmem_writer / rp_requester decode,
+  // which failed 125 MHz on Artix-7 (-0.6 ns).  One cycle of latency, no bandwidth.
+  logic [127:0] q_tdata;
+  logic [15:0]  q_tkeep;
+  logic         q_tlast;
+  logic [1:0]   q_tuser;
+  logic         q_tvalid, q_tready;
 
   always_comb begin : sequencer
-    m_tlp_tdata  = hf_tdata;
-    m_tlp_tkeep  = 16'hFFFF;
-    m_tlp_tlast  = hf_tlast;
-    m_tlp_tuser  = {hf_tlast & ef_tdata[0], hf_tuser[0]};
-    m_tlp_tvalid = 1'b0;
+    q_tdata  = hf_tdata;
+    q_tkeep  = 16'hFFFF;
+    q_tlast  = hf_tlast;
+    q_tuser  = {hf_tlast & ef_tdata[0], hf_tuser[0]};
+    q_tvalid = 1'b0;
     hf_tready    = 1'b0;
     dw_tready    = 1'b0;
     ef_tready    = 1'b0;
     out_fire     = 1'b0;
     case (seq_q)
       SEQ_HDR: begin
-        m_tlp_tvalid = hf_tvalid && (!hf_tlast || ef_tvalid);
-        out_fire     = m_tlp_tvalid && m_tlp_tready;
+        q_tvalid = hf_tvalid && (!hf_tlast || ef_tvalid);
+        out_fire     = q_tvalid && q_tready;
         hf_tready    = out_fire;
         ef_tready    = out_fire && hf_tlast;
       end
       default: begin // SEQ_PAY
-        m_tlp_tdata  = dw_tdata;
-        m_tlp_tkeep  = dw_tkeep;
-        m_tlp_tlast  = dw_tlast;
-        m_tlp_tuser  = {dw_tlast & ef_tdata[0], pay_err_q};
-        m_tlp_tvalid = dw_tvalid && (!dw_tlast || ef_tvalid);
-        out_fire     = m_tlp_tvalid && m_tlp_tready;
+        q_tdata  = dw_tdata;
+        q_tkeep  = dw_tkeep;
+        q_tlast  = dw_tlast;
+        q_tuser  = {dw_tlast & ef_tdata[0], pay_err_q};
+        q_tvalid = dw_tvalid && (!dw_tlast || ef_tvalid);
+        out_fire     = q_tvalid && q_tready;
         dw_tready    = out_fire;
         ef_tready    = out_fire && dw_tlast;
       end
@@ -399,6 +407,17 @@ module pcie7x_rx_adapt #(
     if (out_fire && seq_q == SEQ_HDR) pay_err_q <= hf_tuser[0];
   end
 
+  // tuser[2] of the slice = "this beat is an MRd header" (for the non-posted count below)
+  logic q_is_mrd, o_is_mrd;
+  assign q_is_mrd = (seq_q == SEQ_HDR) && tlp_is_mrd(hf_tdata[31:0]);
+
+  axis_skid #(.W(128), .UW(3)) u_out_skid (
+    .clk(clk), .rst(rst),
+    .s_tdata(q_tdata), .s_tkeep(q_tkeep), .s_tlast(q_tlast), .s_tuser({q_is_mrd, q_tuser}),
+    .s_tvalid(q_tvalid), .s_tready(q_tready),
+    .m_tdata(m_tlp_tdata), .m_tkeep(m_tlp_tkeep), .m_tlast(m_tlp_tlast), .m_tuser({o_is_mrd, m_tlp_tuser}),
+    .m_tvalid(m_tlp_tvalid), .m_tready(m_tlp_tready));
+
   // ---- non-posted bookkeeping: MRd headers waiting in the header FIFO ------------------
   localparam int NP_LIMIT = HDR_FIFO_DEPTH + NP_EXT_DEPTH - 2;
   logic                         np_push, np_pop, np_ok_d;
@@ -406,7 +425,8 @@ module pcie7x_rx_adapt #(
   logic [$clog2(HDR_FIFO_DEPTH+NP_EXT_DEPTH)+1:0] np_total;
 
   assign np_push = fire && hdr_push_i && tlp_is_mrd(hdr_word[31:0]);
-  assign np_pop  = hf_tready && tlp_is_mrd(hf_tdata[31:0]);   // hf_tready = header beat leaves
+  // an MRd header leaves this module (slice output); headers inside the output slice still count
+  assign np_pop  = m_tlp_tvalid && m_tlp_tready && o_is_mrd;
   assign np_total = np_cnt_q + np_ext_count;
   assign np_ok_d  = !np_backpressure && (np_total < NP_LIMIT);
 

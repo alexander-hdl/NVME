@@ -1,6 +1,7 @@
 # Simulation (xsim, Vivado 2022.2)
 
 Tools (Windows): `C:\Xilinx\Vivado\2022.2\bin\xvlog.bat`, `xelab.bat`, `xsim.bat`.
+This machine now has only Vivado 2025.2: set `VIVADO_BIN=C:\AMDDesignTools\2025.2\Vivado\bin` (all 20 tests pass with it, 2026-11-12).
 From Git Bash: `/c/Xilinx/Vivado/2022.2/bin/xvlog.bat -sv <files>`.
 
 Every testbench lives in `sim/tb/tb_<name>.sv`, top module `tb_<name>`, and must:

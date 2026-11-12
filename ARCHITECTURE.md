@@ -1,6 +1,7 @@
 # NVMe host on bare Kintex-7 — architecture specification
 
-Status: v1.1 (design contract; v1.1 = RTL-review fixes M1-M6 / m1-m12, see research/04_rtl_review.md). Owner: project architect.
+Status: v1.2 (design contract; v1.1 = RTL-review fixes M1-M6 / m1-m12, see research/04_rtl_review.md; v1.2 = Artix-7 timing
+slices in `pcie7x_rx_adapt` / `hostmem_completer`, board top `ax7a200b_top`, see STAND/AX7A200B_ARCHITECTURE.md). Owner: project architect.
 Language: SystemVerilog-2012 (synthesizable subset accepted by Vivado 2022.2 and xsim).
 Target: Xilinx Kintex-7 (XC7K325T-2 reference), `pcie_7x` v3.3 integrated block, **Root Port, Gen2 x4,
 AXI-Stream 128-bit @ 125 MHz** (`user_clk`). Goal: sustained sequential NVMe write at the PCIe Gen2 x4
@@ -196,6 +197,10 @@ beats (internal elastic buffer ≥ 4 beats). `m_axis_rx_tready` may be deasserte
 the downstream FIFOs (which then also continued into the IP's `rx_null_gen`). It costs one cycle of latency and no bandwidth;
 `tb_rx_adapt` still requires a saturated output (1 core beat/cycle for non-straddled traffic). The splitter uses 2/3-bit lane
 numbers and counts (no 32-bit `int`; the 11-bit payload remainder is compared through its upper bits only).
+**Output register slice (v1.2, Artix-7 timing).** The output sequencer also goes through an `axis_skid` (128 + 3 tuser
+bits) before `m_tlp`: without it the path header-FIFO LUTRAM read → sequencer → `tlp_rx_demux` → `hostmem_writer` /
+`rp_requester` decode failed 125 MHz on the XC7A200T-2 (−0.6 ns). The extra tuser bit marks "MRd header" so that `np_cnt`
+is decremented when the header leaves the slice (headers inside the slice still count). One cycle of latency.
 **`rx_np_ok` (m5).** `np_cnt` = number of MRd headers in the adapter's header FIFO (+1 when an MRd header is pushed, −1 when it
 leaves). `rx_np_ok <= !np_backpressure && (np_cnt + np_ext_count < HDR_FIFO_DEPTH + NP_EXT_DEPTH − 2)` (8 + 16 − 2 = 22): the
 core is told to bypass non-posted TLPs when the end-to-end queue is two entries short of full. Posted/completion headers are not counted
@@ -264,6 +269,11 @@ Behaviour:
    stalls; stop issuing reads when the FIFO has < 4 free beats).
 5. Completions of one request go out in increasing address order; requests are served in FIFO order (simplest and
    legal; per-tag ordering is preserved automatically).
+6. (v1.2, Artix-7 timing) Between the request FIFO and the working request `W` a request passes two registers:
+   `R` (raw FIFO head; loads only when empty, so its 128-bit load enable does not depend on the W/P hand-over) and
+   `P` (decoded request in `W` format: region decode, BC, Lower Address). `np_count` = FIFO + R + P (0..18).
+   Header-in → first CplD beat: 10 cycles (was 8). A request still needs ≥ 2 output beats, so R's
+   one-request-per-2-cycles rate costs no bandwidth.
 
 ### 5.6 `hostmem_writer`
 ```

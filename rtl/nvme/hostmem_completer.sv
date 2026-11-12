@@ -62,8 +62,14 @@
 //
 // Requests are served strictly in arrival order, so completions of one tag
 // are in increasing address order and tags never need reordering.
-// Latency (header accepted -> first CplD beat): 8 cycles with the reference
-// primitives (see tb_completer).
+// Latency (header accepted -> first CplD beat): 10 cycles with the reference
+// primitives (see tb_completer).  Between the request FIFO and W a request
+// passes two registers (timing on Artix-7 at 125 MHz: LUTRAM read + decode
+// did not fit one cycle): R = raw FIFO head, P = decoded request (W format).
+// R only loads when it is empty (its 128-bit load enable must not depend on
+// the W/P hand-over chain), so a new request can enter R every 2nd cycle; every
+// request needs >= 2 output beats (CplD header + data) anyway, so this costs no
+// bandwidth.  P -> W hand-over is one per cycle.
 // =============================================================================
 module hostmem_completer
   import nvme_host_pkg::*;
@@ -81,7 +87,7 @@ module hostmem_completer
   input  logic         s_mrd_tvalid,
   output logic         s_mrd_tready,
   output logic         np_backpressure,      // request FIFO has < 2 free entries
-  output logic [$clog2(16):0] np_count,       // request FIFO occupancy (MRd queued here), 0..16 = REQ_DEPTH
+  output logic [$clog2(16):0] np_count,       // MRd queued here: request FIFO + registers R and P, 0..18
   // completions (tlp_axis)
   output logic [127:0] m_cpl_tdata,
   output logic [15:0]  m_cpl_tkeep,
@@ -197,6 +203,11 @@ module hostmem_completer
   // ---------------------------------------------------------------------------
   logic [127:0] reqf_tdata;
   logic         reqf_valid, reqf_pop, reqf_afull;
+  logic [$clog2(REQ_DEPTH):0] reqf_count;
+  logic         p_valid;                   // decoded-request register P holds a request
+  logic         r_valid;                   // raw-header register R holds a request
+  logic [127:0] r_tdata;
+  logic         r_take;                    // R -> P this cycle
 
   axis_fifo_sync #(.W(128), .UW(2), .DEPTH(REQ_DEPTH)) u_reqf (
     .clk(clk), .rst(rst),
@@ -204,7 +215,9 @@ module hostmem_completer
     .s_tvalid(s_mrd_tvalid), .s_tready(s_mrd_tready),
     .m_tdata(reqf_tdata), .m_tkeep(), .m_tlast(), .m_tuser(),
     .m_tvalid(reqf_valid), .m_tready(reqf_pop),
-    .count(np_count), .almost_full(reqf_afull));
+    .count(reqf_count), .almost_full(reqf_afull));
+
+  assign np_count = reqf_count + {{$clog2(REQ_DEPTH){1'b0}}, p_valid} + {{$clog2(REQ_DEPTH){1'b0}}, r_valid};
 
   assign np_backpressure = reqf_afull;     // free <= 2 (superset of "free < 2")
 
@@ -226,8 +239,8 @@ module hostmem_completer
     logic [7:0]  tag;
   } wreq_t;
 
-  wreq_t w, w_load;
-  logic  w_valid;
+  wreq_t w, w_load, p;
+  logic  w_valid, p_take;
 
   logic [31:0] rq_h0, rq_h1, rq_h2, rq_h3, rq_addr;
   logic        rq_is4dw, rq_hi_bad;
@@ -238,7 +251,7 @@ module hostmem_completer
   region_t     rq_reg;
 
   always_comb begin
-    {rq_h3, rq_h2, rq_h1, rq_h0} = reqf_tdata;
+    {rq_h3, rq_h2, rq_h1, rq_h0} = r_tdata;
     rq_is4dw  = rq_h0[29];
     rq_addr   = rq_is4dw ? rq_h3 : rq_h2;
     rq_hi_bad = rq_is4dw && (rq_h2 != 32'd0);
@@ -327,7 +340,9 @@ module hostmem_completer
   assign ur_fire   = d_valid &&  d.ur && hdrf_ready;
   assign d_consume = (issue && beat_last) || ur_fire;
   assign emit      = w_valid && (!d_valid || d_consume);
-  assign reqf_pop  = reqf_valid && (!w_valid || (emit && a_done));
+  assign p_take    = p_valid && (!w_valid || (emit && a_done));
+  assign r_take    = r_valid && (!p_valid || p_take);
+  assign reqf_pop  = reqf_valid && !r_valid;      // see the header: load enable kept short
 
   assign rd_en   = issue;
   assign rd_addr = d.rd_addr;
@@ -336,6 +351,8 @@ module hostmem_completer
   always_ff @(posedge clk) begin
     if (rst) begin
       w_valid     <= 1'b0;
+      p_valid     <= 1'b0;
+      r_valid     <= 1'b0;
       d_valid     <= 1'b0;
       d_hdr_sent  <= 1'b0;
     end else begin
@@ -347,10 +364,25 @@ module hostmem_completer
         w.first   <= 1'b0;
         if (a_done) w_valid <= 1'b0;
       end
-      if (reqf_pop) begin
-        w       <= w_load;
+      if (p_take) begin
+        w       <= p;
         w_valid <= 1'b1;
       end
+      // --- pre-decode register (FIFO head decoded into W format) ---
+      if (r_take) begin
+        p       <= w_load;
+        p_valid <= 1'b1;
+      end else if (p_take) begin
+        p_valid <= 1'b0;
+      end
+      // --- raw-header register (cuts LUTRAM read -> decode) ---
+      if (reqf_pop) begin
+        r_tdata <= reqf_tdata;
+        r_valid <= 1'b1;
+      end else if (r_take) begin
+        r_valid <= 1'b0;
+      end
+      // (reqf_pop and r_take are exclusive: reqf_pop needs !r_valid, r_take needs r_valid)
       // --- descriptor / issuer ---
       if (issue) begin
         d.rd_addr    <= d.rd_addr + 32'd16;
