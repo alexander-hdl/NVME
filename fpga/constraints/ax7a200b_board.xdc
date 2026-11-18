@@ -22,9 +22,14 @@ set_property PACKAGE_PIN F10 [get_ports sys_clk_p]
 set_property PACKAGE_PIN E10 [get_ports sys_clk_n]
 
 # ---------------------------------------------------------------------------
-# PERST# to the M.2 SSD: J11 pin 3 (G21, bank 16, VCCIO 3.3 V) -> wire -> adapter XP1 PERST_M2#
+# PERST# to the M.2 SSD: PCIE_PERST of the carrier = edge finger A11 (via R102) -> FPGA L16
+# (bank 15, VCCIO 3.3 V, IO_L23P_T3_FOE_B_15; FOE_B is a BPI-only function, the board boots from SPI).
+# ALINX AX7A200B manual (CN), table "PCIe x2 FPGA pins": PCIE_PERST = L16 (an input for endpoint designs;
+# here the Root Port DRIVES it).  Path: L16 -> A11 -> adapter slot PERST_HOST# -> jumper XP1
+# (PERST_M2# <-> PERST_HOST#) -> M.2 PERST#.  No wire needed.
+# Fallback if the carrier had a one-way buffer on this net: J11 pin 3 (G21) + wire to XP1 PERST_M2#.
 # ---------------------------------------------------------------------------
-set_property PACKAGE_PIN G21      [get_ports pcie_perst_n]      ;# J11-3, verify schematic
+set_property PACKAGE_PIN L16      [get_ports pcie_perst_n]      ;# PCIE_PERST (edge A11)
 set_property IOSTANDARD LVCMOS33  [get_ports pcie_perst_n]
 set_property DRIVE 8              [get_ports pcie_perst_n]
 set_property SLEW SLOW            [get_ports pcie_perst_n]

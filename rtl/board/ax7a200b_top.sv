@@ -7,7 +7,7 @@
 //   slot REFCLK 100 MHz (F10/E10)   --> pcie_7x refclk                         |  link_clk: debouncers, latches, LEDs
 //   GTP x4 (IP lanes 0/1 = slot lanes 0/1; lanes 2/3 = SFP cages, left empty)   |
 //     -> the link trains to x2 (variant A of the architecture document)        +- user_clk (125 MHz): generator
-//   PERST# : FPGA pin G21 (J11 pin 3) -> wire -> adapter jumper XP1 (PERST_M2#); the edge PERST# is not wired.
+//   PERST# : FPGA pin L16 = carrier PCIE_PERST = edge finger A11 -> adapter slot -> jumper XP1 (PERST_M2# <-> PERST_HOST#).
 //
 // User interface (ALINX keys are ACTIVE LOW: pressed = 0; LEDs are ACTIVE LOW: 0 = on)
 //   RESET (F15)  board reset: new PERST# / bring-up cycle, clears the latches and the generator (= new run)
@@ -39,7 +39,7 @@ module ax7a200b_top #(
   input  logic         free_clk_p,           // AC7A200 SYS_CLK 200 MHz (bank 34)
   input  logic         free_clk_n,
   // ---- PCIe ----
-  output logic         pcie_perst_n,         // G21 -> wire -> adapter XP1 PERST_M2#
+  output logic         pcie_perst_n,         // L16 -> edge A11 -> adapter XP1 -> M.2 PERST#
   output logic [3:0]   pci_exp_txp,
   output logic [3:0]   pci_exp_txn,
   input  logic [3:0]   pci_exp_rxp,

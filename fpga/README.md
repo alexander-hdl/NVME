@@ -182,7 +182,7 @@ C:\AMDDesignTools\2025.2\Vivado\bin\vivado.bat -mode batch -source ..\..\scripts
 |---|---|
 | project / reports / bitstream | `fpga/build/nvme_host_ax7a200b/`, `fpga/build/reports_ax7a200b/`, `fpga/build/ax7a200b_top.bit` |
 | IP | `fpga/ip/pcie_7x_0_a7/pcie_7x_0.xci` (same property list as KC705, part xc7a200tfbg484-2; module name `pcie_7x_0`) |
-| constraints | `ax7a200b_board.xdc` (SYS_CLK R4/T4 DIFF_SSTL15, refclk F10/E10 = MGTREFCLK1_216, PERST# G21 = J11-3, keys, LEDs, UART TX L15, SPI x4), `ax7a200b_cdc.xdc` (impl only: clock groups, GT LOCs) |
+| constraints | `ax7a200b_board.xdc` (SYS_CLK R4/T4 DIFF_SSTL15, refclk F10/E10 = MGTREFCLK1_216, PERST# L16 = PCIE_PERST / edge A11, keys, LEDs, UART TX L15, SPI x4), `ax7a200b_cdc.xdc` (impl only: clock groups, GT LOCs) |
 | GT lanes | IP lane 0..3 = `GTPE2_CHANNEL_X0Y7/Y6/Y5/Y4` (slot lane 0, slot lane 1, SFP2, SFP1); = the IP default. x4 IP trains to x2 (SFP cages empty) |
 | top | `ax7a200b_top`, `N_SLOTS = 4` (4 x 128 KiB), generator 1 GiB full rate (parameters `GEN_LEN_SEL` / `GEN_RATE_SEL`) |
 
@@ -194,8 +194,8 @@ Result (2026-11-12, Vivado 2025.2, default strategies): **all timing constraints
 
 | clock | WNS setup | WHS |
 |---|---|---|
-| `userclk2` 125 MHz (host + generator) | **+0.098 ns** | +0.065 ns |
-| `clk_250mhz_mux_x0y0` (IP) | +0.249 ns | +0.080 ns |
+| `userclk2` 125 MHz (host + generator) | **+0.098 ns** (2026-11-18 rebuild with PERST# on L16: +0.187 ns) | +0.065 ns |
+| `clk_250mhz_mux_x0y0` (IP) | +0.249 ns (rebuild: +0.127 ns) | +0.080 ns |
 | `userclk1` 250 MHz | +1.135 ns | +0.070 ns |
 | `free_clk` 200 MHz | +0.138 ns | +0.170 ns |
 
