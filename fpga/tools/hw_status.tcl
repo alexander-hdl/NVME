@@ -40,6 +40,17 @@ proc rv {name} {
     return [expr "0x[get_property INPUT_VALUE $p]"]
 }
 
+# probe value by VIO input port number (for the counters: their net names are cnt_s1*, tm_s1*)
+proc rp {port} {
+    foreach p [get_hw_probes -of_objects [vio] -filter {TYPE == vio_input}] {
+        if {[get_property PROBE_PORT $p] == $port} {
+            set_property INPUT_VALUE_RADIX HEX $p
+            return [expr "0x[get_property INPUT_VALUE $p]"]
+        }
+    }
+    return 0
+}
+
 set ltssm_names {
     00 Detect.Quiet 01 Detect.Quiet 02 Detect.Active 03 Detect.Active 04 Polling.Active 05 Polling.Config
     06 Polling.Compliance 07 Polling.Compliance 08 Polling.Compliance 09 Polling.Compliance 0A Polling.Compliance
@@ -51,15 +62,22 @@ set ltssm_names {
 set err_names {00 none 01 E_LINK_LOST 02 E_ENUM 03 E_ADMIN 04 E_IO_TIMEOUT 05 E_LBA_RANGE 06 E_LINK_TIMEOUT}
 
 proc status {} {
-    global ltssm_names err_names cnt_map
+    global ltssm_names err_names
     refresh_hw_vio [vio]
     set lt  [format %02X [rv ltssm_s1]]
     set err [format %02X [rv s_err]]
     set ltn  [expr {[dict exists $ltssm_names $lt] ? [dict get $ltssm_names $lt] : "?"}]
     set errn [expr {[dict exists $err_names $err] ? [dict get $err_names $err] : "?"}]
     set wid  [lindex {x1 x2 x4 ?} [rv s_width]]
-    set c {}
-    foreach n {bytes cmds cmd_err max_lat} { lappend c "$n=[rv [dict get $cnt_map $n]]" }
+    set bytes [rp 6]
+    set run_cyc [rp 10]; set span_cyc [rp 11]
+    set c [list "bytes=$bytes" "cmds=[rp 7]" "cmd_err=[rp 8]" "max_lat=[rp 9]"]
+    if {$run_cyc > 0} {
+        lappend c [format "run=%.3fs rate=%.1fMB/s" [expr {$run_cyc / 125e6}] [expr {$bytes / ($run_cyc / 125e6) / 1e6}]]
+    }
+    if {$span_cyc > 0 && $bytes > 131072} {
+        lappend c [format "span=%.3fs sustained=%.1fMB/s" [expr {$span_cyc / 125e6}] [expr {($bytes - 131072) / ($span_cyc / 125e6) / 1e6}]]
+    }
     puts [format "STATUS: link_up=%d gen2=%d width=%s ltssm=0x%s(%s) enum=%d nvme_ready=%d run=%d done=%d | err=0x%s(%s) detail=0x%02X flags=0x%02X lba_err=%d cmd_err_nz=%d | perst_pin=%d link_lost=%d link_fail=%d retries=%d start=%d stop=%d | %s"         [rv s_link_up] [rv s_gen2] $wid $lt $ltn [rv s_enum] [rv s_ready] [rv s_run] [rv s_done]         $err $errn [rv det_s1] [rv s_flags] [rv s_lba] [rv s_cmd_err_nz]         [rv perst_pin_s] [rv link_lost] [rv link_fail] [rv link_retries] [rv start_lat] [rv stop_lat] [join $c " "]]
 }
 
@@ -72,7 +90,6 @@ proc pulse {name} {
 }
 
 # which cnt_s1* probe is which counter: decided from the probe's bit range (PROBE_PORT_BITS / name), see "probes"
-set cnt_map {bytes cnt_s1_1 cmds cnt_s1_2 cmd_err cnt_s1_3 max_lat cnt_s1}   ;# VIO ports 6, 7, 8, 9
 
 # vivado.bat splits 'key=value' into 'key value': merge them back
 set argv_m {}

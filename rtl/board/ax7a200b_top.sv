@@ -171,6 +171,7 @@ module ax7a200b_top #(
   (* ASYNC_REG = "TRUE" *) logic [1:0]   perst_pin_s;       // actual level on L16 (= SSD PERST#)
   (* ASYNC_REG = "TRUE" *) logic [7:0]   det_s0, det_s1;    // status_error_detail (fail_step of the failing module)
   (* ASYNC_REG = "TRUE" *) logic [191:0] cnt_s0, cnt_s1;    // {max_latency, cmd_errors, cmds_done, bytes_done}
+  (* ASYNC_REG = "TRUE" *) logic [79:0]  tm_s0, tm_s1;      // {span_cyc, run_cyc} (user_clk timers, see below)
   always_ff @(posedge link_clk) begin
     ltssm_s0 <= dbg_ltssm;
     ltssm_s1 <= ltssm_s0;
@@ -179,6 +180,8 @@ module ax7a200b_top #(
     det_s1   <= det_s0;
     cnt_s0   <= {stat_max_latency, stat_cmd_errors, stat_cmds_done, stat_bytes_done};
     cnt_s1   <= cnt_s0;
+    tm_s0    <= {span_cyc, run_cyc};
+    tm_s1    <= tm_s0;
   end
 
   vio_status u_vio (
@@ -193,6 +196,8 @@ module ax7a200b_top #(
     .probe_in7(cnt_s1[127:64]),                                                           // 64 stat_cmds_done
     .probe_in8(cnt_s1[159:128]),                                                          // 32 stat_cmd_errors
     .probe_in9(cnt_s1[191:160]),                                                          // 32 stat_max_latency
+    .probe_in10(tm_s1[39:0]),                                                             // 40 run_cyc  (RUN + DRAIN)
+    .probe_in11(tm_s1[79:40]),                                                            // 40 span_cyc (1st..last completion)
     .probe_out0(vio_rst),                                                                 // 1 board reset (hold high)
     .probe_out1(vio_start),                                                               // 1 START
     .probe_out2(vio_stop),                                                                // 1 STOP
@@ -233,6 +238,30 @@ module ax7a200b_top #(
   end
   logic halt;
   assign halt = halt_sync[1];
+
+  // ---- run timers (user_clk = 125 MHz), cleared by the board / VIO reset ----------------------------------
+  //  run_cyc  : cycles in sequencer state RUN (5) or DRAIN (6)  -> bytes / run_cyc  = rate of the whole recording
+  //  span_cyc : cycles from the first to the last change of stat_bytes_done (first .. last Write completion)
+  //             -> (bytes - one command) / span_cyc = sustained SSD rate without the start-up
+  logic [39:0] run_cyc, span_cyc, span_cnt;
+  logic [63:0] bytes_q;
+  logic        span_on;
+  always_ff @(posedge user_clk) begin
+    bytes_q <= stat_bytes_done;
+    if (urst) begin
+      run_cyc  <= '0;
+      span_cyc <= '0;
+      span_cnt <= '0;
+      span_on  <= 1'b0;
+    end else begin
+      if (dbg_uc[3:0] == 4'd5 || dbg_uc[3:0] == 4'd6) run_cyc <= run_cyc + 40'd1;
+      if (span_on) span_cnt <= span_cnt + 40'd1;
+      if (stat_bytes_done != bytes_q) begin
+        if (!span_on) span_on <= 1'b1;              // first completion: start counting
+        else          span_cyc <= span_cnt + 40'd1; // every later completion: latch the elapsed time
+      end
+    end
+  end
 
   logic [2:0] phase;
   logic       tick;
