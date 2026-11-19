@@ -53,14 +53,14 @@ function Invoke-Test([string]$Name) {
     $rc = Invoke-Tool $Xvlog (@('-sv', '-L', 'work', '-i', (Join-Path $Root 'rtl')) + $srcs) $log
     if ($rc -ne 0 -or (Select-String -Path $log -Pattern '^ERROR' -Quiet)) {
         Write-Host "[$Name] COMPILE FAILED (see $log)"
-        Select-String -Path $log -Pattern 'ERROR' | Select-Object -First 20 | ForEach-Object { $_.Line }
+        Select-String -Path $log -Pattern 'ERROR' | Select-Object -First 20 | ForEach-Object { Write-Host $_.Line }
         return $false
     }
     Write-Host "[$Name] xelab ..."
     $rc = Invoke-Tool $Xelab @('-debug', 'typical', '-timescale', '1ns/1ps', '-L', 'work', "tb_$Name", '-s', "tb_${Name}_sim") $log
     if ($rc -ne 0 -or (Select-String -Path $log -Pattern '^ERROR' -Quiet)) {
         Write-Host "[$Name] ELABORATION FAILED (see $log)"
-        Select-String -Path $log -Pattern 'ERROR' | Select-Object -First 20 | ForEach-Object { $_.Line }
+        Select-String -Path $log -Pattern 'ERROR' | Select-Object -First 20 | ForEach-Object { Write-Host $_.Line }
         return $false
     }
     Write-Host "[$Name] xsim ..."
@@ -69,8 +69,8 @@ function Invoke-Test([string]$Name) {
     $bad = Select-String -Path $log -Pattern '^(Fatal|FATAL|ERROR)|Error:' -Quiet
     if ($passed -and -not $bad) { Write-Host "[$Name] PASS"; return $true }
     Write-Host "[$Name] FAIL (rc=$rc, log: $log)"
-    Select-String -Path $log -Pattern 'ERROR|Fatal|FATAL|Error' | Select-Object -First 20 | ForEach-Object { $_.Line }
-    Get-Content $log -Tail 5
+    Select-String -Path $log -Pattern 'ERROR|Fatal|FATAL|Error' | Select-Object -First 20 | ForEach-Object { Write-Host $_.Line }
+    Get-Content $log -Tail 5 | Out-Host
     return $false
 }
 
@@ -80,7 +80,9 @@ if (-not $Names -or $Names.Count -eq 0) {
 
 $fail = 0
 foreach ($n in $Names) {
-    if (-not (Invoke-Test $n)) { $fail = 1 }
+    # only the LAST pipeline value is the verdict (stray output must not turn a failure into a pass)
+    $r = @(Invoke-Test $n)
+    if (-not ($r.Count -gt 0 -and $r[-1] -eq $true)) { $fail = 1 }
 }
 if ($fail -eq 0) { Write-Host "ALL PASSED ($($Names -join ' '))" } else { Write-Host 'SOME TESTS FAILED' }
 exit $fail

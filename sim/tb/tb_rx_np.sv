@@ -65,9 +65,9 @@ module tb_rx_np;
   endtask
 
   task automatic drain();
-    m_tlp_tready = 1'b1;
+    m_tlp_tready <= 1'b1;                      // NBA: no race with the DUT's flops sampling tready
     repeat (80) @(posedge clk);
-    m_tlp_tready = 1'b0;
+    m_tlp_tready <= 1'b0;
     repeat (4) @(posedge clk);
   endtask
 

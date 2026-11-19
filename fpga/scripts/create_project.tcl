@@ -11,6 +11,10 @@
 #                otherwise the IP is created from the property list below.
 #   regen_ip   : ignore the tracked .xci, create the IP from the property list and
 #                overwrite fpga/ip/pcie_7x_0/pcie_7x_0.xci.
+#   board=<b>  : kc705 (default: XC7K325T-2, project fpga/build/nvme_host, IP fpga/ip/pcie_7x_0/) or
+#                ax7a200b (ALINX AX7A200B, XC7A200T-2FBG484I, project fpga/build/nvme_host_ax7a200b,
+#                IP fpga/ip/pcie_7x_0_a7/, top ax7a200b_top, constraints ax7a200b_*.xdc;
+#                see STAND/AX7A200B_ARCHITECTURE.md).  The IP keeps the module name pcie_7x_0.
 #   top=<name> : project top module.  Default kc705_top (board top, rtl/board/kc705_top.sv, all pins in
 #                kc705_board.xdc).  top=nvme_host_top builds the bare host (no pins for the user-side
 #                ports, only a bitstream with `loose_io`): only kc705_fmc_m2*.xdc are used plus a
@@ -32,24 +36,43 @@
 set script_dir [file dirname [file normalize [info script]]]
 set repo_root  [file normalize [file join $script_dir .. ..]]
 set build_dir  [file join $repo_root fpga build]
-set proj_name  nvme_host
-set proj_dir   [file join $build_dir $proj_name]
-set part       xc7k325tffg900-2
-set xci_repo   [file join $repo_root fpga ip pcie_7x_0 pcie_7x_0.xci]
 
 # vivado.bat splits 'key=value' into 'key value': merge them back
 set argv_m {}
 foreach a $argv {
-    if {[llength $argv_m] && [lindex $argv_m end] in {top jobs}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
+    if {[llength $argv_m] && [lindex $argv_m end] in {top jobs board}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
 }
 set argv $argv_m
 set regen_ip 0
-set top_name kc705_top
+set top_name {}
+set board    kc705
 if {[info exists argv]} {
     if {[lsearch -exact $argv regen_ip] >= 0} { set regen_ip 1 }
-    foreach a $argv { if {[string match top=* $a]} { set top_name [string range $a 4 end] } }
+    foreach a $argv {
+        if {[string match top=* $a]}   { set top_name [string range $a 4 end] }
+        if {[string match board=* $a]} { set board    [string range $a 6 end] }
+    }
 }
-if {$top_name ni {kc705_top nvme_host_top}} { error "top=$top_name : must be kc705_top or nvme_host_top" }
+switch -- $board {
+    kc705 {
+        set proj_name nvme_host
+        set part      xc7k325tffg900-2
+        set xci_repo  [file join $repo_root fpga ip pcie_7x_0 pcie_7x_0.xci]
+        set ip_dir    [file join $build_dir ip]
+        if {$top_name eq ""} { set top_name kc705_top }
+        if {$top_name ni {kc705_top nvme_host_top}} { error "top=$top_name : must be kc705_top or nvme_host_top" }
+    }
+    ax7a200b {
+        set proj_name nvme_host_ax7a200b
+        set part      xc7a200tfbg484-2
+        set xci_repo  [file join $repo_root fpga ip pcie_7x_0_a7 pcie_7x_0.xci]
+        set ip_dir    [file join $build_dir ip_a7]
+        if {$top_name eq ""} { set top_name ax7a200b_top }
+        if {$top_name ne "ax7a200b_top"} { error "board=ax7a200b supports only top=ax7a200b_top" }
+    }
+    default { error "board=$board : must be kc705 or ax7a200b" }
+}
+set proj_dir [file join $build_dir $proj_name]
 
 file mkdir $build_dir
 create_project -force $proj_name $proj_dir -part $part
@@ -98,9 +121,9 @@ if {!$regen_ip && [file exists $xci_repo]} {
     set ip [get_ips pcie_7x_0]
 } else {
     puts "INFO: creating pcie_7x_0 from the property list"
-    file mkdir [file join $build_dir ip]
+    file mkdir $ip_dir
     create_ip -name pcie_7x -vendor xilinx.com -library ip -version 3.3 -module_name pcie_7x_0 \
-              -dir [file join $build_dir ip]
+              -dir $ip_dir
     set ip [get_ips pcie_7x_0]
 
     # --- role / shared logic (clocking + GT_COMMON inside the core: no pipe_clk/qpll ports) ---
@@ -137,6 +160,36 @@ if {!$regen_ip && [file exists $xci_repo]} {
     if {$ip_cfg_errors > 0} { error "pcie_7x_0 configuration failed ($ip_cfg_errors problem(s)), see ERROR lines above" }
 }
 
+# ---------------------------------------------------------------------------
+# 2b. ax7a200b only: VIO for JTAG status / remote START-STOP (rtl/board/ax7a200b_top.sv, u_vio)
+# ---------------------------------------------------------------------------
+if {$board eq "ax7a200b"} {
+    set vio_xci [file join $repo_root fpga ip vio_status_a7 vio_status.xci]
+    if {!$regen_ip && [file exists $vio_xci]} {
+        import_ip $vio_xci
+    } else {
+        create_ip -name vio -vendor xilinx.com -library ip -module_name vio_status -dir $ip_dir
+        set_property -dict [list CONFIG.C_NUM_PROBE_IN 17 CONFIG.C_NUM_PROBE_OUT 7             CONFIG.C_PROBE_IN0_WIDTH 8  CONFIG.C_PROBE_IN1_WIDTH 16  CONFIG.C_PROBE_IN2_WIDTH 8             CONFIG.C_PROBE_IN3_WIDTH 2  CONFIG.C_PROBE_IN4_WIDTH 7  CONFIG.C_PROBE_IN5_WIDTH 6             CONFIG.C_PROBE_IN6_WIDTH 64 CONFIG.C_PROBE_IN7_WIDTH 64 CONFIG.C_PROBE_IN8_WIDTH 32             CONFIG.C_PROBE_IN9_WIDTH 32 CONFIG.C_PROBE_IN10_WIDTH 40 CONFIG.C_PROBE_IN11_WIDTH 40 CONFIG.C_PROBE_IN12_WIDTH 64 CONFIG.C_PROBE_IN13_WIDTH 32 CONFIG.C_PROBE_IN14_WIDTH 64 CONFIG.C_PROBE_IN15_WIDTH 64 CONFIG.C_PROBE_IN16_WIDTH 2             CONFIG.C_PROBE_OUT0_WIDTH 1 CONFIG.C_PROBE_OUT1_WIDTH 1 CONFIG.C_PROBE_OUT2_WIDTH 1 CONFIG.C_PROBE_OUT3_WIDTH 1 CONFIG.C_PROBE_OUT4_WIDTH 2 CONFIG.C_PROBE_OUT5_WIDTH 2 CONFIG.C_PROBE_OUT6_WIDTH 1] [get_ips vio_status]
+        file mkdir [file dirname $vio_xci]
+        file copy -force [get_property IP_FILE [get_ips vio_status]] $vio_xci
+    }
+    generate_target all [get_ips vio_status]
+    catch { create_ip_run [get_ips vio_status] }
+
+    # ILA on user_clk (u_ila): 304-bit debug bus of nvme_host_top, 4096 samples
+    set ila_xci [file join $repo_root fpga ip ila_pcie_a7 ila_pcie.xci]
+    if {!$regen_ip && [file exists $ila_xci]} {
+        import_ip $ila_xci
+    } else {
+        create_ip -name ila -vendor xilinx.com -library ip -module_name ila_pcie -dir $ip_dir
+        set_property -dict [list CONFIG.C_NUM_OF_PROBES 1 CONFIG.C_PROBE0_WIDTH 304 CONFIG.C_DATA_DEPTH 4096 CONFIG.C_TRIGIN_EN false CONFIG.C_ADV_TRIGGER false] [get_ips ila_pcie]
+        file mkdir [file dirname $ila_xci]
+        file copy -force [get_property IP_FILE [get_ips ila_pcie]] $ila_xci
+    }
+    generate_target all [get_ips ila_pcie]
+    catch { create_ip_run [get_ips ila_pcie] }
+}
+
 # generate everything (synthesis sources, instantiation template, simulation, constraints) and
 # make the IP synthesise out-of-context in its own run
 generate_target all $ip
@@ -152,7 +205,11 @@ if {$regen_ip || ![file exists $xci_repo]} {
 # ---------------------------------------------------------------------------
 # 3. Constraints and top
 # ---------------------------------------------------------------------------
-if {$top_name eq "kc705_top"} {
+if {$board eq "ax7a200b"} {
+    add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints ax7a200b_board.xdc]
+    add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints ax7a200b_cdc.xdc]
+    set_property USED_IN {implementation} [get_files ax7a200b_cdc.xdc]
+} elseif {$top_name eq "kc705_top"} {
     add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints kc705_board.xdc]
 } else {
     # bare nvme_host_top: the clocks that kc705_board.xdc / kc705_top provide, plus the SYSCLK pins
@@ -169,10 +226,12 @@ if {$top_name eq "kc705_top"} {
     close $xf
     add_files -fileset constrs_1 -norecurse [file join $build_dir nvme_host_top_extra.xdc]
 }
-add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints kc705_fmc_m2.xdc]
-add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints kc705_fmc_m2_cdc.xdc]
-# CDC clock groups refer to the IP's clocks, which do not exist while synth_design treats the IP as a black box
-set_property USED_IN {implementation} [get_files kc705_fmc_m2_cdc.xdc]
+if {$board eq "kc705"} {
+    add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints kc705_fmc_m2.xdc]
+    add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints kc705_fmc_m2_cdc.xdc]
+    # CDC clock groups refer to the IP's clocks, which do not exist while synth_design treats the IP as a black box
+    set_property USED_IN {implementation} [get_files kc705_fmc_m2_cdc.xdc]
+}
 if {$top_name eq "nvme_host_top"} {
     # data_clk is a separate clock only here (kc705_top runs the stream on user_clk)
     set xf [open [file join $build_dir nvme_host_top_extra_impl.xdc] w]

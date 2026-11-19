@@ -27,10 +27,16 @@
 //    Invalid Opcode.
 //  I/O engine (QID 1): fetches up to `sq_fetch_max` SQEs per MRd, runs up to
 //    `concurrent_cmds` commands concurrently (their data fetches interleave),
-//    Write (opc 01h) with PRP1/PRP2/PRP list (incl. list chaining), Flush (00h).
+//    Write (opc 01h) and Read (opc 02h) with PRP1/PRP2/PRP list (incl. list chaining),
+//    Flush (00h).
 //    Data is fetched with MRds of random size in [mrd_size_min, MRRS] (DW aligned,
 //    never crossing 4 KiB) with up to `max_outstanding` tags in flight; the data
 //    lands in `lba_mem` (associative array of 512-byte blocks indexed by LBA).
+//    Read: the PRPs are resolved exactly like for a Write (PRP list fetched with MRds), then
+//    the blocks of `lba_mem` are sent to host memory as MWr TLPs (payload <= MPS, never
+//    crossing a 4 KiB boundary, DW aligned, 32- or 64-bit address format as the PRP needs),
+//    and the CQE is posted AFTER all data MWrs (posted-write ordering: a reaped CQE means
+//    the data has reached the host).  LBAs that were never written read as zeros.
 //  CQE posting with phase tag (P=1 on the first pass, flips on wrap), SQHD, CQ-full
 //    back-pressure (waits for the head doorbell), optional split (two 8-byte MWr,
 //    P in the second) and coalescing (two CQEs in one 32-byte MWr).
@@ -59,6 +65,8 @@
 //   exp_cpl_id           expected Completer ID in CplDs from the Root Port           [16'h0000]
 //   cpl_timeout_cycles   MRd completion timeout                                      [100000]
 //   allow_overwrite      0 = writing an LBA twice is an $error                       [0]
+//   corrupt_read_at_byte namespace byte address (longint, LBA*512 + offset) whose bit 0   [-1 = off]
+//                        is flipped in the data of a Read that covers it (negative tests)
 //   verbose              1 = print every TLP / command                               [0]
 //
 // Checks ($error, counted in err_count)
@@ -93,7 +101,7 @@
 //                                     (byte array, ref_mem[0] = first byte of start_lba);
 //                                     returns the number of mismatching bytes
 //   ev_log[$] / ev_find(...)          ordered log of config / MMIO / admin / I/O events
-//   n_io_writes, n_flush, n_cqe, data_cpl_first/last_*    statistics
+//   n_io_writes, n_io_reads, n_flush, n_cqe, data_cpl_first/last_*    statistics
 // =============================================================================
 `timescale 1ns/1ps
 
@@ -131,6 +139,7 @@ module nvme_ssd_model
   logic [15:0] exp_cpl_id           = 16'h0000;
   int          cpl_timeout_cycles   = 100000;
   bit          allow_overwrite      = 0;
+  longint      corrupt_read_at_byte = -1;
   bit          verbose              = 0;
 
   // Identify data constants
@@ -144,6 +153,7 @@ module nvme_ssd_model
   int     err_count    = 0;
   longint cyc          = 0;
   int     n_io_writes  = 0;
+  int     n_io_reads   = 0;
   int     n_flush      = 0;
   int     n_cqe        = 0;
   int     n_mrd        = 0;
@@ -1165,6 +1175,63 @@ module nvme_ssd_model
     end
   endtask
 
+  task automatic do_read(input logic [31:0] s[16], output logic [14:0] st);
+    longint unsigned slba;
+    int unsigned     nlb, nbytes, npages, pos, seg;
+    logic [63:0]     prp1, prp2, a;
+    logic [63:0]     pages[$];
+    logic [63:0]     list[$];
+    bit              bad;
+    byte unsigned    d[$];
+    st     = 0;
+    slba   = {s[11], s[10]};
+    nlb    = s[12][15:0] + 1;
+    nbytes = nlb * 512;
+    prp1   = {s[7], s[6]};
+    prp2   = {s[9], s[8]};
+    if (s[1] != 1)                          begin st = mk_status(0, 8'h0B); return; end   // Invalid Namespace
+    if (slba + nlb > NSZE)                  begin st = mk_status(0, 8'h80); return; end   // LBA Out of Range
+    if (nbytes > (4096 << MDTS))            begin st = mk_status(0, 8'h02); return; end   // > MDTS
+    if (prp1[1:0] != 0)                     begin st = mk_status(0, 8'h13); return; end   // PRP Offset Invalid
+    npages = ((prp1 & 64'hFFF) + nbytes + 4095) / 4096;
+    pages.push_back(prp1);
+    if (npages == 2) begin
+      if (prp2[11:0] != 0) begin st = mk_status(0, 8'h13); return; end
+      pages.push_back(prp2);
+    end else if (npages > 2) begin
+      if (prp2[2:0] != 0) begin st = mk_status(0, 8'h13); return; end
+      fetch_prp_list(prp2, npages - 1, list, bad);
+      if (bad) begin st = mk_status(0, 8'h13); return; end
+      foreach (list[i]) begin
+        if (list[i][11:0] != 0) begin st = mk_status(0, 8'h13); return; end
+        pages.push_back(list[i]);
+      end
+    end
+    // ---- gather the data from the media ----
+    for (int unsigned b = 0; b < nlb; b++)
+      for (int i = 0; i < 512; i++) begin
+        byte unsigned v;
+        v = lba_mem.exists(slba + b) ? lba_mem[slba + b][i] : 8'h00;
+        if (corrupt_read_at_byte >= 0 && longint'((slba + b) * 512 + i) == corrupt_read_at_byte) begin
+          v = v ^ 8'h01;
+          $display("[nvme_ssd_model @%0t] corrupting namespace byte %0d on Read (LBA %0d)", $time, corrupt_read_at_byte, slba + b);
+        end
+        d.push_back(v);
+      end
+    // ---- send it, page by page (dma_write splits at MPS / 4 KiB) ----
+    pos = 0;
+    foreach (pages[i]) begin
+      byte unsigned piece[$];
+      a   = pages[i];
+      seg = 4096 - (a & 64'hFFF);
+      if (seg > nbytes - pos) seg = nbytes - pos;
+      for (int j = 0; j < seg; j++) piece.push_back(d[pos + j]);
+      dma_write(a, piece);
+      pos += seg;
+    end
+    n_io_reads++;
+  endtask
+
   task automatic run_io_cmd(input logic [31:0] s[16]);
     logic [7:0]  opc;
     logic [15:0] cid;
@@ -1176,6 +1243,10 @@ module nvme_ssd_model
     else case (opc)
       8'h01: begin
         do_write(s, st);
+        log_ev(EV_IO, opc, {s[10], s[12][15:0], cid});
+      end
+      8'h02: begin
+        do_read(s, st);
         log_ev(EV_IO, opc, {s[10], s[12][15:0], cid});
       end
       8'h00: begin

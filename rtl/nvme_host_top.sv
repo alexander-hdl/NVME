@@ -19,6 +19,13 @@
 // (KC705 SYSCLK = 200 MHz).  It cannot come from IBUFDS_GTE2.ODIV2: the pcie_7x IP already
 // feeds a BUFG from IBUFDS_GTE2.O and ODIV2 shares that output path (route_design fails with
 // "Route 35-54 IBUFDS_GTE2.O->BUFGCTRL.I0 unroutable" when both are used).
+// Verify mode.  verify_mode / verify_cmds (board logic, quasi-static, set before ctrl_start) are 2-FF
+// synchronised into user_clk (verify_cmds per bit: it must not change while the run is active).  With
+// verify_mode=1 the host reads the first verify_cmds * SLOT_BYTES bytes from START_LBA back with NVMe
+// Reads and compares them with the test pattern in the FPGA (verify_checker); the user data stream stays
+// off.  When cmd_limit_done goes high all commands are complete: raise ctrl_stop (the DRAIN/FLUSH/SHUTDOWN
+// follows) and read vfy_* afterwards.  vfy_* / cmd_limit_done are user_clk domain (board logic must
+// synchronise them; they are static once status_done is set).  ARCHITECTURE.md 5.19.
 // SIM_FAST shortens all "millisecond" timers (microsecond ticks).
 //
 // Sticky link flags.  link_bringup's link_lost / link_fail go straight to the core inputs of the
@@ -60,6 +67,8 @@ module nvme_host_top
   // ---- control / status ----
   input  logic         ctrl_start,
   input  logic         ctrl_stop,
+  input  logic         verify_mode,           // 1: read back + compare (verify run); async / quasi-static, set before ctrl_start
+  input  logic [31:0]  verify_cmds,           // verify run: number of Read commands (SLOT_BYTES each, from START_LBA); 0 = unlimited; quasi-static
   output logic         status_link_up,
   output logic         status_gen2,
   output logic         status_enum_done,
@@ -76,11 +85,21 @@ module nvme_host_top
   output logic [31:0]  stat_max_latency,
   output logic [7:0]   status_flags,          // see nvme_host_core.sv: [0] shutdown_timeout .. [7] rx_drop
   output logic [63:0]  stat_first_error_lba,  // SLBA of the first failed Write (status_flags[6])
+  // verify results (user_clk domain, valid once the run is stopped; cleared at the start of every run)
+  output logic         cmd_limit_done,        // user_clk: verify_cmds commands submitted and completed -> raise ctrl_stop
+  output logic [63:0]  vfy_bytes,             // user_clk: bytes compared
+  output logic [31:0]  vfy_err_beats,         // user_clk: 16-byte beats with a mismatch
+  output logic [63:0]  vfy_first_err_lba,     // user_clk: LBA containing the first mismatching beat
+  output logic [31:0]  vfy_first_err_exp,     // user_clk: expected DW of the first mismatching DW of that beat
+  output logic [31:0]  vfy_first_err_got,     // user_clk: received DW
   output logic [1:0]   link_retries,          // link_clk domain: PERST# re-runs caused by link-up timeouts
   output logic         link_lost,             // link_clk domain, sticky (same signal that feeds the core)
   output logic         link_fail,             // link_clk domain, sticky; valid while user_clk is dead
   output logic         link_clk_out,          // free-running 200 MHz link_clk (BUFG output)
-  output logic         user_clk_out
+  output logic         user_clk_out,
+  output logic [5:0]   dbg_ltssm_state,       // debug: pl_ltssm_state of the core (pipe clock domain, raw)
+  // debug bus, user_clk domain (for an ILA): see the assignment below for the bit map
+  output logic [303:0] dbg_uc
 );
 
   // ===========================================================================
@@ -148,6 +167,19 @@ module nvme_host_top
   assign link_fail = link_fail_lc;
 
   assign link_clk_out = link_clk;
+  assign dbg_ltssm_state = pl_ltssm_state;
+
+  // ---- debug bus (user_clk) ----------------------------------------------------------------------------
+  //  [3:0] host_sequencer state  [4] user_reset  [5] user_lnk_up
+  //  [6] tx_tvalid [7] tx_tready [8] tx_tlast  [9] rx_tvalid [10] rx_tready [11] rx_tlast  [17:12] tx_buf_av
+  //  [18] cfg_mgmt_rd_en [19] cfg_mgmt_wr_en [20] cfg_mgmt_rd_wr_done [21] rx_np_ok [23:22] 0
+  //  [151:24] s_axis_tx_tdata  [279:152] m_axis_rx_tdata  [301:280] m_axis_rx_tuser  [303:302] 0
+  logic [3:0] dbg_seq_state;
+  assign dbg_uc = {2'b00, m_axis_rx_tuser, m_axis_rx_tdata, s_axis_tx_tdata, 2'b00, rx_np_ok,
+                   cfg_mgmt_rd_wr_done, cfg_mgmt_wr_en, cfg_mgmt_rd_en, tx_buf_av,
+                   m_axis_rx_tlast, m_axis_rx_tready, m_axis_rx_tvalid,
+                   s_axis_tx_tlast, s_axis_tx_tready, s_axis_tx_tvalid,
+                   user_lnk_up, user_reset, dbg_seq_state};
 
   link_bringup #(
     .CLK_HZ(LINK_CLK_HZ), .SIM_FAST(SIM_FAST)
@@ -167,6 +199,8 @@ module nvme_host_top
   // ===========================================================================
   (* ASYNC_REG = "TRUE" *) logic [1:0] link_ready_sync, link_gen2_sync, ctrl_start_sync, ctrl_stop_sync;
   (* ASYNC_REG = "TRUE" *) logic [1:0] link_width_sync0, link_width_sync1;   // per-bit 2-FF (quasi-static)
+  (* ASYNC_REG = "TRUE" *) logic [1:0] verify_mode_sync;
+  (* ASYNC_REG = "TRUE" *) logic [31:0] verify_cmds_sync0, verify_cmds_sync1; // per-bit 2-FF (quasi-static)
   always_ff @(posedge user_clk) begin
     link_ready_sync    <= {link_ready_sync[0],  link_ready_lc};
     link_gen2_sync     <= {link_gen2_sync[0],   link_gen2_lc};
@@ -174,6 +208,9 @@ module nvme_host_top
     link_width_sync1   <= link_width_sync0;
     ctrl_start_sync    <= {ctrl_start_sync[0],  ctrl_start};
     ctrl_stop_sync     <= {ctrl_stop_sync[0],   ctrl_stop};
+    verify_mode_sync   <= {verify_mode_sync[0], verify_mode};
+    verify_cmds_sync0  <= verify_cmds;
+    verify_cmds_sync1  <= verify_cmds_sync0;
   end
 
   logic       link_ready_uc, link_gen2_uc, ctrl_start_uc, ctrl_stop_uc;
@@ -216,16 +253,20 @@ module nvme_host_top
     .data_clk(data_clk), .data_rst(data_rst_sync[1]),
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
     .ctrl_start(ctrl_start_uc), .ctrl_stop(ctrl_stop_uc),
+    .verify_mode(verify_mode_sync[1]), .verify_cmds(verify_cmds_sync1),
     .status_link_up(status_link_up), .status_gen2(status_gen2), .status_link_width(status_link_width),
     .status_enum_done(status_enum_done), .status_nvme_ready(status_nvme_ready),
     .status_running(status_running), .status_done(status_done),
     .status_error(status_error), .status_error_detail(status_error_detail),
-    .status_seq_state(), .status_lba_range_err(status_lba_range_err), .status_shutdown_timeout(),
+    .status_seq_state(dbg_seq_state), .status_lba_range_err(status_lba_range_err), .status_shutdown_timeout(),
     .status_flags(status_flags),
     .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
     .stat_max_latency(stat_max_latency), .stat_last_status(), .stat_next_lba(), .stat_beats_in(),
     .stat_stall_cycles(), .stat_sq_full_stall_cycles(), .stat_unexpected_cpl(),
     .stat_lbads(), .stat_nsze(), .stat_mdts(),
-    .stat_first_error_lba(stat_first_error_lba));
+    .stat_first_error_lba(stat_first_error_lba),
+    .cmd_limit_done(cmd_limit_done), .vfy_bytes(vfy_bytes), .vfy_err_beats(vfy_err_beats),
+    .vfy_first_err_lba(vfy_first_err_lba), .vfy_first_err_exp(vfy_first_err_exp),
+    .vfy_first_err_got(vfy_first_err_got));
 
 endmodule

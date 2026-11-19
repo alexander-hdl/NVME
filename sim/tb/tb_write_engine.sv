@@ -8,7 +8,7 @@
 // posts CQEs out of order with random latencies (CQE written as a 16-byte
 // beat, lower half first, phase/CID half last).
 //
-// Four harness instances run in parallel:
+// Seven harness instances run in parallel:
 //   H0 (SCEN 0) 4 slots x 128 KiB, 600 commands (CQ/SQ wrap > 9 times), random out-of-order
 //               completion, injected error CQEs, enable gating, flush while busy and at
 //               the end, stats (bytes/cmds/errors/last_status/max latency).
@@ -22,6 +22,15 @@
 //               submitted, the slot is NOT freed, a Flush request is answered at once with
 //               flush_done + flush_skipped and no Flush SQE; `restart` then returns the engine
 //               to its initial state (flags cleared, next_lba reloaded, queue pointers 0).
+//   H5 (SCEN 5) read mode (verify run): 4 slots x 16 KiB, the ring stays EMPTY (slot_full never set)
+//               and max_cmds = 37: every data SQE must be an NVMe Read (opcode 02h, otherwise
+//               identical), submitted without slot_full, exactly 37 commands, then cmd_limit_done
+//               (and only then), no further submission although enable stays high; slot_lba_flat
+//               holds the SLBA of the last command of every slot; a restart clears cmd_limit_done
+//               and the submission counter.
+//   H6 (SCEN 6) write mode with max_cmds = 30: the ring offers 60 slots, only 30 Writes are submitted,
+//               the rest stays full; cmd_limit_done after the 30th completion.
+// slot_lba_flat is also checked in every harness against the SLBA of each fetched SQE.
 // First-error reporting (M6): every harness compares io_error / first_error_lba with the first
 // failed Write seen by the SSD model (H0 injects errors).
 // =============================================================================
@@ -41,7 +50,9 @@ module we_harness
   parameter logic [63:0] START_LBA = 64'h0,
   parameter logic [63:0] NSZE      = 64'h0000_0000_7470_0000,
   parameter int IO_TMO_MS  = 0,                          // engine I/O timeout in tick_ms units (0 = off)
-  parameter int DROP_NTH   = -1                          // the SSD model never completes data command #n
+  parameter int DROP_NTH   = -1,                         // the SSD model never completes data command #n
+  parameter int READ_MODE  = 0,                          // read_mode input (Reads, slot_full ignored)
+  parameter int MAX_CMDS   = 0                           // max_cmds input (0 = unlimited)
 ) (
   input  logic clk,
   output logic done,
@@ -60,6 +71,11 @@ module we_harness
   logic [3:0]  dstrd_s = 4'd0;
   logic [N_SLOTS-1:0] slot_full = '0;
   logic [N_SLOTS-1:0] slot_free;
+  logic [N_SLOTS*64-1:0] slot_lba_flat;
+  logic        read_mode_s = (READ_MODE != 0);
+  logic [31:0] max_cmds_s  = 32'(MAX_CMDS);
+  logic        cmd_limit_done;
+  localparam int EXP_CMDS = (MAX_CMDS != 0) ? MAX_CMDS : (SCEN == 2) ? 3 : N_CMDS;
   logic         iosq_wr_en;
   logic [7:0]   iosq_wr_addr;
   logic [127:0] iosq_wr_data;
@@ -89,8 +105,8 @@ module we_harness
 
   nvme_write_engine #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .IO_TIMEOUT_MS(IO_TMO_MS)) dut (
     .clk(clk), .rst(rst), .tick_ms(tick_ms), .restart(restart),
-    .enable(enable), .start_lba(start_lba), .lbads(lbads_s), .nsze(nsze_s), .dstrd(dstrd_s),
-    .slot_full(slot_full), .slot_free(slot_free),
+    .enable(enable), .read_mode(read_mode_s), .max_cmds(max_cmds_s), .start_lba(start_lba), .lbads(lbads_s), .nsze(nsze_s), .dstrd(dstrd_s),
+    .slot_full(slot_full), .slot_free(slot_free), .slot_lba_flat(slot_lba_flat), .cmd_limit_done(cmd_limit_done),
     .iosq_wr_en(iosq_wr_en), .iosq_wr_addr(iosq_wr_addr), .iosq_wr_data(iosq_wr_data),
     .iocq_rd_en(iocq_rd_en), .iocq_rd_addr(iocq_rd_addr), .iocq_rd_data(iocq_rd_data),
     .req_valid(req_valid), .req_ready(req_ready), .req_op(req_op), .req_addr(req_addr),
@@ -138,7 +154,7 @@ module we_harness
   int          fill_limit;
   logic [N_SLOTS-1:0] free_d1 = '0, free_d2 = '0;
   int          free_pulses = 0;
-  initial fill_limit = (SCEN == 2) ? 6 : N_CMDS;
+  initial fill_limit = (SCEN == 2) ? 6 : (SCEN == 5) ? 0 : (SCEN == 6) ? 60 : N_CMDS;
 
   always_ff @(posedge clk) begin
     free_d1 <= slot_free;
@@ -210,7 +226,7 @@ module we_harness
     lba = START_LBA + 64'(j) * 64'(LBA_PER_SLOT);
     data_addr = DATA_BASE + 32'(k) * 32'(SLOT_BYTES);
     s = '0;
-    s[31:0]     = {16'(k), 8'h00, 8'h01};
+    s[31:0]     = {16'(k), 8'h00, (READ_MODE != 0) ? 8'h02 : 8'h01};
     s[63:32]    = 32'h1;
     s[32*6+:32] = data_addr;
     if (SLOT_BYTES > 8192)       s[32*8+:32] = PRP_BASE + 32'(k) * 32'h1000;
@@ -287,7 +303,9 @@ module we_harness
                 check(!slot_inflight[kk], $sformatf("slot %0d resubmitted before its CQE", kk));
                 slot_inflight[kk] = 1;
                 db_cycle[kk] = cyc;
-                check(slot_full[kk], $sformatf("slot %0d submitted while not full", kk));
+                if (READ_MODE == 0) check(slot_full[kk], $sformatf("slot %0d submitted while not full", kk));
+                check(slot_lba_flat[64*kk +: 64] == {got[32*11 +: 32], got[32*10 +: 32]},
+                      $sformatf("slot_lba_flat[%0d] = %h, SQE SLBA %h", kk, slot_lba_flat[64*kk +: 64], {got[32*11 +: 32], got[32*10 +: 32]}));
                 if (DROP_NTH >= 0 && n_sqe == DROP_NTH) begin
                   // the SSD "loses" this command: no CQE, ever
                 end else begin
@@ -383,6 +401,9 @@ module we_harness
       for (int k = 0; k < N_SLOTS; k++)
         if (slot_free[k] && slot_inflight[k]) fail_msg("slot_free pulse before the CQE was posted");
       check(!doorbell_err, "doorbell_err raised");
+      if (MAX_CMDS == 0) check(!cmd_limit_done, "cmd_limit_done without a command limit");
+      else if (cmd_limit_done && (n_ok + n_err < MAX_CMDS || n_sqe != MAX_CMDS))
+        fail_msg($sformatf("cmd_limit_done too early (ok %0d err %0d sqe %0d)", n_ok, n_err, n_sqe));
     end
   end
 
@@ -480,6 +501,15 @@ module we_harness
         done = 1'b1;
         wait (1'b0);
       end
+      5, 6: begin   // read mode / write mode with a command limit
+        t = 0; while (!cmd_limit_done && t < 1000000) begin @(posedge clk); t++; end
+        check(cmd_limit_done, "H5/6: cmd_limit_done never came");
+        check(n_ok + n_err == MAX_CMDS, $sformatf("H5/6: %0d completions at cmd_limit_done, expected %0d", n_ok + n_err, MAX_CMDS));
+        snap = n_sqe;
+        wait_cycles(1500);
+        check(n_sqe == snap && n_sqe == MAX_CMDS, "H5/6: a command was submitted beyond max_cmds");
+        check(cmd_limit_done, "H5/6: cmd_limit_done dropped");
+      end
       default: ;
     endcase
 
@@ -493,7 +523,7 @@ module we_harness
     wait_cycles(400);
 
     // ---- final checks ----
-    total_expected = (SCEN == 2) ? 3 : N_CMDS;
+    total_expected = EXP_CMDS;
     check(n_sqe == total_expected, $sformatf("commands fetched %0d expected %0d", n_sqe, total_expected));
     check(n_ok + n_err == total_expected, $sformatf("completions %0d expected %0d", n_ok + n_err, total_expected));
     check(cmds_done == 64'(n_ok), $sformatf("cmds_done %0d expected %0d", cmds_done, n_ok));
@@ -516,6 +546,24 @@ module we_harness
     if (SCEN == 0) check(n_flush_sqe == 2, $sformatf("H0: flush SQEs %0d expected 2", n_flush_sqe));
     else           check(n_flush_sqe == 1, $sformatf("flush SQEs %0d expected 1", n_flush_sqe));
     if (SCEN == 0) check(n_err > 0, "H0: no error CQE injected");
+    // slot_lba_flat: SLBA of the last command of every slot
+    for (int k = 0; k < N_SLOTS; k++) begin
+      int jl;
+      jl = -1;
+      for (int j = 0; j < total_expected; j++) if (j % N_SLOTS == k) jl = j;
+      if (jl >= 0)
+        check(slot_lba_flat[64*k +: 64] == START_LBA + 64'(jl) * 64'(LBA_PER_SLOT),
+              $sformatf("final slot_lba_flat[%0d] = %h", k, slot_lba_flat[64*k +: 64]));
+    end
+    if (MAX_CMDS != 0) begin
+      check(cmd_limit_done, "cmd_limit_done not set at the end");
+      enable = 1'b0;
+      wait_cycles(5);
+      restart = 1'b1; wait_cycles(1); restart = 1'b0;
+      wait_cycles(4);
+      check(!cmd_limit_done, "cmd_limit_done not cleared by restart");
+      check(slot_lba_flat == '0, "slot_lba_flat not cleared by restart");
+    end
     $display("H%0d: commands=%0d ok=%0d err=%0d sq_db=%0d cq_db=%0d (%0.2f CQEs per CQ doorbell) max_lat=%0d (tb>=%0d) stall_cycles=%0d max_outstanding=%0d",
              SCEN, n_sqe, n_ok, n_err, sq_db_count, cq_db_count, (cq_db_count != 0) ? (real'(cq_posted_total) / real'(cq_db_count)) : 0.0,
              max_latency_cycles, tb_max_lat_lo, sq_full_stall_cycles, max_inflight);
@@ -527,8 +575,8 @@ module tb_write_engine;
   logic clk = 1'b0;
   always #4 clk = ~clk;
 
-  logic [4:0] done;
-  int e0, e1, e2, e3, e4;
+  logic [6:0] done;
+  int e0, e1, e2, e3, e4, e5, e6;
 
   we_harness #(.SCEN(0), .N_SLOTS(4),  .SLOT_BYTES(131072), .LBADS(9),  .N_CMDS(600),
                .LAT_MIN(20),  .LAT_MAX(150), .ERR_EVERY(17)) h0 (.clk(clk), .done(done[0]), .errors(e0));
@@ -546,11 +594,18 @@ module tb_write_engine;
                .LAT_MIN(10),  .LAT_MAX(30), .ERR_EVERY(0), .IO_TMO_MS(3), .DROP_NTH(5))
                h4 (.clk(clk), .done(done[4]), .errors(e4));
 
+  we_harness #(.SCEN(5), .N_SLOTS(4),  .SLOT_BYTES(16384), .LBADS(9),  .N_CMDS(37),
+               .LAT_MIN(10),  .LAT_MAX(120), .ERR_EVERY(0), .READ_MODE(1), .MAX_CMDS(37),
+               .START_LBA(64'h0000_0000_0000_1000)) h5 (.clk(clk), .done(done[5]), .errors(e5));
+
+  we_harness #(.SCEN(6), .N_SLOTS(4),  .SLOT_BYTES(16384), .LBADS(9),  .N_CMDS(60),
+               .LAT_MIN(10),  .LAT_MAX(120), .ERR_EVERY(0), .MAX_CMDS(30)) h6 (.clk(clk), .done(done[6]), .errors(e6));
+
   initial begin
     wait (&done);
     repeat (10) @(posedge clk);
-    if (e0 + e1 + e2 + e3 + e4 == 0) $display("TEST PASSED");
-    else $fatal(1, "TEST FAILED: %0d errors", e0 + e1 + e2 + e3 + e4);
+    if (e0 + e1 + e2 + e3 + e4 + e5 + e6 == 0) $display("TEST PASSED");
+    else $fatal(1, "TEST FAILED: %0d errors", e0 + e1 + e2 + e3 + e4 + e5 + e6);
     $finish;
   end
   initial begin

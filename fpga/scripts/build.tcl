@@ -8,6 +8,10 @@
 #                              reports in fpga/build/reports/
 #           impl             : synth + impl_1 up to route_design (post-route reports)
 #           bit              : synth + impl + write_bitstream (fpga/build/nvme_host_top.bit)
+#   board=kc705|ax7a200b : target board (default kc705); ax7a200b -> project nvme_host_ax7a200b,
+#                          reports in fpga/build/reports_ax7a200b/
+#   strategy=<name>   : implementation strategy of impl_1 (e.g. Performance_ExplorePostRoutePhysOpt); default: the run's current one
+#   impl_only         : skip synthesis (re-use synth_1), only implementation / bitstream
 #   jobs=N  parallel runs (default 4)
 #   recreate  : always re-run create_project.tcl (default: re-use fpga/build/nvme_host/nvme_host.xpr)
 #   top=<name>: kc705_top (default, board top, all pins assigned: a bitstream needs no loose_io) or
@@ -26,13 +30,12 @@
 set script_dir [file dirname [file normalize [info script]]]
 set repo_root  [file normalize [file join $script_dir .. ..]]
 set build_dir  [file join $repo_root fpga build]
-set xpr        [file join $build_dir nvme_host nvme_host.xpr]
 set rpt_dir    [file join $build_dir reports]
 
 # vivado.bat splits 'key=value' into 'key value': merge them back
 set argv_m {}
 foreach a $argv {
-    if {[llength $argv_m] && [lindex $argv_m end] in {top jobs}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
+    if {[llength $argv_m] && [lindex $argv_m end] in {top jobs board strategy}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
 }
 set argv $argv_m
 
@@ -40,7 +43,10 @@ set stage    synth
 set jobs     4
 set recreate 0
 set loose_io 0
-set top_name kc705_top
+set strategy {}
+set impl_only 0
+set top_name {}
+set board    kc705
 foreach a $argv {
     switch -glob -- $a {
         synth - impl - bit { set stage $a }
@@ -48,9 +54,20 @@ foreach a $argv {
         recreate           { set recreate 1 }
         loose_io           { set loose_io 1 }
         top=*              { set top_name [string range $a 4 end] }
+        board=*            { set board    [string range $a 6 end] }
+        strategy=*         { set strategy [string range $a 9 end] }
+        impl_only          { set impl_only 1 }
         default            { puts "WARNING: ignoring unknown argument '$a'" }
     }
 }
+switch -- $board {
+    kc705    { set proj_name nvme_host;          if {$top_name eq ""} { set top_name kc705_top } }
+    ax7a200b { set proj_name nvme_host_ax7a200b; if {$top_name eq ""} { set top_name ax7a200b_top } }
+    default  { error "board=$board : must be kc705 or ax7a200b" }
+}
+set xpr [file join $build_dir $proj_name ${proj_name}.xpr]
+# per-board report directory (kc705 keeps fpga/build/reports)
+if {$board ne "kc705"} { set rpt_dir [file join $build_dir reports_$board] }
 file mkdir $rpt_dir
 
 if {$recreate || ![file exists $xpr]} {
@@ -67,7 +84,7 @@ if {$recreate || ![file exists $xpr]} {
 proc check_run {run} {
     set st [get_property STATUS [get_runs $run]]
     puts "INFO: run $run status: $st"
-    if {![string match "*Complete*" $st] || [string match "*ERROR*" $st]} {
+    if {(![string match "*Complete*" $st] && ![string match "*cached IP results*" $st]) || [string match "*ERROR*" $st]} {
         error "run $run did not complete successfully ($st)"
     }
 }
@@ -75,33 +92,37 @@ proc check_run {run} {
 # ---------------------------------------------------------------------------
 # synthesis (IP out-of-context run first, then the top)
 # ---------------------------------------------------------------------------
-reset_run synth_1
-set ip_runs [get_runs -quiet *pcie_7x_0*synth*]
-if {[llength $ip_runs]} {
-    reset_run [lindex $ip_runs 0]
-    launch_runs $ip_runs -jobs $jobs
-    foreach r $ip_runs { wait_on_run $r; check_run $r }
-}
-launch_runs synth_1 -jobs $jobs
-wait_on_run synth_1
-check_run synth_1
+if {!$impl_only} {
+    reset_run synth_1
+    # every out-of-context IP run (pcie_7x_0, and vio_status for board=ax7a200b)
+    set ip_runs [get_runs -quiet -filter {IS_SYNTHESIS && NAME != "synth_1"}]
+    if {[llength $ip_runs]} {
+        foreach r $ip_runs { reset_run $r }
+        launch_runs $ip_runs -jobs $jobs
+        foreach r $ip_runs { wait_on_run $r; check_run $r }
+    }
+    launch_runs synth_1 -jobs $jobs
+    wait_on_run synth_1
+    check_run synth_1
 
-open_run synth_1 -name synth_1
-report_utilization    -file [file join $rpt_dir synth_utilization.rpt]
-report_utilization -hierarchical -file [file join $rpt_dir synth_utilization_hier.rpt]
-report_timing_summary -delay_type min_max -max_paths 10 -file [file join $rpt_dir synth_timing_summary.rpt]
-report_clock_networks -file [file join $rpt_dir synth_clock_networks.rpt]
-report_methodology    -file [file join $rpt_dir synth_methodology.rpt]
-write_checkpoint -force [file join $build_dir ${top_name}_synth.dcp]
-puts "INFO: synthesis finished, reports in $rpt_dir"
-if {$stage eq "synth"} { exit 0 }
+    open_run synth_1 -name synth_1
+    report_utilization    -file [file join $rpt_dir synth_utilization.rpt]
+    report_utilization -hierarchical -file [file join $rpt_dir synth_utilization_hier.rpt]
+    report_timing_summary -delay_type min_max -max_paths 10 -file [file join $rpt_dir synth_timing_summary.rpt]
+    report_clock_networks -file [file join $rpt_dir synth_clock_networks.rpt]
+    report_methodology    -file [file join $rpt_dir synth_methodology.rpt]
+    write_checkpoint -force [file join $build_dir ${top_name}_synth.dcp]
+    puts "INFO: synthesis finished, reports in $rpt_dir"
+    if {$stage eq "synth"} { exit 0 }
+    close_design
+}
 
 # ---------------------------------------------------------------------------
 # implementation / bitstream
 # ---------------------------------------------------------------------------
-close_design
 if {$stage eq "bit"} { set last write_bitstream } else { set last route_design }
 reset_run impl_1
+if {$strategy ne ""} { set_property strategy $strategy [get_runs impl_1]; puts "INFO: impl_1 strategy $strategy" }
 if {$loose_io} {
     set_property STEPS.WRITE_BITSTREAM.TCL.PRE [file join $script_dir bit_pre_loose_io.tcl] [get_runs impl_1]
 } else {
@@ -119,8 +140,11 @@ report_drc            -file [file join $rpt_dir route_drc.rpt]
 report_power          -file [file join $rpt_dir route_power.rpt]
 write_checkpoint -force [file join $build_dir ${top_name}_routed.dcp]
 if {$stage eq "bit"} {
-    set bit [glob -nocomplain [file join $build_dir nvme_host nvme_host.runs impl_1 *.bit]]
+    set bit [glob -nocomplain [file join $build_dir $proj_name ${proj_name}.runs impl_1 *.bit]]
     if {[llength $bit]} { file copy -force [lindex $bit 0] [file join $build_dir ${top_name}.bit] }
+    # debug probes file (VIO of ax7a200b_top) for the Hardware Manager / fpga/tools/hw_status.tcl
+    set ltx [file join $build_dir $proj_name ${proj_name}.runs impl_1 ${top_name}.ltx]
+    if {[file exists $ltx]} { file copy -force $ltx [file join $build_dir ${top_name}.ltx] }
 }
 puts "INFO: $stage finished, reports in $rpt_dir"
 exit 0

@@ -166,3 +166,57 @@ The `top=nvme_host_top` flow was only checked up to project creation (generated 
 * `Buf_Opt_BMA = false` / NP credits 12: keep in sync with the request FIFO depth in `hostmem_completer`.
 * `stat_bytes_done`, `stat_first_error_lba` and the other wide statistic buses are not routed to pins in `kc705_top` (only the LED pages); add a VIO / ILA (or UART) if they are needed on hardware.
 * A new run needs CPU_RESET (the START / STOP latches are only cleared by it); after "unlimited" + STOP the last partial ring slot is not on the SSD.
+
+## Board ALINX AX7A200B (`board=ax7a200b`, XC7A200T-2FBG484I)
+
+Stand: AX7A200B (AC7A200 core) in the passive PCIe-slot -> M.2 adapter `STAND/PCB/PCIe-m2`; design and test plan in
+`STAND/AX7A200B_ARCHITECTURE.md`. Only Vivado **2025.2** is installed on this machine now (`C:\AMDDesignTools\2025.2\Vivado\bin`);
+the AX7A200B flow was built with it. (The KC705 `.xci` is from 2022.2 and was not re-built with 2025.2.)
+
+```
+cd fpga/build/a7log
+C:\AMDDesignTools\2025.2\Vivado\bin\vivado.bat -mode batch -source ..\..\scripts\build.tcl -log build.log -journal build.jou -tclargs bit board=ax7a200b jobs=8
+```
+
+| item | value |
+|---|---|
+| project / reports / bitstream | `fpga/build/nvme_host_ax7a200b/`, `fpga/build/reports_ax7a200b/`, `fpga/build/ax7a200b_top.bit` |
+| IP | `fpga/ip/pcie_7x_0_a7/pcie_7x_0.xci` (same property list as KC705, part xc7a200tfbg484-2; module name `pcie_7x_0`) |
+| constraints | `ax7a200b_board.xdc` (SYS_CLK R4/T4 DIFF_SSTL15, refclk F10/E10 = MGTREFCLK1_216, PERST# L16 = PCIE_PERST / edge A11, keys, LEDs, UART TX L15, SPI x4), `ax7a200b_cdc.xdc` (impl only: clock groups, GT LOCs) |
+| GT lanes | IP lane 0..3 = `GTPE2_CHANNEL_X0Y7/Y6/Y5/Y4` (slot lane 0, slot lane 1, SFP2, SFP1); = the IP default. x4 IP trains to x2 (SFP cages empty) |
+| top | `ax7a200b_top`, `N_SLOTS = 4` (4 x 128 KiB), generator 1 GiB full rate (parameters `GEN_LEN_SEL` / `GEN_RATE_SEL`) |
+
+Result (2026-11-12, Vivado 2025.2, default strategies): **all timing constraints met**.
+
+| | LUT | FF | RAMB36 | GTP | MMCM | BUFG | IOB |
+|---|---|---|---|---|---|---|---|
+| `ax7a200b_top`, routed | 6 583 (4.9 %) | 6 585 (2.4 %) | 142 (38.9 %) | 4 | 1 | 7 | 13 |
+
+| clock | WNS setup | WHS |
+|---|---|---|
+| `userclk2` 125 MHz (host + generator) | **+0.098 ns** (2026-11-18 rebuild with PERST# on L16: +0.187 ns) | +0.065 ns |
+| `clk_250mhz_mux_x0y0` (IP) | +0.249 ns (rebuild: +0.127 ns) | +0.080 ns |
+| `userclk1` 250 MHz | +1.135 ns | +0.070 ns |
+| `free_clk` 200 MHz | +0.138 ns | +0.170 ns |
+
+Timing closure history (same flow): first build WNS −0.618 ns / 86 endpoints (header FIFO of `pcie7x_rx_adapt` and request
+FIFO of `hostmem_completer` read combinationally into decode logic) -> output `axis_skid` in `pcie7x_rx_adapt` + decoded
+register P in the completer: −0.477 ns / 46 -> raw register R in front of the decode: −0.040 ns / 6 (R's load enable
+depended on the W/P chain) -> R loads only when empty: **+0.098 ns**. ARCHITECTURE.md v1.2 documents both changes. DRC:
+the same REQP-1839 / REQP-181 / RTSTAT-10 warnings as on the KC705. The margin is thin: re-check after every RTL change.
+
+### Stand debug (2026-11-19)
+
+`ax7a200b_top` carries a VIO (`vio_status`, `link_clk`: status, LTSSM, PERST# pin, counters, remote RESET / START / STOP,
+generator enable `gen_en`, 0 after configuration) and an ILA (`ila_pcie`, `user_clk`, 304 bit x 4096: `nvme_host_top.dbg_uc` =
+sequencer state, TX/RX handshakes and data of the pcie_7x AXI-S). `PERST_DRIVE = 0` (default): L16 is an input, the SSD reset
+comes from the adapter (XP1 joins PERST_M2#, PERST_HOST# and SYS_RESET#). Build with
+`-tclargs bit board=ax7a200b strategy=Performance_ExplorePostRoutePhysOpt` (default strategy: up to -0.9 ns with the debug cores);
+WNS +0.211 ns. `build.tcl` new options: `strategy=<name>`, `impl_only`; it copies `ax7a200b_top.ltx` next to the bitstream.
+
+```
+vivado -mode batch -nojournal -nolog -source fpga/tools/hw_status.tcl -tclargs program gen_off watch=3 start watch=5 stop status
+vivado -mode batch -nojournal -nolog -source fpga/tools/hw_status.tcl -tclargs capture_enum      # ILA -> fpga/build/ila_capture.csv
+python fpga/tools/ila_decode.py fpga/build/ila_capture.csv
+```
+
