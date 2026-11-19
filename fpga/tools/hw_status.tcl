@@ -11,6 +11,8 @@
 #                    (from LBA 0) ONLY if the generator is enabled (gen_on); with gen_off (default) RUN writes nothing
 #     capture        arm the ILA on the first TX TLP, press START, save fpga/build/ila_capture.csv
 #     capture_enum   same, trigger = sequencer enters ENUM
+#     len=<0..3>     generator length: 0 1 GiB (default), 1 8 GiB, 2 64 GiB, 3 unlimited (set BEFORE start)
+#     rate=<0..3>    generator rate: 0 full (default), 1 1/2, 2 1/4, 3 1/8
 #     gen_on | gen_off  generator enable (VIO probe_out3, 0 after programming)
 #     probes         list the VIO probes with their properties (debugging this script)
 #   Commands run in the given order, e.g.  -tclargs program watch=5 status
@@ -94,7 +96,7 @@ proc pulse {name} {
 # vivado.bat splits 'key=value' into 'key value': merge them back
 set argv_m {}
 foreach a $argv {
-    if {[llength $argv_m] && [lindex $argv_m end] in {watch}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
+    if {[llength $argv_m] && [lindex $argv_m end] in {watch len rate}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
 }
 set argv $argv_m
 
@@ -146,6 +148,8 @@ foreach a $argv {
                         puts "CAPTURE: written $csv"
                     }
                 }
+                len=*    { set p [get_hw_probes vio_len_sel -of_objects [vio]];  set_property OUTPUT_VALUE [string range $a 4 end] $p; commit_hw_vio $p; puts "LEN: [string range $a 4 end] (0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited)" }
+                rate=*   { set p [get_hw_probes vio_rate_sel -of_objects [vio]]; set_property OUTPUT_VALUE [string range $a 5 end] $p; commit_hw_vio $p; puts "RATE: [string range $a 5 end] (0 full, 1 1/2, 2 1/4, 3 1/8)" }
                 gen_on   { set p [get_hw_probes vio_gen_en -of_objects [vio]]; set_property OUTPUT_VALUE 1 $p; commit_hw_vio $p; puts "GEN: on" }
                 gen_off  { set p [get_hw_probes vio_gen_en -of_objects [vio]]; set_property OUTPUT_VALUE 0 $p; commit_hw_vio $p; puts "GEN: off" }
                 default  { puts "WARNING: unknown command $a" }

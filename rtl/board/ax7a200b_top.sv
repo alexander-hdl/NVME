@@ -19,7 +19,9 @@
 //                LED4 error (steady) or heartbeat (~3 Hz blink, no error)
 //   UART TX      idle high for now (status_uart comes in a later step)
 //
-// There are no DIP switches on this board: rate and length are parameters (GEN_RATE_SEL / GEN_LEN_SEL, same
+// There are no DIP switches on this board: rate and length come from the VIO (probe_out5 rate_sel, probe_out4
+// len_sel, both 0 after configuration = full rate, 1 GiB; same encoding as kc705_top's DIP switches; set them
+// BEFORE START).  Formerly the parameters GEN_RATE_SEL / GEN_LEN_SEL (same
 // encoding as kc705_top's DIP switches).  The test pattern is identical to kc705_top / sim/tb/tb_top.sv:
 //   beat n = { ~n, n ^ 32'hA5A5A5A5, n * 7, n }, START_LBA = 0, check with fpga/tools/check_pattern.py.
 //
@@ -34,8 +36,6 @@ module ax7a200b_top #(
   parameter bit          SIM_FAST      = 1'b0,
   parameter int unsigned DEBOUNCE_BITS = 21,       // 2^21 link_clk cycles (200 MHz) = 10.5 ms
   parameter int unsigned N_SLOTS       = 4,        // 4 x 128 KiB ring: enough for Gen2 x2 (architecture doc 4.3)
-  parameter logic [1:0]  GEN_RATE_SEL  = 2'd0,     // 0 full, 1 1/2, 2 1/4, 3 1/8
-  parameter logic [1:0]  GEN_LEN_SEL   = 2'd0,     // 0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited
   // PERST# on L16 (edge A11): 0 = OBSERVE only (pin is an input; the SSD reset comes from the adapter's
   // SYS_RESET# supervisor / button SA1 via XP1 = PERST_M2# + PERST_HOST# + SYS_RESET#; link_bringup's PERST#
   // pulses then have no effect), 1 = DRIVE (Root Port drives PERST# through A11; XP1 = PERST_M2# <-> PERST_HOST# only)
@@ -67,6 +67,8 @@ module ax7a200b_top #(
   logic         board_rst_n;
   logic         vio_rst, vio_start, vio_stop;                // VIO probe_out (link_clk)
   logic         vio_gen_en;                                  // VIO probe_out3: generator enable (0 after configuration)
+  logic [1:0]   vio_len_sel, vio_rate_sel;                   // VIO probe_out4 / 5: 0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited /
+                                                             //   0 full, 1 1/2, 2 1/4, 3 1/8
   assign board_rst_n = rst_key_n & ~vio_rst;
 
   logic         link_clk, user_clk;
@@ -201,7 +203,9 @@ module ax7a200b_top #(
     .probe_out0(vio_rst),                                                                 // 1 board reset (hold high)
     .probe_out1(vio_start),                                                               // 1 START
     .probe_out2(vio_stop),                                                                // 1 STOP
-    .probe_out3(vio_gen_en));                                                             // 1 generator enable
+    .probe_out3(vio_gen_en),                                                              // 1 generator enable
+    .probe_out4(vio_len_sel),                                                             // 2 length select
+    .probe_out5(vio_rate_sel));                                                           // 2 rate select
 
   logic [25:0] hb_cnt;
   always_ff @(posedge link_clk) hb_cnt <= hb_cnt + 1'b1;      // free running, no reset needed
@@ -263,10 +267,19 @@ module ax7a200b_top #(
     end
   end
 
+  // rate / length select from the VIO (quasi-static, set before START)
+  (* ASYNC_REG = "TRUE" *) logic [3:0] sel_s0, sel_s1;
+  logic [1:0]  rate_sel, len_sel;
+  always_ff @(posedge user_clk) begin
+    sel_s0 <= {vio_len_sel, vio_rate_sel};
+    sel_s1 <= sel_s0;
+  end
+  assign {len_sel, rate_sel} = sel_s1;
+
   logic [2:0] phase;
   logic       tick;
   always_comb begin
-    case (GEN_RATE_SEL)
+    case (rate_sel)
       2'd0:    tick = 1'b1;
       2'd1:    tick = (phase[0]   == 1'b0);
       2'd2:    tick = (phase[1:0] == 2'b0);
@@ -274,12 +287,14 @@ module ax7a200b_top #(
     endcase
   end
 
-  localparam logic [32:0] LIMIT = (GEN_LEN_SEL == 2'd0) ? (33'd1 << 26) :   // 1 GiB  = 2^26 beats of 16 B
-                                  (GEN_LEN_SEL == 2'd1) ? (33'd1 << 29) :   // 8 GiB
-                                                          (33'd1 << 32);    // 64 GiB
+  logic [32:0] limit_q;
+  always_ff @(posedge user_clk)
+    limit_q <= (len_sel == 2'd0) ? (33'd1 << 26) :   // 1 GiB  = 2^26 beats of 16 B
+               (len_sel == 2'd1) ? (33'd1 << 29) :   // 8 GiB
+                                   (33'd1 << 32);    // 64 GiB
   logic [32:0] sent;
   logic at_limit, can_send;
-  assign at_limit = (GEN_LEN_SEL != 2'd3) && (sent == LIMIT);
+  assign at_limit = (len_sel != 2'd3) && (sent == limit_q);
   // gen_en = 0: no beat is produced, the ring stays empty and RUN submits no Write (bring-up test without
   // touching the SSD contents).  With the VIO it starts at 0; set it to 1 BEFORE START for a recording.
   assign can_send = gen_en_sync[1] && !halt && !at_limit;
