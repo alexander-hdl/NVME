@@ -43,6 +43,11 @@
 // once the sequencer is past RUN; the checker needs 8 cycles after the last data beat).
 // vfy_* are cleared by the restart pulse of every run (init_start).
 //
+// Format NVM (format_req = 1, quasi-static, sampled at init_start): nvme_admin issues Format NVM
+// (SES=0) between Identify Namespace and Set Features, i.e. before the I/O queues exist - the SSD
+// returns to the "fresh" state (all LBAs deallocated).  format_done / format_ms report the result.
+// The sequencer waits in ADMIN_INIT as long as nvme_admin needs (FORMAT_TIMEOUT_MS in nvme_admin).
+//
 // Data path.  s_data_tready is held low while the core is in reset, while data_rst is
 // active and until the sequencer is in RUN (accept_enable = running) - see data_ring.
 // The write engine is restarted (pointers, flags, statistics) on every init_start, so
@@ -120,6 +125,7 @@ module nvme_host_core
   input  logic         ctrl_stop,
   input  logic         verify_mode = 1'b0,       // 1: read back and compare instead of recording
   input  logic [31:0]  verify_cmds = 32'd0,    // verify: number of Read commands (0 = unlimited)
+  input  logic         format_req = 1'b0,        // 1: issue NVMe Format NVM during bring-up (sampled at init_start; quasi-static)
 
   // ---- status ----
   output logic         status_link_up,
@@ -149,6 +155,8 @@ module nvme_host_core
   output logic [63:0]  stat_nsze,
   output logic [7:0]   stat_mdts,
   output logic [63:0]  stat_first_error_lba,     // SLBA of the first failed Write (status_flags[6])
+  output logic         format_done,              // sticky: Format NVM completed OK (cleared at init_start)
+  output logic [31:0]  format_ms,                // ms the Format NVM took (SQ doorbell -> CQE)
   // ---- verify results (user_clk) ----
   output logic         cmd_limit_done,           // verify_cmds data commands submitted and completed
   output logic [63:0]  vfy_bytes,                // bytes compared
@@ -436,7 +444,8 @@ module nvme_host_core
 
   nvme_admin #(.SLOT_BYTES(SLOT_BYTES)) u_admin (
     .clk(user_clk), .rst(user_rst), .tick_ms(tick_ms),
-    .start_init(seq_init_start), .init_done(init_done), .init_fail(init_fail), .fail_step(init_fail_step),
+    .start_init(seq_init_start), .format_req(format_req), .format_done(format_done), .format_ms(format_ms),
+    .init_done(init_done), .init_fail(init_fail), .fail_step(init_fail_step),
     .cqe_status_last(admin_cqe_status),
     .start_shutdown(seq_shutdown_start), .shutdown_done(shutdown_done), .shutdown_timeout(shutdown_timeout),
     .lbads(lbads), .nsze(nsze), .mdts(mdts), .dstrd(dstrd), .vwc(vwc),

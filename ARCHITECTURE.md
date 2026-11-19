@@ -414,6 +414,9 @@ delay up to `CRS_RETRY_MAX`=1000; UR/timeout → fail). `done`/`fail` latch unti
 Uses a requester command port (port 0 of `req_mux`), writes SQEs into `asq_ram`, polls `acq_ram`, reads `ident_ram`.
 ```
 parameter SLOT_BYTES = SLOT_BYTES_DEF;         // MDTS check; elaboration error if > 2 MiB
+parameter FORMAT_TIMEOUT_MS = 600_000;         // wait for the Format NVM CQE (10 min); ADMIN_TIMEOUT_MS (1000) for all other commands
+input format_req;                              // level, quasi-static, sampled at start_init: 1 = issue Format NVM during init
+output format_done; output [31:0] format_ms;   // sticky OK flag / ms from SQ doorbell to CQE; both cleared at start_init
 input start_init; output init_done, init_fail; output [7:0] fail_step; output [15:0] cqe_status_last;
 // init_done/init_fail/shutdown_done/shutdown_timeout latch until the next start_* but drop in the cycle the start is accepted (comb. mask)
 input start_shutdown; output shutdown_done;   // Delete SQ1 → Delete CQ1 → CC.SHN=01 → wait SHST==10
@@ -431,6 +434,23 @@ MDTS (byte 77; **if MDTS != 0 and SLOT_BYTES > 4096 << MDTS → init_fail F_MDTS
 (bytes 0–7), FLBAS (26), LBAF[FLBAS&0xF] at 128+4·n → LBADS=[23:16], MS=[15:0] must be 0; Set Features FID 7
 (CDW10=7, CDW11=0); Create IOCQ (opc 5, PRP1 0x1000_4000, CDW10 0x003F0001, CDW11 1); Create IOSQ (opc 1, PRP1
 0x1000_3000, CDW10 0x003F0001, CDW11 0x00010001). Then `init_done`.
+
+**Optional Format NVM (`format_req`).** Purpose: bring a used SSD back to the "fresh" state (all LBAs deallocated, SLC cache restored) before a
+recording. With `format_req=1` at `start_init` the command list becomes Identify Ctrl, Identify NS, **Format NVM**, Set Features, Create IOCQ, Create IOSQ
+(6 commands; the CIDs stay consecutive). The Format sits after Identify NS (the LBA format is known) and before the I/O queues exist.
+* SQE: OPC `0x80`, **NSID = 1**, CDW10 = `{LBAF = FLBAS[3:0] of Identify NS, MSET=0, PI=0, PIL=0, SES=000b}`, no PRP. NSID 1 rather than `0xFFFFFFFF`: the host only
+  works with namespace 1, the broadcast NSID is valid only when Identify Controller `FNA[0]=0` (not parsed), an explicit NSID is accepted by every controller
+  (with `FNA[0]=1` it formats all namespaces anyway; same effect on a one-namespace SSD). LBAF = the format already in use, so LBADS/NSZE do not change and
+  Identify Namespace is **not** re-read after the Format.
+* Timeout: `FORMAT_TIMEOUT_MS` (default 600 000 ms), counted with the ms tick from the SQ doorbell, replaces `ADMIN_TIMEOUT_MS` for this command only (a Format with SES=0 can
+  take milliseconds to minutes; the whole time `host_sequencer` stays in ADMIN_INIT and `status_nvme_ready` stays low).
+* Failure: CQE status != 0 → `init_fail`, fail_step **0x15 F_FORMAT_STATUS** (`cqe_status_last` holds the status); no CQE in time → fail_step **0x16 F_FORMAT_TMO**
+  (both reach the sequencer as E_ADMIN with detail 0x15 / 0x16).
+* `format_done` (sticky) is set when the Format completed with status 0 and cleared at `start_init`; `format_ms` = ms (tick count) from doorbell to CQE (valid with
+  `format_done`, also latched on a failed Format; 0 = faster than 1 ms). Both are exported by `nvme_host_core` / `nvme_host_top` (user_clk).
+* `format_req` at `nvme_host_top` is an asynchronous / quasi-static input (2-FF synchronised into user_clk like `verify_mode`, default `1'b0` when left unconnected);
+  `nvme_host_core.format_req` is already in user_clk (default `1'b0`). Never combine it with a verify run: the Format destroys the recorded data.
+  The Format runs on every `init_start` while `format_req=1` (the sequencer restarts the whole bring-up for each run), so drop `format_req` before a second run that must keep the data.
 Polling interval for CSTS: every 1 ms. Doorbell addresses computed from `dstrd`.
 
 ### 5.16 `nvme_write_engine`
@@ -525,6 +545,8 @@ output [7:0] status_flags;             // [0] shutdown_timeout  [1] doorbell_err
 output [63:0] stat_first_error_lba;    // SLBA of the first failed Write
 parameter IO_TIMEOUT_MS = 30000;
 ```
+**Format ports.** `nvme_host_core` / `nvme_host_top`: `input format_req` (default 0; top: async, 2-FF), `output format_done`, `output [31:0] format_ms` (user_clk), see §5.15.
+
 **Verify ports (v1.2).** `nvme_host_core` / `nvme_host_top`: `input verify_mode; input [31:0] verify_cmds;` (top: asynchronous / quasi-static, 2-FF synchronised
 into user_clk like ctrl_start; set before `ctrl_start`) and `output cmd_limit_done; output [63:0] vfy_bytes; output [31:0] vfy_err_beats;
 output [63:0] vfy_first_err_lba; output [31:0] vfy_first_err_exp, vfy_first_err_got;` (all user_clk domain). See §5.19.

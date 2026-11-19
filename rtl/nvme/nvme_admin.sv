@@ -36,8 +36,23 @@
 //     The init command list and the shutdown command list both run through it.
 //
 // Init command order (CID = running counter, starts at 0 on start_init):
-//   Identify Controller, Identify Namespace, Set Features(FID 7),
-//   Create IO CQ 1, Create IO SQ 1                       -> init_done
+//   Identify Controller, Identify Namespace, [Format NVM - only if format_req was 1 at
+//   start_init], Set Features(FID 7), Create IO CQ 1, Create IO SQ 1   -> init_done
+//
+// Optional Format NVM (format_req, ARCHITECTURE.md 5.15.x).  Purpose: return a used SSD to the
+// "fresh" state (all LBAs deallocated, SLC cache restored) before a recording.
+//   SQE: OPC 0x80, NSID = 1, CDW10 = {LBAF = FLBAS[3:0] of Identify Namespace, MSET = 0, PI = 0,
+//        PIL = 0, SES = 000b (no secure erase)}, no PRP.
+//   NSID = 1, not 0xFFFFFFFF: the host uses namespace 1 only (Identify NS uses NSID 1 too).  The
+//        broadcast NSID is allowed only when Identify Controller FNA[0] = 0 (otherwise Invalid
+//        Field), and the host does not parse FNA; an explicit NSID is valid on every controller
+//        (with FNA[0] = 1 it formats all namespaces anyway).  Same effect on a 1-namespace SSD.
+//   LBAF = the format already in use (FLBAS), so the sector size / NSZE do not change (SES=0 keeps
+//        the namespace size): Identify Namespace is NOT re-read after the Format.
+//   Format has its own timeout FORMAT_TIMEOUT_MS (counted from the SQ doorbell) instead of
+//   ADMIN_TIMEOUT_MS; it may take milliseconds to minutes.  Status != 0 -> F_FORMAT_STATUS,
+//   timeout -> F_FORMAT_TMO.  format_done (sticky) is set when the Format completed with status 0;
+//   format_ms = ms (tick_ms count) from the SQ doorbell to the CQE.
 // Shutdown (start_shutdown): Delete IO SQ 1, Delete IO CQ 1, CC=CC_SHUTDOWN,
 //   poll CSTS.SHST==10b every ms (10 s timeout -> still shutdown_done, with
 //   shutdown_timeout=1).
@@ -67,6 +82,7 @@ module nvme_admin
   parameter int unsigned RDY_TIMEOUT_MS_MAX  = 128_000,  // upper cap of (CAP.TO+1)*500 ms (TO max = 255)
   parameter int unsigned ADMIN_TIMEOUT_MS    = 1_000,    // wait for one admin CQE
   parameter int unsigned SHUTDOWN_TIMEOUT_MS = 10_000,   // wait for CSTS.SHST == 10b
+  parameter int unsigned FORMAT_TIMEOUT_MS   = 600_000,  // wait for the Format NVM CQE (10 min)
   parameter int unsigned SLOT_BYTES          = SLOT_BYTES_DEF // bytes per Write command (MDTS check)
 ) (
   input  logic        clk,
@@ -75,6 +91,9 @@ module nvme_admin
 
   // ---- control / status ----
   input  logic        start_init,
+  input  logic        format_req,        // level, quasi-static: sampled at start_init; 1 = issue Format NVM
+  output logic        format_done,       // sticky: Format NVM completed OK; cleared at start_init
+  output logic [31:0] format_ms,         // ms from SQ doorbell to CQE of the Format (cleared at start_init)
   output logic        init_done,         // level, drops in the cycle start_init is accepted
   output logic        init_fail,         // level, drops in the cycle start_init is accepted
   output logic [7:0]  fail_step,         // see F_* codes below
@@ -158,6 +177,8 @@ module nvme_admin
   localparam logic [7:0] F_NS_LBADS   = 8'h12;  // LBADS out of the 512 B .. 32 KiB range
   localparam logic [7:0] F_CQE_CID    = 8'h13;  // CQE.CID does not match the submitted command
   localparam logic [7:0] F_MDTS       = 8'h14;  // MDTS != 0 and SLOT_BYTES > 4096 << MDTS
+  localparam logic [7:0] F_FORMAT_STATUS = 8'h15;  // Format NVM CQE status != 0
+  localparam logic [7:0] F_FORMAT_TMO = 8'h16;  // no Format NVM CQE within FORMAT_TIMEOUT_MS
   localparam logic [7:0] F_CMD_STATUS = 8'h20;  // | CID[4:0]: CQE status != 0
   localparam logic [7:0] F_CMD_TMO    = 8'h40;  // | CID[4:0]: no CQE within ADMIN_TIMEOUT_MS
 
@@ -181,10 +202,11 @@ module nvme_admin
     K_CREATE_CQ  = 3'd3,
     K_CREATE_SQ  = 3'd4,
     K_DELETE_SQ  = 3'd5,
-    K_DELETE_CQ  = 3'd6
+    K_DELETE_CQ  = 3'd6,
+    K_FORMAT     = 3'd7
   } cmd_kind_t;
 
-  localparam int unsigned INIT_CMDS = 5;      // K_IDENT_CTRL .. K_CREATE_SQ
+  localparam int unsigned INIT_CMDS = 5;      // K_IDENT_CTRL .. K_CREATE_SQ (6 with Format NVM)
   localparam int unsigned SHN_CMDS  = 2;      // K_DELETE_SQ, K_DELETE_CQ
 
   typedef enum logic [1:0] { POLL_RDY0 = 2'd0, POLL_RDY1 = 2'd1, POLL_SHST = 2'd2 } poll_t;
@@ -240,6 +262,7 @@ module nvme_admin
   cmd_kind_t        cmd_kind;
   logic [2:0]       cmd_seq;
   logic             in_shutdown;
+  logic             fmt_en;       // format_req latched at start_init
 
   // Identify extraction
   logic [1:0]  ex_step;
@@ -250,7 +273,7 @@ module nvme_admin
   // Combinational helpers
   // ---------------------------------------------------------------------------
   // The 16 DWs of the SQE for the current command.  DW i at [32*i +: 32].
-  function automatic logic [511:0] build_sqe(input cmd_kind_t kind, input logic [15:0] cid_in);
+  function automatic logic [511:0] build_sqe(input cmd_kind_t kind, input logic [15:0] cid_in, input logic [3:0] lbaf);
     logic [511:0] s;
     logic [7:0]   opc;
     logic [31:0]  nsid, prp1, cdw10, cdw11;
@@ -265,6 +288,7 @@ module nvme_admin
                           cdw10 = {16'(IO_QSIZE-1), 16'd1}; cdw11 = {16'd1, 16'd1};            end // CQID=1, PC=1
       K_DELETE_SQ:  begin opc = AOPC_DELETE_SQ;    cdw10 = 32'h1;                              end
       K_DELETE_CQ:  begin opc = AOPC_DELETE_CQ;    cdw10 = 32'h1;                              end
+      K_FORMAT:     begin opc = AOPC_FORMAT_NVM;   nsid = 32'h1; cdw10 = {28'h0, lbaf};        end // LBAF, MSET/PI/PIL/SES = 0
       default: ;
     endcase
     s = '0;
@@ -289,11 +313,14 @@ module nvme_admin
   endfunction
 
   logic [511:0] sqe_v;
-  assign sqe_v = build_sqe(cmd_kind, cid);
+  assign sqe_v = build_sqe(cmd_kind, cid, ex_fmt);
 
   // sequence tables
-  function automatic cmd_kind_t init_cmd(input logic [2:0] idx);
-    case (idx)
+  function automatic cmd_kind_t init_cmd(input logic [2:0] idx, input logic fmt);
+    logic [2:0] i;
+    if (fmt && idx == 3'd2) return K_FORMAT;       // Format NVM sits between Identify NS and Set Features
+    i = (fmt && idx > 3'd2) ? idx - 3'd1 : idx;
+    case (i)
       3'd0:    return K_IDENT_CTRL;
       3'd1:    return K_IDENT_NS;
       3'd2:    return K_SET_FEAT;
@@ -419,6 +446,9 @@ module nvme_admin
       cqe_status_last  <= 16'h0;
       shutdown_done_r    <= 1'b0;
       shutdown_timeout_r <= 1'b0;
+      format_done      <= 1'b0;
+      format_ms        <= 32'd0;
+      fmt_en           <= 1'b0;
       lbads            <= 4'd0;
       nsze             <= 64'd0;
       mdts             <= 8'd0;
@@ -462,6 +492,9 @@ module nvme_admin
             shutdown_done_r    <= 1'b0;
             shutdown_timeout_r <= 1'b0;
             in_shutdown      <= 1'b0;
+            fmt_en           <= format_req;
+            format_done      <= 1'b0;
+            format_ms        <= 32'd0;
             asq_tail         <= '0;
             acq_head         <= '0;
             acq_phase        <= 1'b1;
@@ -619,7 +652,7 @@ module nvme_admin
         // ---------------------------------------------------------------
         // admin_cmd sub-FSM
         S_CMD_START: begin
-          cmd_kind <= in_shutdown ? shn_cmd(cmd_seq) : init_cmd(cmd_seq);
+          cmd_kind <= in_shutdown ? shn_cmd(cmd_seq) : init_cmd(cmd_seq, fmt_en);
           wr_beat  <= 2'd0;
           state    <= S_AC_WR;
         end
@@ -640,24 +673,28 @@ module nvme_admin
         S_AC_POLL_CHK: begin                          // acq_rd_data valid now
           if (cqe_hit) begin
             cqe_status_last <= {1'b0, cqe_status};
+            if (cmd_kind == K_FORMAT && !in_shutdown) format_ms <= ms_cnt;
             acq_head        <= head_next;
             if (acq_head == ASQ_W'(ADMIN_QSIZE-1)) acq_phase <= ~acq_phase;
             if (acq_rd_data[111:96] != cid && !in_shutdown) begin
               do_fail(F_CQE_CID);
             end else if (cqe_status != 15'd0 && !in_shutdown) begin
-              do_fail(F_CMD_STATUS | {3'b000, cid[4:0]});
+              if (cmd_kind == K_FORMAT) do_fail(F_FORMAT_STATUS);
+              else                      do_fail(F_CMD_STATUS | {3'b000, cid[4:0]});
             end else begin
               // CQ0HDBL = new head
               mm_wr(doorbell_addr(dstrd, 0, 1'b1), 32'(head_next), F_DOORBELL, S_AC_CQDB_DONE);
             end
-          end else if (ms_cnt >= ADMIN_TIMEOUT_MS) begin
-            if (in_shutdown) state <= S_CMD_FINISH;   // keep shutting down regardless
-            else             do_fail(F_CMD_TMO | {3'b000, cid[4:0]});
+          end else if (ms_cnt >= ((cmd_kind == K_FORMAT) ? FORMAT_TIMEOUT_MS : ADMIN_TIMEOUT_MS)) begin
+            if (in_shutdown)              state <= S_CMD_FINISH;   // keep shutting down regardless
+            else if (cmd_kind == K_FORMAT) do_fail(F_FORMAT_TMO);
+            else                           do_fail(F_CMD_TMO | {3'b000, cid[4:0]});
           end else begin
             state <= S_AC_POLL_RD;
           end
         end
         S_AC_CQDB_DONE: begin
+          if (!in_shutdown && cmd_kind == K_FORMAT) format_done <= 1'b1;
           if (!in_shutdown && (cmd_kind == K_IDENT_CTRL || cmd_kind == K_IDENT_NS)) begin
             ex_step <= 2'd0;
             ex_addr <= (cmd_kind == K_IDENT_CTRL) ? IDC_BEAT_MDTS : IDN_BEAT_NSZE;
@@ -713,7 +750,7 @@ module nvme_admin
           cid     <= cid + 1'b1;              // CIDs keep incrementing
           cmd_seq <= cmd_seq + 1'b1;
           if (!in_shutdown) begin
-            if (cmd_seq == 3'(INIT_CMDS-1)) begin
+            if (cmd_seq == 3'(INIT_CMDS - 1 + (fmt_en ? 1 : 0))) begin
               init_done_r <= 1'b1;
               state     <= S_IDLE;
             end else begin

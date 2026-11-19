@@ -43,6 +43,9 @@
 //        vfy_err_beats == 0, vfy_bytes == 1 MiB, stat_bytes_done == 1 MiB, no command error, orderly DONE.
 //   T-11 second verify run with the SSD corrupting one bit of namespace byte VFY_CORRUPT_BYTE on the Read
 //        path: exactly 1 error beat, first_err_lba / first_err_exp / first_err_got as predicted.
+//   T-12 format run (after T-11): format_req = 1, the generator streams the 1 MiB again; the SSD must execute one
+//        Format NVM (OPC 80h) between Identify NS and Set Features, lba_mem is empty when RUN starts,
+//        format_done / format_ms are valid, the re-recording is correct (T-13: verify run after it, 0 error beats).
 //   Metric: TX-bus valid-beat ratio in the steady-state window (first .. last data CplD
 //   accepted by the core) is printed (ARCHITECTURE.md §7 target >= 0.9 with tready always
 //   high; note the 100 MHz x 16 B = 1.6 GB/s source limits the ratio to roughly 0.85).
@@ -105,6 +108,9 @@ module tb_top;
   logic         verify_mode;
   logic [31:0]  verify_cmds;
   wire          cmd_limit_done;
+  logic         format_req;
+  wire          format_done;
+  wire  [31:0]  format_ms;
   wire  [63:0]  vfy_bytes, vfy_first_err_lba;
   wire  [31:0]  vfy_err_beats, vfy_first_err_exp, vfy_first_err_got;
 
@@ -150,6 +156,7 @@ module tb_top;
     .data_clk(data_clk), .data_rst(data_rst),
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
     .ctrl_start(ctrl_start), .ctrl_stop(ctrl_stop), .verify_mode(verify_mode), .verify_cmds(verify_cmds),
+    .format_req(format_req), .format_done(format_done), .format_ms(format_ms),
     .status_link_up(status_link_up), .status_gen2(status_gen2), .status_link_width(status_link_width),
     .status_enum_done(status_enum_done), .status_nvme_ready(status_nvme_ready), .status_running(status_running),
     .status_done(status_done), .status_error(status_error), .status_error_detail(status_error_detail),
@@ -455,6 +462,61 @@ module tb_top;
   endtask
 
   // ---------------------------------------------------------------------------
+  // T-12: Format NVM at bring-up (format_req = 1), then a normal recording of the same 1 MiB.
+  //   The SSD (which still holds the first recording) must execute exactly one Format NVM between
+  //   Identify Namespace and Set Features (OPC 80h, NSID 1, CDW10 = 0), its lba_mem must be empty
+  //   when the new run starts, format_done / format_ms must be reported, and the data written again
+  //   (no "LBA written twice" error: the Format deallocated the namespace) must be correct.
+  // ---------------------------------------------------------------------------
+  task automatic format_record_run();
+    int          t, ev0, nfmt0;
+    int          adm[$];
+    logic [31:0] adm_cdw10[$];
+    logic [3:0]  exp_states[$];
+    int          e;
+    ctrl_start <= 1'b0; ctrl_stop <= 1'b0;
+    t = 0; while (status_seq_state !== 4'd0 && t < 2000) begin @(posedge user_clk); t++; end
+    if (status_seq_state !== 4'd0) tb_err($sformatf("T-12: sequencer did not return to IDLE (state %0d)", status_seq_state));
+    repeat (10) @(posedge user_clk);
+    verify_mode <= 1'b0; format_req <= 1'b1;
+    u_ssd.format_delay_cycles = 3000;
+    src_cnt = 0; src_done = 0;                       // the generator streams the same 1 MiB again
+    ev0 = u_ssd.ev_log.size(); nfmt0 = u_ssd.n_format;
+    seq_trace.delete();
+    @(posedge user_clk);
+    ctrl_start <= 1'b1;
+    t = 0; while (status_running !== 1'b1 && status_error == 0 && t < 400000) begin @(posedge user_clk); t++; end
+    if (status_running !== 1'b1) tb_err($sformatf("T-12: never reached RUN (state %0d, error %02h/%02h)", status_seq_state, status_error, status_error_detail));
+    if (format_done !== 1'b1) tb_err("T-12: format_done not set in RUN");
+    if (format_ms > 32'd1000) tb_err($sformatf("T-12: format_ms = %0d (implausible)", format_ms));
+    if (u_ssd.n_format - nfmt0 != 1) tb_err($sformatf("T-12: SSD executed %0d Format NVM commands, expected 1", u_ssd.n_format - nfmt0));
+    if (u_ssd.lba_mem.num() > N_LBAS / 4) tb_err($sformatf("T-12: SSD still holds %0d LBAs at RUN (Format should have cleared them)", u_ssd.lba_mem.num()));
+    $display("[tb_top @%0t] T-12: RUN after Format NVM: format_done=%0b format_ms=%0d, SSD holds %0d LBAs", $time, format_done, format_ms, u_ssd.lba_mem.num());
+    wait (src_done);
+    repeat (200) @(posedge user_clk);
+    ctrl_stop <= 1'b1;
+    t = 0; while (status_done !== 1'b1 && status_error == 0 && t < 600000) begin @(posedge user_clk); t++; end
+    repeat (50) @(posedge user_clk);
+    format_req <= 1'b0;                              // the following verify run must NOT format
+    if (status_done !== 1'b1 || status_error != 0)
+      tb_err($sformatf("T-12: no orderly DONE (done %0b, error %02h/%02h)", status_done, status_error, status_error_detail));
+    for (int i = ev0; i < u_ssd.ev_log.size(); i++)
+      if (u_ssd.ev_log[i].kind == EV_ADMIN) begin adm.push_back(u_ssd.ev_log[i].a); adm_cdw10.push_back(u_ssd.ev_log[i].b[63:32]); end
+    if (adm.size() != 8 || adm[0] != 8'h06 || adm[1] != 8'h06 || adm[2] != 8'h80 || adm[3] != 8'h09 || adm[4] != 8'h05 ||
+        adm[5] != 8'h01 || adm[6] != 8'h00 || adm[7] != 8'h04 || adm_cdw10[2] != 32'h0)
+      tb_err($sformatf("T-12: admin sequence %p (CDW10 of Format %08h), expected [06 06 80 09 05 01 00 04], Format CDW10 0", adm, adm_cdw10.size() > 2 ? adm_cdw10[2] : 32'hx));
+    exp_states = {4'd0, 4'd1, 4'd2, 4'd3, 4'd4, 4'd5, 4'd6, 4'd7, 4'd8, 4'd9};
+    if (seq_trace != exp_states) tb_err($sformatf("T-12: sequencer state trace %p", seq_trace));
+    e = u_ssd.check_range(0, N_LBAS, ref_mem);
+    if (e != 0) tb_err($sformatf("T-12: %0d data bytes differ after the re-recording", e));
+    if (u_ssd.lba_mem.num() != N_LBAS) tb_err($sformatf("T-12: SSD holds %0d LBAs, expected %0d", u_ssd.lba_mem.num(), N_LBAS));
+    if (stat_bytes_done != TOTAL_BYTES || stat_cmd_errors != 0) tb_err($sformatf("T-12: bytes %0d / errors %0d", stat_bytes_done, stat_cmd_errors));
+    if (status_flags !== 8'h00) tb_err($sformatf("T-12: status_flags = %02h", status_flags));
+    if (u_ssd.err_count != 0) tb_err($sformatf("T-12: SSD model reported %0d error(s)", u_ssd.err_count));
+    else if (tb_errs == 0) $display("[tb_top] T-12 OK: Format NVM executed once, namespace wiped, 1 MiB re-recorded correctly");
+  endtask
+
+  // ---------------------------------------------------------------------------
   // Main
   // ---------------------------------------------------------------------------
   initial begin
@@ -463,7 +525,7 @@ module tb_top;
     data_rst   = 1'b1;
     link_ready = 1'b0; link_gen2 = 1'b0; link_width = 2'b00;
     ctrl_start = 1'b0; ctrl_stop = 1'b0;
-    verify_mode = 1'b0; verify_cmds = 32'd0;
+    verify_mode = 1'b0; verify_cmds = 32'd0; format_req = 1'b0;
     apply_plusargs();
     #(1us);
     sys_rst_n = 1'b1;
@@ -516,6 +578,10 @@ module tb_top;
     // T-10 / T-11: read the recording back and compare it inside the DUT
     verify_run("T-10 verify", 0, 0);
     verify_run("T-11 verify with corruption", VFY_CORRUPT_BYTE, 1);
+    if (!inject) begin
+      format_record_run();
+      verify_run("T-13 verify after format + re-record", 0, 0);
+    end
     $display("--------------------------------------------------------------------------");
     $display(" tb_top summary: core TX TLPs %0d, RX TLPs %0d (straddles %0d, SOF@DW2 %0d)",
              u_core.tx_tlps, u_core.rx_tlps, u_core.n_straddles, u_core.n_sof_dw2);

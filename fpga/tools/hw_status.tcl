@@ -11,10 +11,14 @@
 #                    (from LBA 0) ONLY if the generator is enabled (gen_on); with gen_off (default) RUN writes nothing
 #     capture        arm the ILA on the first TX TLP, press START, save fpga/build/ila_capture.csv
 #     capture_enum   same, trigger = sequencer enters ENUM
+#     rate_bps=<R>   real-time source of R bytes/s (backlog = memory needed beyond the ring); 0 = off
+#     len_gib=<G> | len_cmds=<N>  run length (overrides len=); 0 = back to len=
+#     until=<s>      poll every s seconds until done / error, print the rate of each interval (PROFILE:)
 #     len=<0..3>     generator length: 0 1 GiB (default), 1 8 GiB, 2 64 GiB, 3 unlimited (set BEFORE start)
 #     rate=<0..3>    generator rate: 0 full (default), 1 1/2, 2 1/4, 3 1/8
 #     verify_on | verify_off  verify run: START reads len= GiB back with NVMe Read and compares it with the pattern
 #                    (results: VERIFY: in the status line); recording: verify_off
+#     format_on | format_off  NVMe Format NVM (SES=0, all data lost) during the bring-up of the next START
 #     gen_on | gen_off  generator enable (VIO probe_out3, 0 after programming)
 #     probes         list the VIO probes with their properties (debugging this script)
 #   Commands run in the given order, e.g.  -tclargs program watch=5 status
@@ -84,6 +88,16 @@ proc status {} {
     if {$span_cyc > 0 && $bytes > 131072} {
         lappend c [format "span=%.3fs sustained=%.1fMB/s" [expr {$span_cyc / 125e6}] [expr {($bytes - 131072) / ($span_cyc / 125e6) / 1e6}]]
     }
+    set nsze [rp 17]; set lbads [rp 18]
+    if {$nsze > 0} { lappend c [format "cap=%.1fGB" [expr {double($nsze) * (1 << $lbads) / 1e9}]] }
+    set bmax [rp 19]; set bnow [rp 20]; set due [rp 21]
+    if {$due > 0} {
+        lappend c [format "src=%.3fGB backlog_now=%.1fKiB backlog_max=%.1fKiB" [expr {$due * 16 / 1e9}] [expr {$bnow * 16 / 1024.0}] [expr {$bmax * 16 / 1024.0}]]
+    }
+    global last_bytes last_cyc last_done last_err
+    set last_bytes $bytes; set last_cyc $run_cyc; set last_done [rv s_done]; set last_err [expr {[rv s_err] != 0 || [rv s_lba]}]
+    set fm [rp 22]
+    if {$fm != 0} { lappend c [format "FORMAT: done=%d took=%d ms" [expr {($fm >> 32) & 1}] [expr {$fm & 0xFFFFFFFF}]] }
     set vf [rp 16]
     if {$vf & 2} {
         set vb [rp 12]; set ve [rp 13]; set el [rp 14]; set eg [rp 15]
@@ -105,7 +119,7 @@ proc pulse {name} {
 # vivado.bat splits 'key=value' into 'key value': merge them back
 set argv_m {}
 foreach a $argv {
-    if {[llength $argv_m] && [lindex $argv_m end] in {watch len rate}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
+    if {[llength $argv_m] && [lindex $argv_m end] in {watch len rate rate_bps len_cmds len_gib until}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
 }
 set argv $argv_m
 
@@ -157,10 +171,43 @@ foreach a $argv {
                         puts "CAPTURE: written $csv"
                     }
                 }
+                rate_bps=* {
+                    # real-time source: R bytes/s -> step = R * 2^32 / 2e9 (0 = off, back to rate=)
+                    set r [string range $a 9 end]
+                    set step [expr {wide(round(double($r) * 4294967296.0 / 2.0e9))}]
+                    if {$r > 0 && $step == 0} { set step 1 }
+                    if {$step > 4294967295} { set step 4294967295 }
+                    set p [get_hw_probes vio_rate_step -of_objects [vio]]
+                    set_property OUTPUT_VALUE_RADIX UNSIGNED $p; set_property OUTPUT_VALUE $step $p; commit_hw_vio $p
+                    puts [format "RATE_BPS: %s B/s -> step %d (= %.3f B/s)" $r $step [expr {$step * 2.0e9 / 4294967296.0}]]
+                }
+                len_cmds=* - len_gib=* {
+                    if {[string match len_gib=* $a]} { set n [expr {wide([string range $a 8 end]) * 8192}] } else { set n [string range $a 9 end] }
+                    set p [get_hw_probes vio_len_cmds -of_objects [vio]]
+                    set_property OUTPUT_VALUE_RADIX UNSIGNED $p; set_property OUTPUT_VALUE $n $p; commit_hw_vio $p
+                    puts [format "LEN_CMDS: %d commands = %.3f GiB" $n [expr {$n / 8192.0}]]
+                }
+                until=* {
+                    # poll every N s until done or error (max 2 h); print the rate of each interval
+                    set iv [string range $a 6 end]
+                    global last_bytes last_cyc last_done last_err
+                    set pb 0; set pc 0; set t0 [clock seconds]
+                    while {1} {
+                        status
+                        if {$last_cyc > $pc} {
+                            puts [format "PROFILE: t=%.1fs bytes=%.3fGB interval_rate=%.1fMB/s" [expr {$last_cyc / 125e6}] [expr {$last_bytes / 1e9}] [expr {($last_bytes - $pb) / (($last_cyc - $pc) / 125e6) / 1e6}]]
+                        }
+                        set pb $last_bytes; set pc $last_cyc
+                        if {$last_done || $last_err || [clock seconds] - $t0 > 7200} break
+                        after [expr {int($iv * 1000)}]
+                    }
+                }
                 len=*    { set p [get_hw_probes vio_len_sel -of_objects [vio]];  set_property OUTPUT_VALUE [string range $a 4 end] $p; commit_hw_vio $p; puts "LEN: [string range $a 4 end] (0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited)" }
                 rate=*   { set p [get_hw_probes vio_rate_sel -of_objects [vio]]; set_property OUTPUT_VALUE [string range $a 5 end] $p; commit_hw_vio $p; puts "RATE: [string range $a 5 end] (0 full, 1 1/2, 2 1/4, 3 1/8)" }
                 verify_on  { set p [get_hw_probes vio_verify -of_objects [vio]]; set_property OUTPUT_VALUE 1 $p; commit_hw_vio $p; puts "VERIFY: on (Read + compare, generator off)" }
                 verify_off { set p [get_hw_probes vio_verify -of_objects [vio]]; set_property OUTPUT_VALUE 0 $p; commit_hw_vio $p; puts "VERIFY: off" }
+                format_on  { set p [get_hw_probes vio_format -of_objects [vio]]; set_property OUTPUT_VALUE 1 $p; commit_hw_vio $p; puts "FORMAT: requested for the next START (erases the SSD)" }
+                format_off { set p [get_hw_probes vio_format -of_objects [vio]]; set_property OUTPUT_VALUE 0 $p; commit_hw_vio $p; puts "FORMAT: off" }
                 gen_on   { set p [get_hw_probes vio_gen_en -of_objects [vio]]; set_property OUTPUT_VALUE 1 $p; commit_hw_vio $p; puts "GEN: on" }
                 gen_off  { set p [get_hw_probes vio_gen_en -of_objects [vio]]; set_property OUTPUT_VALUE 0 $p; commit_hw_vio $p; puts "GEN: off" }
                 default  { puts "WARNING: unknown command $a" }

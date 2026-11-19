@@ -68,6 +68,10 @@
 //   corrupt_read_at_byte namespace byte address (longint, LBA*512 + offset) whose bit 0   [-1 = off]
 //                        is flipped in the data of a Read that covers it (negative tests)
 //   verbose              1 = print every TLP / command                               [0]
+//   format_delay_cycles  Format NVM (admin opcode 80h) completion delay                   [2000]
+//   format_status        status written for a Format NVM instead of success (data kept)   [0 = ok]
+//                        A successful Format deletes lba_mem (all LBAs read as zero), n_format++;
+//                        NSID must be 1 / FFFFFFFFh, LBAF 0, MSET/PI/PIL 0, SES <= 1.
 //
 // Checks ($error, counted in err_count)
 // -------------------------------------
@@ -141,6 +145,8 @@ module nvme_ssd_model
   bit          allow_overwrite      = 0;
   longint      corrupt_read_at_byte = -1;
   bit          verbose              = 0;
+  int          format_delay_cycles  = 2000;      // Format NVM (admin 80h) completion delay
+  logic [14:0] format_status        = 15'h0;     // != 0: Format NVM completes with this status (data kept)
 
   // Identify data constants
   localparam byte unsigned MDTS  = 8'd5;
@@ -155,6 +161,7 @@ module nvme_ssd_model
   int     n_io_writes  = 0;
   int     n_io_reads   = 0;
   int     n_flush      = 0;
+  int     n_format     = 0;
   int     n_cqe        = 0;
   int     n_mrd        = 0;
   int     n_mwr        = 0;
@@ -1044,6 +1051,22 @@ module nvme_ssd_model
         else begin
           while (cqs[1].pend.size() != 0) @(posedge clk);
           cqs[1].exists = 0;
+        end
+      end
+      8'h80: begin  // Format NVM
+        // CDW10: LBAF [3:0], MSET [4], PI [7:5], PIL [8], SES [11:9], LBAFU [13:12]
+        if (nsid != 1 && nsid != 32'hFFFF_FFFF)               st = mk_status(0, 8'h0B);   // Invalid Namespace
+        else if (cdw10[3:0] != 0 || cdw10[13:12] != 0)        st = mk_status(0, 8'h0A);   // Invalid Format (only LBAF0 is modelled, = FLBAS)
+        else if (cdw10[4] || cdw10[7:5] != 0 || cdw10[8] || cdw10[11:9] > 1) st = mk_status(0, 8'h02);   // MSET/PI/PIL/SES unsupported
+        else if (sqs[1].exists || cqs[1].exists)              st = mk_status(0, 8'h02);   // not while I/O queues exist
+        else begin
+          repeat (format_delay_cycles) @(posedge clk);
+          if (format_status != 0) st = format_status;
+          else begin
+            lba_mem.delete();                                   // all LBAs deallocated -> read as zero
+            n_format++;
+            $display("[nvme_ssd_model @%0t] Format NVM done (SES %0d): namespace deallocated", $time, cdw10[11:9]);
+          end
         end
       end
       default: st = mk_status(0, 8'h01);   // Invalid Command Opcode

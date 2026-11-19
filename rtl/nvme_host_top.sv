@@ -26,6 +26,9 @@
 // off.  When cmd_limit_done goes high all commands are complete: raise ctrl_stop (the DRAIN/FLUSH/SHUTDOWN
 // follows) and read vfy_* afterwards.  vfy_* / cmd_limit_done are user_clk domain (board logic must
 // synchronise them; they are static once status_done is set).  ARCHITECTURE.md 5.19.
+// Format NVM.  format_req (async / quasi-static, 2-FF synchronised like verify_mode, defaults to 0 when left
+// unconnected) makes the bring-up issue NVMe Format NVM (SES=0, NSID 1) before the I/O queues are created; it
+// can take ms .. minutes (FORMAT_TIMEOUT_MS = 10 min in nvme_admin).  format_done / format_ms are user_clk.
 // SIM_FAST shortens all "millisecond" timers (microsecond ticks).
 //
 // Sticky link flags.  link_bringup's link_lost / link_fail go straight to the core inputs of the
@@ -69,6 +72,7 @@ module nvme_host_top
   input  logic         ctrl_stop,
   input  logic         verify_mode,           // 1: read back + compare (verify run); async / quasi-static, set before ctrl_start
   input  logic [31:0]  verify_cmds,           // verify run: number of Read commands (SLOT_BYTES each, from START_LBA); 0 = unlimited; quasi-static
+  input  logic         format_req = 1'b0,     // 1: NVMe Format NVM during bring-up (SSD back to "fresh"); async / quasi-static, set before ctrl_start
   output logic         status_link_up,
   output logic         status_gen2,
   output logic         status_enum_done,
@@ -85,7 +89,11 @@ module nvme_host_top
   output logic [31:0]  stat_max_latency,
   output logic [7:0]   status_flags,          // see nvme_host_core.sv: [0] shutdown_timeout .. [7] rx_drop
   output logic [63:0]  stat_first_error_lba,  // SLBA of the first failed Write (status_flags[6])
+  output logic         format_done,           // user_clk: sticky, Format NVM completed OK (cleared at the start of every run)
+  output logic [31:0]  format_ms,             // user_clk: ms the Format NVM took (valid with format_done)
   // verify results (user_clk domain, valid once the run is stopped; cleared at the start of every run)
+  output logic [3:0]   stat_lbads,            // user_clk: LBA size = 1 << stat_lbads (Identify Namespace)
+  output logic [63:0]  stat_nsze,             // user_clk: namespace size in LBAs (capacity = nsze << lbads)
   output logic         cmd_limit_done,        // user_clk: verify_cmds commands submitted and completed -> raise ctrl_stop
   output logic [63:0]  vfy_bytes,             // user_clk: bytes compared
   output logic [31:0]  vfy_err_beats,         // user_clk: 16-byte beats with a mismatch
@@ -199,7 +207,7 @@ module nvme_host_top
   // ===========================================================================
   (* ASYNC_REG = "TRUE" *) logic [1:0] link_ready_sync, link_gen2_sync, ctrl_start_sync, ctrl_stop_sync;
   (* ASYNC_REG = "TRUE" *) logic [1:0] link_width_sync0, link_width_sync1;   // per-bit 2-FF (quasi-static)
-  (* ASYNC_REG = "TRUE" *) logic [1:0] verify_mode_sync;
+  (* ASYNC_REG = "TRUE" *) logic [1:0] verify_mode_sync, format_req_sync;
   (* ASYNC_REG = "TRUE" *) logic [31:0] verify_cmds_sync0, verify_cmds_sync1; // per-bit 2-FF (quasi-static)
   always_ff @(posedge user_clk) begin
     link_ready_sync    <= {link_ready_sync[0],  link_ready_lc};
@@ -209,6 +217,7 @@ module nvme_host_top
     ctrl_start_sync    <= {ctrl_start_sync[0],  ctrl_start};
     ctrl_stop_sync     <= {ctrl_stop_sync[0],   ctrl_stop};
     verify_mode_sync   <= {verify_mode_sync[0], verify_mode};
+    format_req_sync    <= {format_req_sync[0], format_req};
     verify_cmds_sync0  <= verify_cmds;
     verify_cmds_sync1  <= verify_cmds_sync0;
   end
@@ -254,6 +263,7 @@ module nvme_host_top
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
     .ctrl_start(ctrl_start_uc), .ctrl_stop(ctrl_stop_uc),
     .verify_mode(verify_mode_sync[1]), .verify_cmds(verify_cmds_sync1),
+    .format_req(format_req_sync[1]), .format_done(format_done), .format_ms(format_ms),
     .status_link_up(status_link_up), .status_gen2(status_gen2), .status_link_width(status_link_width),
     .status_enum_done(status_enum_done), .status_nvme_ready(status_nvme_ready),
     .status_running(status_running), .status_done(status_done),
@@ -263,7 +273,7 @@ module nvme_host_top
     .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
     .stat_max_latency(stat_max_latency), .stat_last_status(), .stat_next_lba(), .stat_beats_in(),
     .stat_stall_cycles(), .stat_sq_full_stall_cycles(), .stat_unexpected_cpl(),
-    .stat_lbads(), .stat_nsze(), .stat_mdts(),
+    .stat_lbads(stat_lbads), .stat_nsze(stat_nsze), .stat_mdts(),
     .stat_first_error_lba(stat_first_error_lba),
     .cmd_limit_done(cmd_limit_done), .vfy_bytes(vfy_bytes), .vfy_err_beats(vfy_err_beats),
     .vfy_first_err_lba(vfy_first_err_lba), .vfy_first_err_exp(vfy_first_err_exp),

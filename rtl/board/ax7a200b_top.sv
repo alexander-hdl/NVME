@@ -69,6 +69,13 @@ module ax7a200b_top #(
   logic         vio_gen_en;                                  // VIO probe_out3: generator enable (0 after configuration)
   logic [1:0]   vio_len_sel, vio_rate_sel;
   logic         vio_verify;                                  // VIO probe_out6: 1 = verify run (NVMe Read + compare), generator forced off
+  logic [31:0]  vio_rate_step;                               // VIO probe_out7: real-time source rate, R = 2 GB/s * step / 2^32 (0 = rate_sel)
+  logic [31:0]  vio_len_cmds;                                // VIO probe_out8: run length in 128 KiB commands (0 = len_sel)
+  logic         vio_format;                                  // VIO probe_out9: NVMe Format NVM (SES=0) during the next bring-up
+  logic         format_done;
+  logic [31:0]  format_ms;
+  logic [3:0]   stat_lbads;
+  logic [63:0]  stat_nsze;
   logic [31:0]  verify_cmds;                                 // from len_sel: 1 / 8 / 64 GiB of 128 KiB commands, 0 = unlimited
   logic         cmd_limit_done;
   logic [63:0]  vfy_bytes, vfy_first_err_lba;
@@ -116,12 +123,15 @@ module ax7a200b_top #(
     .link_lost(link_lost), .link_fail(link_fail),
     .link_clk_out(link_clk), .user_clk_out(user_clk), .dbg_ltssm_state(dbg_ltssm), .dbg_uc(dbg_uc),
     .verify_mode(vio_verify), .verify_cmds(verify_cmds), .cmd_limit_done(cmd_limit_done),
+    .stat_lbads(stat_lbads), .stat_nsze(stat_nsze),
+    .format_req(vio_format), .format_done(format_done), .format_ms(format_ms),
     .vfy_bytes(vfy_bytes), .vfy_err_beats(vfy_err_beats), .vfy_first_err_lba(vfy_first_err_lba),
     .vfy_first_err_exp(vfy_first_err_exp), .vfy_first_err_got(vfy_first_err_got));
 
   // verify run length = the recording length selected with len_sel (SLOT_BYTES = 128 KiB per command)
   always_ff @(posedge link_clk)
-    verify_cmds <= (vio_len_sel == 2'd0) ? 32'd8192 :      // 1 GiB
+    verify_cmds <= (vio_len_cmds != 32'd0) ? vio_len_cmds :  // explicit length
+                   (vio_len_sel == 2'd0) ? 32'd8192 :      // 1 GiB
                    (vio_len_sel == 2'd1) ? 32'd65536 :     // 8 GiB
                    (vio_len_sel == 2'd2) ? 32'd524288 :    // 64 GiB
                                            32'd0;          // unlimited
@@ -193,6 +203,9 @@ module ax7a200b_top #(
   (* ASYNC_REG = "TRUE" *) logic [191:0] cnt_s0, cnt_s1;    // {max_latency, cmd_errors, cmds_done, bytes_done}
   (* ASYNC_REG = "TRUE" *) logic [79:0]  tm_s0, tm_s1;      // {span_cyc, run_cyc} (user_clk timers, see below)
   (* ASYNC_REG = "TRUE" *) logic [223:0] vfy_s0, vfy_s1;    // verify results (static once the run is done)
+  (* ASYNC_REG = "TRUE" *) logic [67:0]  ns_s0, ns_s1;      // {lbads, nsze}
+  (* ASYNC_REG = "TRUE" *) logic [32:0]  fmt_s0, fmt_s1;    // {format_done, format_ms}
+  (* ASYNC_REG = "TRUE" *) logic [119:0] src_s0, src_s1;    // {due, backlog_now, backlog_max} (beats, 40 bit each)
   always_ff @(posedge link_clk) begin
     ltssm_s0 <= dbg_ltssm;
     ltssm_s1 <= ltssm_s0;
@@ -205,6 +218,12 @@ module ax7a200b_top #(
     tm_s1    <= tm_s0;
     vfy_s0   <= {vfy_first_err_exp, vfy_first_err_got, vfy_first_err_lba, vfy_err_beats, vfy_bytes};
     vfy_s1   <= vfy_s0;
+    ns_s0    <= {stat_lbads, stat_nsze};
+    ns_s1    <= ns_s0;
+    fmt_s0   <= {format_done, format_ms};
+    fmt_s1   <= fmt_s0;
+    src_s0   <= {due_cnt, backlog_q, backlog_max};
+    src_s1   <= src_s0;
   end
 
   vio_status u_vio (
@@ -226,13 +245,22 @@ module ax7a200b_top #(
     .probe_in14(vfy_s1[159:96]),                                                          // 64 vfy_first_err_lba
     .probe_in15(vfy_s1[223:160]),                                                         // 64 {first_err_exp, first_err_got}
     .probe_in16({vio_verify, lim_sync[1]}),                                               // 2 {verify mode, cmd_limit_done}
+    .probe_in17(ns_s1[63:0]),                                                             // 64 namespace size (LBAs)
+    .probe_in18(ns_s1[67:64]),                                                            // 4 lbads
+    .probe_in19(src_s1[39:0]),                                                            // 40 backlog_max (beats of 16 B)
+    .probe_in20(src_s1[79:40]),                                                           // 40 backlog now (beats)
+    .probe_in21(src_s1[119:80]),                                                          // 40 beats produced by the source (due)
+    .probe_in22(fmt_s1),                                                                  // 33 {format_done, format_ms}
     .probe_out0(vio_rst),                                                                 // 1 board reset (hold high)
     .probe_out1(vio_start),                                                               // 1 START
     .probe_out2(vio_stop),                                                                // 1 STOP
     .probe_out3(vio_gen_en),                                                              // 1 generator enable
     .probe_out4(vio_len_sel),                                                             // 2 length select
     .probe_out5(vio_rate_sel),                                                            // 2 rate select
-    .probe_out6(vio_verify));                                                             // 1 verify run
+    .probe_out6(vio_verify),                                                              // 1 verify run
+    .probe_out7(vio_rate_step),                                                           // 32 real-time source rate step
+    .probe_out8(vio_len_cmds),                                                            // 32 run length in commands
+    .probe_out9(vio_format));                                                             // 1 Format NVM at the next bring-up
 
   logic [25:0] hb_cnt;
   always_ff @(posedge link_clk) hb_cnt <= hb_cnt + 1'b1;      // free running, no reset needed
@@ -295,13 +323,16 @@ module ax7a200b_top #(
   end
 
   // rate / length select from the VIO (quasi-static, set before START)
-  (* ASYNC_REG = "TRUE" *) logic [3:0] sel_s0, sel_s1;
+  (* ASYNC_REG = "TRUE" *) logic [67:0] sel_s0, sel_s1;
   logic [1:0]  rate_sel, len_sel;
+  logic [31:0] rate_step, len_cmds;
   always_ff @(posedge user_clk) begin
-    sel_s0 <= {vio_len_sel, vio_rate_sel};
+    sel_s0 <= {vio_len_cmds, vio_rate_step, vio_len_sel, vio_rate_sel};
     sel_s1 <= sel_s0;
   end
-  assign {len_sel, rate_sel} = sel_s1;
+  assign {len_cmds, rate_step, len_sel, rate_sel} = sel_s1;
+  logic rt_mode;                                   // real-time source model (rate_step != 0)
+  assign rt_mode = (rate_step != 32'd0);
 
   logic [2:0] phase;
   logic       tick;
@@ -314,17 +345,56 @@ module ax7a200b_top #(
     endcase
   end
 
-  logic [32:0] limit_q;
-  always_ff @(posedge user_clk)
-    limit_q <= (len_sel == 2'd0) ? (33'd1 << 26) :   // 1 GiB  = 2^26 beats of 16 B
-               (len_sel == 2'd1) ? (33'd1 << 29) :   // 8 GiB
-                                   (33'd1 << 32);    // 64 GiB
-  logic [32:0] sent;
+  logic [39:0] limit_q;
+  logic        unlimited_q;
+  always_ff @(posedge user_clk) begin
+    limit_q <= (len_cmds != 32'd0) ? ({8'd0, len_cmds} << 13) :   // len_cmds x 128 KiB = x 8192 beats
+               (len_sel == 2'd0)   ? (40'd1 << 26) :              // 1 GiB  = 2^26 beats of 16 B
+               (len_sel == 2'd1)   ? (40'd1 << 29) :              // 8 GiB
+                                     (40'd1 << 32);               // 64 GiB
+    unlimited_q <= (len_cmds == 32'd0) && (len_sel == 2'd3);
+  end
+  logic [39:0] sent;
   logic at_limit, can_send;
-  assign at_limit = (len_sel != 2'd3) && (sent == limit_q);
+  assign at_limit = !unlimited_q && (sent == limit_q);
+
+  // ---- real-time source model (rate_step != 0) -----------------------------------------------------------
+  // A real sensor cannot wait.  The source "produces" one 16-byte beat whenever the phase accumulator
+  // overflows (R = 16 B x 125 MHz x step / 2^32 = 2 GB/s x step / 2^32, resolution ~0.47 B/s) and counts it
+  // in due_cnt.  The generator hands beats to the host as fast as s_data_tready allows; the beats produced but
+  // not yet taken (backlog = due_cnt - sent) are what an extra FIFO in front of the host would have to hold.
+  // backlog_max x 16 B is therefore the memory a lossless recorder needs IN ADDITION to the on-chip ring
+  // (N_SLOTS x 128 KiB + the data_ring async FIFO) at this rate on this SSD.
+  logic [31:0] acc;
+  logic        acc_c;
+  logic [39:0] due_cnt, backlog_q, backlog_max;
+  logic        src_on;
+  // The source starts with the recording (sequencer in RUN), as a real sensor is enabled once the recorder is
+  // ready; otherwise the bring-up time (enumeration + NVMe init, ~0.1 s) would show up as backlog.
+  logic run_seen;
+  always_ff @(posedge user_clk)
+    if (urst) run_seen <= 1'b0; else if (status_running) run_seen <= 1'b1;
+  assign src_on = gen_en_sync[1] && run_seen && !halt && (unlimited_q || (due_cnt != limit_q));
+  always_ff @(posedge user_clk) begin
+    if (urst) begin
+      acc         <= '0;
+      acc_c       <= 1'b0;
+      due_cnt     <= '0;
+      backlog_q   <= '0;
+      backlog_max <= '0;
+    end else begin
+      if (rt_mode && src_on) {acc_c, acc} <= {1'b0, acc} + {1'b0, rate_step};
+      else                   acc_c <= 1'b0;
+      if (acc_c) due_cnt <= due_cnt + 40'd1;
+      backlog_q <= due_cnt - sent;                               // stage 1: subtract
+      if (backlog_q > backlog_max) backlog_max <= backlog_q;     // stage 2: compare
+    end
+  end
+
   // gen_en = 0: no beat is produced, the ring stays empty and RUN submits no Write (bring-up test without
   // touching the SSD contents).  With the VIO it starts at 0; set it to 1 BEFORE START for a recording.
-  assign can_send = gen_en_sync[1] && !halt && !at_limit;
+  // rt_mode: a beat may be handed over only if the source has produced it (due_cnt > sent).
+  assign can_send = gen_en_sync[1] && !halt && !at_limit && (!rt_mode || (due_cnt != sent));
 
   logic [31:0]  n, n7;
   logic         gen_valid;
@@ -338,12 +408,12 @@ module ax7a200b_top #(
       n7        <= '0;
       sent      <= '0;
     end else if (!gen_valid || s_data_tready) begin
-      if (can_send && tick) begin
+      if (can_send && (rt_mode || tick)) begin
         gen_valid <= 1'b1;
         gen_data  <= {~n, n ^ 32'hA5A5A5A5, n7, n};
         n         <= n + 32'd1;
         n7        <= n7 + 32'd7;
-        sent      <= sent + 33'd1;
+        sent      <= sent + 40'd1;
       end else begin
         gen_valid <= 1'b0;
       end

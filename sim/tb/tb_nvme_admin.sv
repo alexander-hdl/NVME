@@ -44,6 +44,8 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   // DUT
   // --------------------------------------------------------------------------
   logic        start_init, init_done, init_fail;
+  logic        format_req, format_done;
+  logic [31:0] format_ms;
   logic [7:0]  fail_step;
   logic [15:0] cqe_status_last;
   logic        start_shutdown, shutdown_done, shutdown_timeout;
@@ -72,9 +74,10 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   logic [7:0]   ident_rd_addr;
   logic [127:0] ident_rd_data;
 
-  nvme_admin #(.RDY_TIMEOUT_MS_MAX(40), .ADMIN_TIMEOUT_MS(30), .SHUTDOWN_TIMEOUT_MS(20)) dut (
+  nvme_admin #(.RDY_TIMEOUT_MS_MAX(40), .ADMIN_TIMEOUT_MS(30), .SHUTDOWN_TIMEOUT_MS(20), .FORMAT_TIMEOUT_MS(100)) dut (
     .clk(clk), .rst(rst), .tick_ms(tick_ms),
-    .start_init(start_init), .init_done(init_done), .init_fail(init_fail), .fail_step(fail_step),
+    .start_init(start_init), .format_req(format_req), .format_done(format_done), .format_ms(format_ms),
+    .init_done(init_done), .init_fail(init_fail), .fail_step(fail_step),
     .cqe_status_last(cqe_status_last),
     .start_shutdown(start_shutdown), .shutdown_done(shutdown_done), .shutdown_timeout(shutdown_timeout),
     .lbads(lbads), .nsze(nsze), .mdts(mdts), .dstrd(dstrd), .vwc(vwc),
@@ -111,6 +114,8 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   int          cfg_drop_cmd  = -1;    // command index whose CQE is never posted
   bit          cfg_bad_qes   = 0;     // SQES=0x55
   bit          cfg_shn_never = 0;     // SHST never reaches 10b
+  bit          cfg_format    = 0;     // format_req (Format NVM between Identify NS and Set Features)
+  int          cfg_fmt_ms    = 50;    // model: Format NVM completion delay in "ms" (> ADMIN_TIMEOUT_MS = 30 on purpose)
   int          cfg_flbas     = 0;     // FLBAS (format index)
   int          cfg_ms        = 0;     // metadata size of the selected LBAF
   int          cfg_lbads     = 9;     // LBADS of the selected LBAF
@@ -118,6 +123,9 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   int          cfg_sqes      = 8'h66; // SQES byte (when cfg_bad_qes = 0)
   int          cfg_cqes      = 8'h44; // CQES byte
   bit          cfg_rdy_stale = 0;     // power-up with CC.EN = 0 but CSTS.RDY = 1 (reset still running)
+
+  assign format_req = cfg_format;
+  function automatic int n_init_cmds(); return cfg_format ? 6 : 5; endfunction
 
   localparam logic [63:0] NSZE_VALUE = 64'h0000_0000_7470_0000;
 
@@ -212,17 +220,28 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   logic [31:0] wlog_data [$];
 
   // ----- expected SQE content -----
+  // kind: 0 IdentCtrl, 1 IdentNS, 2 SetFeat, 3 CreateCQ, 4 CreateSQ, 5 DeleteSQ, 6 DeleteCQ, 7 Format
+  function automatic int cmd_kind_of(input int idx);
+    int n = n_init_cmds();
+    if (idx >= n)                  return 5 + (idx - n);
+    if (cfg_format && idx == 2)    return 7;
+    if (cfg_format && idx > 2)     return idx - 1;
+    return idx;
+  endfunction
+
   function automatic logic [511:0] expected_sqe(input int idx);
     logic [511:0] s;
     s = '0;
-    case (idx)
-      0: begin s[31:0] = {16'd0, 8'h00, 8'h06}; s[191+32:192] = IDENT_BASE; s[32*10+:32] = 32'h1; end
-      1: begin s[31:0] = {16'd1, 8'h00, 8'h06}; s[63:32] = 32'h1; s[32*6+:32] = IDENT_BASE; s[32*10+:32] = 32'h0; end
-      2: begin s[31:0] = {16'd2, 8'h00, 8'h09}; s[32*10+:32] = 32'h7; end
-      3: begin s[31:0] = {16'd3, 8'h00, 8'h05}; s[32*6+:32] = 32'h1000_4000; s[32*10+:32] = 32'h003F_0001; s[32*11+:32] = 32'h1; end
-      4: begin s[31:0] = {16'd4, 8'h00, 8'h01}; s[32*6+:32] = 32'h1000_3000; s[32*10+:32] = 32'h003F_0001; s[32*11+:32] = 32'h0001_0001; end
-      5: begin s[31:0] = {16'd5, 8'h00, 8'h00}; s[32*10+:32] = 32'h1; end
-      6: begin s[31:0] = {16'd6, 8'h00, 8'h04}; s[32*10+:32] = 32'h1; end
+    case (cmd_kind_of(idx))
+      0: begin s[31:0] = {16'(idx), 8'h00, 8'h06}; s[191+32:192] = IDENT_BASE; s[32*10+:32] = 32'h1; end
+      1: begin s[31:0] = {16'(idx), 8'h00, 8'h06}; s[63:32] = 32'h1; s[32*6+:32] = IDENT_BASE; s[32*10+:32] = 32'h0; end
+      2: begin s[31:0] = {16'(idx), 8'h00, 8'h09}; s[32*10+:32] = 32'h7; end
+      3: begin s[31:0] = {16'(idx), 8'h00, 8'h05}; s[32*6+:32] = 32'h1000_4000; s[32*10+:32] = 32'h003F_0001; s[32*11+:32] = 32'h1; end
+      4: begin s[31:0] = {16'(idx), 8'h00, 8'h01}; s[32*6+:32] = 32'h1000_3000; s[32*10+:32] = 32'h003F_0001; s[32*11+:32] = 32'h0001_0001; end
+      5: begin s[31:0] = {16'(idx), 8'h00, 8'h00}; s[32*10+:32] = 32'h1; end
+      6: begin s[31:0] = {16'(idx), 8'h00, 8'h04}; s[32*10+:32] = 32'h1; end
+      // Format NVM: OPC 80h, NSID 1, CDW10 = LBAF (= FLBAS[3:0]), MSET/PI/PIL/SES = 0, no PRP
+      7: begin s[31:0] = {16'(idx), 8'h00, 8'h80}; s[63:32] = 32'h1; s[32*10+:32] = 32'(cfg_flbas & 15); end
       default: ;
     endcase
     return s;
@@ -431,7 +450,8 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
                       cqe_stat  <= (cmd_idx == cfg_err_cmd) ? 15'h0002 : 15'h0;
                       cqe_dw0   <= 32'h0;
                       cqe_pend  <= (cmd_idx != cfg_drop_cmd);
-                      cqe_delay <= (REAL_RAMS ? 300 : 6) + ($urandom % 10);   // REAL_RAMS: let the Identify burst finish first
+                      cqe_delay <= (cmd_kind_of(cmd_idx) == 7) ? (cfg_fmt_ms * TICK_PERIOD + ($urandom % 10))
+                                                               : ((REAL_RAMS ? 300 : 6) + ($urandom % 10));   // REAL_RAMS: let the Identify burst finish first
                       cmd_idx   <= cmd_idx + 1;
                     end else begin
                       // ------------- CQ0 head doorbell -------------
@@ -543,7 +563,7 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     exp_w(NVME_ACQ_HI, 32'h0);
     exp_w(NVME_CC,     CC_CONFIG);
     exp_w(NVME_CC,     CC_ENABLE);
-    for (int i = 0; i < 5; i++) begin
+    for (int i = 0; i < n_init_cmds(); i++) begin
       exp_w(16'(sqdb), 32'(i + 1));
       exp_w(16'(cqdb), 32'(i + 1));
     end
@@ -555,10 +575,10 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     int cqdb = 16'h1000 + (4 << cfg_dstrd);
     check(wlog_off.size() == base + 5, $sformatf("shutdown log size %0d expected %0d", wlog_off.size(), base + 5));
     if (wlog_off.size() >= base + 5) begin
-      check(wlog_off[base+0] == 16'(sqdb) && wlog_data[base+0] == 32'd6, "shutdown: SQ db (delete SQ)");
-      check(wlog_off[base+1] == 16'(cqdb) && wlog_data[base+1] == 32'd6, "shutdown: CQ db (delete SQ)");
-      check(wlog_off[base+2] == 16'(sqdb) && wlog_data[base+2] == 32'd7, "shutdown: SQ db (delete CQ)");
-      check(wlog_off[base+3] == 16'(cqdb) && wlog_data[base+3] == 32'd7, "shutdown: CQ db (delete CQ)");
+      check(wlog_off[base+0] == 16'(sqdb) && wlog_data[base+0] == 32'(n_init_cmds()+1), "shutdown: SQ db (delete SQ)");
+      check(wlog_off[base+1] == 16'(cqdb) && wlog_data[base+1] == 32'(n_init_cmds()+1), "shutdown: CQ db (delete SQ)");
+      check(wlog_off[base+2] == 16'(sqdb) && wlog_data[base+2] == 32'(n_init_cmds()+2), "shutdown: SQ db (delete CQ)");
+      check(wlog_off[base+3] == 16'(cqdb) && wlog_data[base+3] == 32'(n_init_cmds()+2), "shutdown: CQ db (delete CQ)");
       check(wlog_off[base+4] == NVME_CC   && wlog_data[base+4] == CC_SHUTDOWN, "shutdown: CC write");
     end
   endtask
@@ -566,7 +586,7 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   task automatic reset_knobs();
     cfg_dstrd = 0; cfg_css = 1; cfg_init_en = 0; cfg_rdy_never = 0; cfg_cfs = 0;
     cfg_err_cmd = -1; cfg_drop_cmd = -1; cfg_bad_qes = 0; cfg_shn_never = 0;
-    cfg_flbas = 0; cfg_ms = 0; cfg_lbads = 9;
+    cfg_flbas = 0; cfg_ms = 0; cfg_lbads = 9; cfg_format = 0; cfg_fmt_ms = 50;
     cfg_mdts = 5; cfg_sqes = 8'h66; cfg_cqes = 8'h44; cfg_rdy_stale = 0;
   endtask
 
@@ -598,6 +618,7 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     check(vwc == 1'b1, "T1: vwc");
     check(cqe_status_last == 16'h0, "T1: cqe_status_last");
     check(cmd_idx == 5, "T1: five admin commands");
+    check(!format_done && format_ms == 0, "T1: no Format without format_req");
     check_init_log(1'b1);
     begin
       base = wlog_off.size();
@@ -764,6 +785,81 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
       check(!saw_fail_in_start_cycle, "T15: init_fail/init_done still high in the cycle of start_init");
     end
     repeat (5) @(posedge clk);
+
+    // ---- T16: Format NVM (SES=0, LBAF = FLBAS = 3) between Identify NS and Set Features, 50 ms > ADMIN_TIMEOUT_MS ----
+    $display("T16: Format NVM, success");
+    reset_knobs(); cfg_format = 1; cfg_flbas = 3; cfg_lbads = 12;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done && !init_fail, "T16: init_done");
+    check(format_done, "T16: format_done");
+    check(format_ms >= 32'(cfg_fmt_ms - 1) && format_ms <= 32'(cfg_fmt_ms + 3), $sformatf("T16: format_ms %0d", format_ms));
+    check(cmd_idx == 6, "T16: six admin commands");
+    check(lbads == 4'd12 && nsze == NSZE_VALUE, "T16: lbads / nsze kept");
+    check_init_log(1'b0);                 // also checks the SQE of every command incl. Format
+    begin
+      base = wlog_off.size();
+      pulse_start_shutdown();
+      wait_shutdown(400000);
+      check(shutdown_done && !shutdown_timeout, "T16: shutdown ok");
+      check(cmd_idx == 8, "T16: two delete commands");
+      check_shutdown_log(base);
+    end
+    $display("  T16 -> format_done, format_ms=%0d", format_ms);
+
+    // ---- T17: Format with a fast completion (format_ms ~ 0) and FLBAS 0 ----
+    $display("T17: Format NVM, fast");
+    reset_knobs(); cfg_format = 1; cfg_fmt_ms = 0;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done && !init_fail && format_done, "T17: init_done + format_done");
+    check(format_ms <= 32'd2, "T17: format_ms small");
+    check_init_log(1'b0);
+
+    // ---- T18: Format completes with an error status ----
+    $display("T18: Format NVM error status");
+    reset_knobs(); cfg_format = 1; cfg_err_cmd = 2;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    expect_fail("T18", 8'h15);
+    check(!format_done, "T18: format_done must stay 0");
+    check(cqe_status_last == 16'h0002, "T18: cqe_status_last");
+    check(cmd_idx == 3, "T18: init stopped after Format");
+
+    // ---- T19: Format CQE never arrives -> FORMAT_TIMEOUT_MS (100), not the admin timeout (30) ----
+    $display("T19: Format NVM timeout");
+    reset_knobs(); cfg_format = 1; cfg_drop_cmd = 2;
+    do_reset();
+    pulse_start_init();
+    begin
+      automatic int n = 0;
+      while (!init_fail && n < 20000) begin @(posedge clk); n++; end
+      check(n > 30 * TICK_PERIOD + 400 && n < 20000, $sformatf("T19: gave up after only %0d clocks (admin timeout used?)", n));
+    end
+    expect_fail("T19", 8'h16);
+    check(!format_done, "T19: format_done must stay 0");
+
+    // ---- T20: format_done / format_ms are cleared by the next init start ----
+    $display("T20: format_done cleared at start_init");
+    reset_knobs(); cfg_format = 1; cfg_fmt_ms = 2;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(format_done, "T20: precondition format_done");
+    begin   // init flags of the controller model are not reusable: a second init is only checked for the clear
+      @(posedge clk);
+      cfg_format = 0;
+      start_init <= 1'b1;
+      @(posedge clk);
+      start_init <= 1'b0;
+      @(posedge clk);
+      check(!format_done && format_ms == 0, "T20: format_done/format_ms not cleared at start_init");
+    end
+    do_reset();                           // abandon the second init (the controller model is not re-armed)
+    repeat (20) @(posedge clk);
 
     // ---- done ----
     repeat (20) @(posedge clk);

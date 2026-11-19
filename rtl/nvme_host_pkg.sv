@@ -64,7 +64,8 @@ package nvme_host_pkg;
 
   // Admin opcodes
   localparam logic [7:0] AOPC_DELETE_SQ = 8'h00, AOPC_CREATE_SQ = 8'h01, AOPC_DELETE_CQ = 8'h04,
-                         AOPC_CREATE_CQ = 8'h05, AOPC_IDENTIFY = 8'h06, AOPC_SET_FEATURES = 8'h09;
+                         AOPC_CREATE_CQ = 8'h05, AOPC_IDENTIFY = 8'h06, AOPC_SET_FEATURES = 8'h09,
+                         AOPC_FORMAT_NVM = 8'h80;
   // NVM command set opcodes
   localparam logic [7:0] NOPC_FLUSH = 8'h00, NOPC_WRITE = 8'h01, NOPC_READ = 8'h02;
 
