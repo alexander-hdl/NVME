@@ -160,6 +160,36 @@ if {!$regen_ip && [file exists $xci_repo]} {
     if {$ip_cfg_errors > 0} { error "pcie_7x_0 configuration failed ($ip_cfg_errors problem(s)), see ERROR lines above" }
 }
 
+# ---------------------------------------------------------------------------
+# 2b. ax7a200b only: VIO for JTAG status / remote START-STOP (rtl/board/ax7a200b_top.sv, u_vio)
+# ---------------------------------------------------------------------------
+if {$board eq "ax7a200b"} {
+    set vio_xci [file join $repo_root fpga ip vio_status_a7 vio_status.xci]
+    if {!$regen_ip && [file exists $vio_xci]} {
+        import_ip $vio_xci
+    } else {
+        create_ip -name vio -vendor xilinx.com -library ip -module_name vio_status -dir $ip_dir
+        set_property -dict [list CONFIG.C_NUM_PROBE_IN 10 CONFIG.C_NUM_PROBE_OUT 4             CONFIG.C_PROBE_IN0_WIDTH 8  CONFIG.C_PROBE_IN1_WIDTH 16  CONFIG.C_PROBE_IN2_WIDTH 8             CONFIG.C_PROBE_IN3_WIDTH 2  CONFIG.C_PROBE_IN4_WIDTH 7  CONFIG.C_PROBE_IN5_WIDTH 6             CONFIG.C_PROBE_IN6_WIDTH 64 CONFIG.C_PROBE_IN7_WIDTH 64 CONFIG.C_PROBE_IN8_WIDTH 32             CONFIG.C_PROBE_IN9_WIDTH 32             CONFIG.C_PROBE_OUT0_WIDTH 1 CONFIG.C_PROBE_OUT1_WIDTH 1 CONFIG.C_PROBE_OUT2_WIDTH 1 CONFIG.C_PROBE_OUT3_WIDTH 1] [get_ips vio_status]
+        file mkdir [file dirname $vio_xci]
+        file copy -force [get_property IP_FILE [get_ips vio_status]] $vio_xci
+    }
+    generate_target all [get_ips vio_status]
+    catch { create_ip_run [get_ips vio_status] }
+
+    # ILA on user_clk (u_ila): 304-bit debug bus of nvme_host_top, 4096 samples
+    set ila_xci [file join $repo_root fpga ip ila_pcie_a7 ila_pcie.xci]
+    if {!$regen_ip && [file exists $ila_xci]} {
+        import_ip $ila_xci
+    } else {
+        create_ip -name ila -vendor xilinx.com -library ip -module_name ila_pcie -dir $ip_dir
+        set_property -dict [list CONFIG.C_NUM_OF_PROBES 1 CONFIG.C_PROBE0_WIDTH 304 CONFIG.C_DATA_DEPTH 4096 CONFIG.C_TRIGIN_EN false CONFIG.C_ADV_TRIGGER false] [get_ips ila_pcie]
+        file mkdir [file dirname $ila_xci]
+        file copy -force [get_property IP_FILE [get_ips ila_pcie]] $ila_xci
+    }
+    generate_target all [get_ips ila_pcie]
+    catch { create_ip_run [get_ips ila_pcie] }
+}
+
 # generate everything (synthesis sources, instantiation template, simulation, constraints) and
 # make the IP synthesise out-of-context in its own run
 generate_target all $ip

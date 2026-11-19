@@ -80,7 +80,10 @@ module nvme_host_top
   output logic         link_lost,             // link_clk domain, sticky (same signal that feeds the core)
   output logic         link_fail,             // link_clk domain, sticky; valid while user_clk is dead
   output logic         link_clk_out,          // free-running 200 MHz link_clk (BUFG output)
-  output logic         user_clk_out
+  output logic         user_clk_out,
+  output logic [5:0]   dbg_ltssm_state,       // debug: pl_ltssm_state of the core (pipe clock domain, raw)
+  // debug bus, user_clk domain (for an ILA): see the assignment below for the bit map
+  output logic [303:0] dbg_uc
 );
 
   // ===========================================================================
@@ -148,6 +151,19 @@ module nvme_host_top
   assign link_fail = link_fail_lc;
 
   assign link_clk_out = link_clk;
+  assign dbg_ltssm_state = pl_ltssm_state;
+
+  // ---- debug bus (user_clk) ----------------------------------------------------------------------------
+  //  [3:0] host_sequencer state  [4] user_reset  [5] user_lnk_up
+  //  [6] tx_tvalid [7] tx_tready [8] tx_tlast  [9] rx_tvalid [10] rx_tready [11] rx_tlast  [17:12] tx_buf_av
+  //  [18] cfg_mgmt_rd_en [19] cfg_mgmt_wr_en [20] cfg_mgmt_rd_wr_done [21] rx_np_ok [23:22] 0
+  //  [151:24] s_axis_tx_tdata  [279:152] m_axis_rx_tdata  [301:280] m_axis_rx_tuser  [303:302] 0
+  logic [3:0] dbg_seq_state;
+  assign dbg_uc = {2'b00, m_axis_rx_tuser, m_axis_rx_tdata, s_axis_tx_tdata, 2'b00, rx_np_ok,
+                   cfg_mgmt_rd_wr_done, cfg_mgmt_wr_en, cfg_mgmt_rd_en, tx_buf_av,
+                   m_axis_rx_tlast, m_axis_rx_tready, m_axis_rx_tvalid,
+                   s_axis_tx_tlast, s_axis_tx_tready, s_axis_tx_tvalid,
+                   user_lnk_up, user_reset, dbg_seq_state};
 
   link_bringup #(
     .CLK_HZ(LINK_CLK_HZ), .SIM_FAST(SIM_FAST)
@@ -220,7 +236,7 @@ module nvme_host_top
     .status_enum_done(status_enum_done), .status_nvme_ready(status_nvme_ready),
     .status_running(status_running), .status_done(status_done),
     .status_error(status_error), .status_error_detail(status_error_detail),
-    .status_seq_state(), .status_lba_range_err(status_lba_range_err), .status_shutdown_timeout(),
+    .status_seq_state(dbg_seq_state), .status_lba_range_err(status_lba_range_err), .status_shutdown_timeout(),
     .status_flags(status_flags),
     .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
     .stat_max_latency(stat_max_latency), .stat_last_status(), .stat_next_lba(), .stat_beats_in(),

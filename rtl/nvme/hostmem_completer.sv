@@ -206,7 +206,7 @@ module hostmem_completer
   logic [$clog2(REQ_DEPTH):0] reqf_count;
   logic         p_valid;                   // decoded-request register P holds a request
   logic         r_valid;                   // raw-header register R holds a request
-  logic [127:0] r_tdata;
+  (* keep = "true" *) logic [127:0] r_tdata;   // keep: stops synthesis from moving R onto the RAM read address
   logic         r_take;                    // R -> P this cycle
 
   axis_fifo_sync #(.W(128), .UW(2), .DEPTH(REQ_DEPTH)) u_reqf (

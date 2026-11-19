@@ -204,3 +204,19 @@ FIFO of `hostmem_completer` read combinationally into decode logic) -> output `a
 register P in the completer: −0.477 ns / 46 -> raw register R in front of the decode: −0.040 ns / 6 (R's load enable
 depended on the W/P chain) -> R loads only when empty: **+0.098 ns**. ARCHITECTURE.md v1.2 documents both changes. DRC:
 the same REQP-1839 / REQP-181 / RTSTAT-10 warnings as on the KC705. The margin is thin: re-check after every RTL change.
+
+### Stand debug (2026-11-19)
+
+`ax7a200b_top` carries a VIO (`vio_status`, `link_clk`: status, LTSSM, PERST# pin, counters, remote RESET / START / STOP,
+generator enable `gen_en`, 0 after configuration) and an ILA (`ila_pcie`, `user_clk`, 304 bit x 4096: `nvme_host_top.dbg_uc` =
+sequencer state, TX/RX handshakes and data of the pcie_7x AXI-S). `PERST_DRIVE = 0` (default): L16 is an input, the SSD reset
+comes from the adapter (XP1 joins PERST_M2#, PERST_HOST# and SYS_RESET#). Build with
+`-tclargs bit board=ax7a200b strategy=Performance_ExplorePostRoutePhysOpt` (default strategy: up to -0.9 ns with the debug cores);
+WNS +0.211 ns. `build.tcl` new options: `strategy=<name>`, `impl_only`; it copies `ax7a200b_top.ltx` next to the bitstream.
+
+```
+vivado -mode batch -nojournal -nolog -source fpga/tools/hw_status.tcl -tclargs program gen_off watch=3 start watch=5 stop status
+vivado -mode batch -nojournal -nolog -source fpga/tools/hw_status.tcl -tclargs capture_enum      # ILA -> fpga/build/ila_capture.csv
+python fpga/tools/ila_decode.py fpga/build/ila_capture.csv
+```
+

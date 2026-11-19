@@ -31,7 +31,7 @@ set_property PACKAGE_PIN E10 [get_ports sys_clk_n]
 # ---------------------------------------------------------------------------
 set_property PACKAGE_PIN L16      [get_ports pcie_perst_n]      ;# PCIE_PERST (edge A11)
 set_property IOSTANDARD LVCMOS33  [get_ports pcie_perst_n]
-set_property DRIVE 8              [get_ports pcie_perst_n]
+set_property DRIVE 8              [get_ports pcie_perst_n]      ;# used only with PERST_DRIVE = 1 (inout port)
 set_property SLEW SLOW            [get_ports pcie_perst_n]
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ set_property IOSTANDARD LVCMOS33 [get_ports uart_tx]
 # ---------------------------------------------------------------------------
 # Asynchronous / static user I/O
 # ---------------------------------------------------------------------------
-set_false_path -from [get_ports {rst_key_n key_n[*]}]
+set_false_path -from [get_ports {rst_key_n key_n[*] pcie_perst_n}]
 set_false_path -to   [get_ports {led_n[*] pcie_perst_n uart_tx}]
 set_false_path -to   [get_cells -hier -filter {ASYNC_REG == TRUE}]
 

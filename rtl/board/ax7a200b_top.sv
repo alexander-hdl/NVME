@@ -23,6 +23,10 @@
 // encoding as kc705_top's DIP switches).  The test pattern is identical to kc705_top / sim/tb/tb_top.sv:
 //   beat n = { ~n, n ^ 32'hA5A5A5A5, n * 7, n }, START_LBA = 0, check with fpga/tools/check_pattern.py.
 //
+// Debug: VIO core `vio_status` (IP fpga/ip/vio_status_a7/, clocked by link_clk) shows every status bit, the LTSSM state and
+// the statistic counters over JTAG (fpga/tools/hw_status.tcl) and adds remote START / STOP / reset buttons.  Wide counters
+// are captured per bit through 2 FFs from user_clk: a value may be torn while it changes (display only).
+//
 // NOTE: the generator below is a copy of the one in kc705_top (trial build); it will move into a shared
 // rtl/board/pattern_gen.sv.  kc705_debounce is reused from kc705_top.sv.
 // =============================================================================
@@ -31,7 +35,11 @@ module ax7a200b_top #(
   parameter int unsigned DEBOUNCE_BITS = 21,       // 2^21 link_clk cycles (200 MHz) = 10.5 ms
   parameter int unsigned N_SLOTS       = 4,        // 4 x 128 KiB ring: enough for Gen2 x2 (architecture doc 4.3)
   parameter logic [1:0]  GEN_RATE_SEL  = 2'd0,     // 0 full, 1 1/2, 2 1/4, 3 1/8
-  parameter logic [1:0]  GEN_LEN_SEL   = 2'd0      // 0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited
+  parameter logic [1:0]  GEN_LEN_SEL   = 2'd0,     // 0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited
+  // PERST# on L16 (edge A11): 0 = OBSERVE only (pin is an input; the SSD reset comes from the adapter's
+  // SYS_RESET# supervisor / button SA1 via XP1 = PERST_M2# + PERST_HOST# + SYS_RESET#; link_bringup's PERST#
+  // pulses then have no effect), 1 = DRIVE (Root Port drives PERST# through A11; XP1 = PERST_M2# <-> PERST_HOST# only)
+  parameter bit          PERST_DRIVE   = 1'b0
 ) (
   // ---- clocks ----
   input  logic         sys_clk_p,            // 100 MHz PCIe refclk from the slot (adapter Si52142), MGTREFCLK1_216
@@ -39,7 +47,7 @@ module ax7a200b_top #(
   input  logic         free_clk_p,           // AC7A200 SYS_CLK 200 MHz (bank 34)
   input  logic         free_clk_n,
   // ---- PCIe ----
-  output logic         pcie_perst_n,         // L16 -> edge A11 -> adapter XP1 -> M.2 PERST#
+  inout  wire          pcie_perst_n,         // L16 <-> edge A11 <-> adapter XP1 <-> M.2 PERST# (see PERST_DRIVE)
   output logic [3:0]   pci_exp_txp,
   output logic [3:0]   pci_exp_txn,
   input  logic [3:0]   pci_exp_rxp,
@@ -57,7 +65,9 @@ module ax7a200b_top #(
   // nvme_host_top
   // ===========================================================================
   logic         board_rst_n;
-  assign board_rst_n = rst_key_n;
+  logic         vio_rst, vio_start, vio_stop;                // VIO probe_out (link_clk)
+  logic         vio_gen_en;                                  // VIO probe_out3: generator enable (0 after configuration)
+  assign board_rst_n = rst_key_n & ~vio_rst;
 
   logic         link_clk, user_clk;
   logic         ctrl_start, ctrl_stop;
@@ -70,6 +80,13 @@ module ax7a200b_top #(
   logic         status_lba_range_err;
   logic [31:0]  stat_cmd_errors;
   logic         link_lost, link_fail;
+  logic [63:0]  stat_bytes_done, stat_cmds_done;
+  logic [31:0]  stat_max_latency;
+  logic [5:0]   dbg_ltssm;
+  logic         host_perst_n;                                // PERST# requested by link_bringup
+  logic [303:0] dbg_uc;                                      // user_clk debug bus -> ILA
+
+  assign pcie_perst_n = PERST_DRIVE ? host_perst_n : 1'bz;
 
   nvme_host_top #(
     .N_SLOTS(N_SLOTS),
@@ -77,7 +94,7 @@ module ax7a200b_top #(
   ) u_host (
     .sys_clk_p(sys_clk_p), .sys_clk_n(sys_clk_n),
     .free_clk_p(free_clk_p), .free_clk_n(free_clk_n),
-    .board_rst_n(board_rst_n), .pcie_perst_n(pcie_perst_n),
+    .board_rst_n(board_rst_n), .pcie_perst_n(host_perst_n),
     .pci_exp_txp(pci_exp_txp), .pci_exp_txn(pci_exp_txn), .pci_exp_rxp(pci_exp_rxp), .pci_exp_rxn(pci_exp_rxn),
     .data_clk(user_clk),
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
@@ -86,10 +103,14 @@ module ax7a200b_top #(
     .status_nvme_ready(status_nvme_ready), .status_running(status_running), .status_done(status_done),
     .status_error(status_error), .status_error_detail(status_error_detail),
     .status_link_width(status_link_width), .status_lba_range_err(status_lba_range_err),
-    .stat_bytes_done(), .stat_cmds_done(), .stat_cmd_errors(stat_cmd_errors), .stat_max_latency(),
+    .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
+    .stat_max_latency(stat_max_latency),
     .status_flags(status_flags), .stat_first_error_lba(), .link_retries(link_retries),
     .link_lost(link_lost), .link_fail(link_fail),
-    .link_clk_out(link_clk), .user_clk_out(user_clk));
+    .link_clk_out(link_clk), .user_clk_out(user_clk), .dbg_ltssm_state(dbg_ltssm), .dbg_uc(dbg_uc));
+
+  // ILA on user_clk: TLP-level view of the PCIe core interface (bit map in nvme_host_top, dbg_uc)
+  ila_pcie u_ila (.clk(user_clk), .probe0(dbg_uc));
 
   // ===========================================================================
   // link_clk domain: reset, debouncers, start/stop latches, heartbeat, LEDs
@@ -120,8 +141,8 @@ module ax7a200b_top #(
       ctrl_start <= 1'b0;
       ctrl_stop  <= 1'b0;
     end else begin
-      if (sw_start)             start_lat <= 1'b1;
-      if (sw_stop && start_lat) stop_lat  <= 1'b1;
+      if (sw_start || vio_start)              start_lat <= 1'b1;
+      if ((sw_stop || vio_stop) && start_lat) stop_lat  <= 1'b1;
       ctrl_start <= start_lat;
       ctrl_stop  <= start_lat && quiet_sync[1];
     end
@@ -144,6 +165,38 @@ module ax7a200b_top #(
   logic [7:0] s_flags, s_err;
   logic [1:0] s_width;
   assign {s_cmd_err_nz, s_lba, s_width, s_err, s_flags, s_done, s_run, s_ready, s_enum, s_gen2, s_link_up} = st_s1;
+
+  // ---- debug: VIO (JTAG) ------------------------------------------------------------
+  (* ASYNC_REG = "TRUE" *) logic [5:0]   ltssm_s0, ltssm_s1;
+  (* ASYNC_REG = "TRUE" *) logic [1:0]   perst_pin_s;       // actual level on L16 (= SSD PERST#)
+  (* ASYNC_REG = "TRUE" *) logic [7:0]   det_s0, det_s1;    // status_error_detail (fail_step of the failing module)
+  (* ASYNC_REG = "TRUE" *) logic [191:0] cnt_s0, cnt_s1;    // {max_latency, cmd_errors, cmds_done, bytes_done}
+  always_ff @(posedge link_clk) begin
+    ltssm_s0 <= dbg_ltssm;
+    ltssm_s1 <= ltssm_s0;
+    perst_pin_s <= {perst_pin_s[0], pcie_perst_n};
+    det_s0   <= status_error_detail;
+    det_s1   <= det_s0;
+    cnt_s0   <= {stat_max_latency, stat_cmd_errors, stat_cmds_done, stat_bytes_done};
+    cnt_s1   <= cnt_s0;
+  end
+
+  vio_status u_vio (
+    .clk(link_clk),
+    .probe_in0({s_cmd_err_nz, s_lba, s_done, s_run, s_ready, s_enum, s_gen2, s_link_up}),  // 8
+    .probe_in1({det_s1, s_err}),                                                          // 16 {error_detail, status_error}
+    .probe_in2(s_flags),                                                                  // 8 status_flags
+    .probe_in3(s_width),                                                                  // 2 link width (01 = x2)
+    .probe_in4({stop_lat, start_lat, perst_pin_s[1], link_fail, link_lost, link_retries}),  // 7 [4] = PERST# pin level
+    .probe_in5(ltssm_s1),                                                                 // 6 pl_ltssm_state
+    .probe_in6(cnt_s1[63:0]),                                                             // 64 stat_bytes_done
+    .probe_in7(cnt_s1[127:64]),                                                           // 64 stat_cmds_done
+    .probe_in8(cnt_s1[159:128]),                                                          // 32 stat_cmd_errors
+    .probe_in9(cnt_s1[191:160]),                                                          // 32 stat_max_latency
+    .probe_out0(vio_rst),                                                                 // 1 board reset (hold high)
+    .probe_out1(vio_start),                                                               // 1 START
+    .probe_out2(vio_stop),                                                                // 1 STOP
+    .probe_out3(vio_gen_en));                                                             // 1 generator enable
 
   logic [25:0] hb_cnt;
   always_ff @(posedge link_clk) hb_cnt <= hb_cnt + 1'b1;      // free running, no reset needed
@@ -173,8 +226,11 @@ module ax7a200b_top #(
   logic urst;
   assign urst = urst_sync[1];
 
-  (* ASYNC_REG = "TRUE" *) logic [1:0] halt_sync;
-  always_ff @(posedge user_clk) halt_sync <= {halt_sync[0], stop_lat};
+  (* ASYNC_REG = "TRUE" *) logic [1:0] halt_sync, gen_en_sync;
+  always_ff @(posedge user_clk) begin
+    halt_sync   <= {halt_sync[0], stop_lat};
+    gen_en_sync <= {gen_en_sync[0], vio_gen_en};
+  end
   logic halt;
   assign halt = halt_sync[1];
 
@@ -195,7 +251,9 @@ module ax7a200b_top #(
   logic [32:0] sent;
   logic at_limit, can_send;
   assign at_limit = (GEN_LEN_SEL != 2'd3) && (sent == LIMIT);
-  assign can_send = !halt && !at_limit;
+  // gen_en = 0: no beat is produced, the ring stays empty and RUN submits no Write (bring-up test without
+  // touching the SSD contents).  With the VIO it starts at 0; set it to 1 BEFORE START for a recording.
+  assign can_send = gen_en_sync[1] && !halt && !at_limit;
 
   logic [31:0]  n, n7;
   logic         gen_valid;
