@@ -1,7 +1,7 @@
 // =============================================================================
 // tb_writer — testbench for hostmem_writer + hostmem_rams (+ prp_synth mux)
 //
-// Part 1  MWr traffic into Identify / ACQ / IOCQ:
+// Part 1  MWr traffic into Identify / ACQ / IOCQ / DATA (data ring, wr_en_data):
 //         random DW alignment, Length 1..64 DW (plus a 1024-DW zero fill),
 //         partial First/Last BE, CQE-shaped writes (1..3 CQEs per MWr and split
 //         8+8 byte CQE writes), 4DW headers, poisoned / unmapped / straddling
@@ -12,6 +12,9 @@
 //         (2-cycle latency).
 // Part 2  CQ clear FSM: fill ACQ/IOCQ, clear, read back zeros, Identify intact,
 //         clear_done protocol, normal writes afterwards.
+// Part 4  Throughput of the DATA region path: back-to-back 256-byte MWr (MPS), bytes/cycle
+//         measured from the first header to the last output beat (verify run needs > 1 GB/s
+//         at 125 MHz, i.e. > 8 B/cycle).
 // Part 3  Completer read mux: ASQ/IOSQ writes through their ports and reads via
 //         cpl_rd_* (sel ASQ/IOSQ/PRP/DATA, random addresses, 2-cycle latency,
 //         cpl_rd_en_data only for RSEL_DATA).
@@ -31,16 +34,16 @@ module tb_writer;
   logic [15:0]  s_mwr_tkeep;
   logic         s_mwr_tlast, s_mwr_tvalid, s_mwr_tready;
   logic [1:0]   s_mwr_tuser;
-  logic         wr_en_ident, wr_en_acq, wr_en_iocq, drop_cnt_inc;
+  logic         wr_en_ident, wr_en_acq, wr_en_iocq, wr_en_data, drop_cnt_inc;
   logic [31:0]  wr_beat_addr;
   logic [127:0] wr_data;
   logic [15:0]  wr_be;
 
-  hostmem_writer dut_w (
+  hostmem_writer #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES)) dut_w (
     .clk(clk), .rst(rst),
     .s_mwr_tdata(s_mwr_tdata), .s_mwr_tkeep(s_mwr_tkeep), .s_mwr_tlast(s_mwr_tlast),
     .s_mwr_tuser(s_mwr_tuser), .s_mwr_tvalid(s_mwr_tvalid), .s_mwr_tready(s_mwr_tready),
-    .wr_en_ident(wr_en_ident), .wr_en_acq(wr_en_acq), .wr_en_iocq(wr_en_iocq),
+    .wr_en_ident(wr_en_ident), .wr_en_acq(wr_en_acq), .wr_en_iocq(wr_en_iocq), .wr_en_data(wr_en_data),
     .wr_beat_addr(wr_beat_addr), .wr_data(wr_data), .wr_be(wr_be), .drop_cnt_inc(drop_cnt_inc));
 
   // ---------------- DUT: rams ----------------
@@ -91,23 +94,24 @@ module tb_writer;
   endtask
 
   // ---------------- reference memories (byte level) ----------------
-  logic [7:0] ref_mem  [3][4096];      // [0]=ident [1]=acq [2]=iocq
-  logic [7:0] port_mem [3][4096];
-  int         region_size [3] = '{4096, 512, 1024};
+  localparam int unsigned DATA_BYTES = N_SLOTS * SLOT_BYTES;
+  logic [7:0] ref_mem  [4][DATA_BYTES];      // [0]=ident [1]=acq [2]=iocq [3]=data
+  logic [7:0] port_mem [4][DATA_BYTES];
+  int         region_size [4] = '{4096, 512, 1024, DATA_BYTES};
   int         exp_drops = 0, got_drops = 0;
   int         n_pkts = 0, n_written_pkts = 0, n_beats = 0;
 
   function automatic logic [31:0] region_base(input int r);
-    case (r) 0: return IDENT_BASE; 1: return ACQ_BASE; default: return IOCQ_BASE; endcase
+    case (r) 0: return IDENT_BASE; 1: return ACQ_BASE; 2: return IOCQ_BASE; default: return DATA_BASE; endcase
   endfunction
 
   // ---------------- write-port monitor ----------------
   always @(posedge clk) if (!rst) begin
     if (drop_cnt_inc) got_drops++;
-    if ((wr_en_ident + wr_en_acq + wr_en_iocq) > 1) fail("more than one wr_en");
-    if (wr_en_ident || wr_en_acq || wr_en_iocq) begin
+    if ((wr_en_ident + wr_en_acq + wr_en_iocq + wr_en_data) > 1) fail("more than one wr_en");
+    if (wr_en_ident || wr_en_acq || wr_en_iocq || wr_en_data) begin
       int r;
-      r = wr_en_ident ? 0 : wr_en_acq ? 1 : 2;
+      r = wr_en_ident ? 0 : wr_en_acq ? 1 : wr_en_iocq ? 2 : 3;
       n_beats++;
       if (wr_beat_addr[3:0] != 4'h0) fail($sformatf("wr_beat_addr %h not 16 B aligned", wr_beat_addr));
       if (wr_beat_addr + 16 > region_size[r]) fail($sformatf("wr_beat_addr %h beyond region %0d", wr_beat_addr, r));
@@ -131,7 +135,7 @@ module tb_writer;
   endtask
 
   // send one MWr and update the reference model
-  //   region: 0 ident, 1 acq, 2 iocq, 3 = raw address given in `raw_addr`
+  //   region: 0 ident, 1 acq, 2 iocq, 3 data, 4 = raw address given in `raw_addr`
   task automatic send_mwr(input int region, input int rel, input int len,
                           input logic [3:0] fbe, input logic [3:0] lbe,
                           input bit poison = 0, input bit is4dw = 0, input bit hi_nz = 0,
@@ -141,7 +145,7 @@ module tb_writer;
     logic [31:0] dw [];
     bit expect_write;
     int total_beats;
-    if (region == 3) addr = raw_addr; else addr = region_base(region) + rel;
+    if (region == 4) addr = raw_addr; else addr = region_base(region) + rel;
     hdr = hdr_mwr32(addr, 10'(len), 16'h0100, 8'(n_pkts), fbe, lbe);
     if (is4dw) begin
       hdr[31:24] = FT_MWR64;
@@ -152,9 +156,9 @@ module tb_writer;
     for (int i = 0; i < len; i++) dw[i] = zero_data ? 32'h0 : $urandom;
     // does it land in a region? (independent decode)
     expect_write = !poison && !hi_nz;
-    if (region == 3) begin
+    if (region == 4) begin
       expect_write = 0;
-      for (int r = 0; r < 3; r++)
+      for (int r = 0; r < 4; r++)
         if (!poison && !hi_nz && addr >= region_base(r) && (addr + len*4) <= region_base(r) + region_size[r]) begin
           expect_write = 1; region = r; rel = addr - region_base(r);
         end
@@ -196,7 +200,7 @@ module tb_writer;
     int region, len, maxdw, rel, kind;
     bit poison, is4, hinz;
     kind = $urandom_range(0, 99);
-    region = $urandom_range(0, 2);
+    region = $urandom_range(0, 3);
     maxdw = region_size[region] / 4;
     poison = 0; is4 = 0; hinz = 0;
     case (1)
@@ -212,12 +216,15 @@ module tb_writer;
     if (kind >= 97) begin
       // unmapped / straddling
       case ($urandom_range(0, 5))
-        0: send_mwr(3, 0, len, rnd_fbe(len), rnd_lbe(len), 0, 0, 0, 32'hFEE0_0000);                      // MSI
-        1: send_mwr(3, 0, len, rnd_fbe(len), rnd_lbe(len), 0, 0, 0, ASQ_BASE + 4 * $urandom_range(0, 8));
-        2: send_mwr(3, 0, 4, 4'hF, 4'hF, 0, 0, 0, IDENT_BASE + 4096 - 8);                               // straddles end
-        3: send_mwr(3, 0, 8, 4'hF, 4'hF, 0, 0, 0, ACQ_BASE + ACQ_BYTES - 16);
-        4: send_mwr(3, 0, len, rnd_fbe(len), rnd_lbe(len), 0, 0, 0, DATA_BASE);
-        default: send_mwr(3, 0, 2, 4'hF, 4'hF, 0, 0, 0, IOCQ_BASE + IOCQ_BYTES - 4);
+        0: send_mwr(4, 0, len, rnd_fbe(len), rnd_lbe(len), 0, 0, 0, 32'hFEE0_0000);                      // MSI
+        1: send_mwr(4, 0, len, rnd_fbe(len), rnd_lbe(len), 0, 0, 0, ASQ_BASE + 4 * $urandom_range(0, 8));
+        2: send_mwr(4, 0, 4, 4'hF, 4'hF, 0, 0, 0, IDENT_BASE + 4096 - 8);                               // straddles end
+        3: send_mwr(4, 0, 8, 4'hF, 4'hF, 0, 0, 0, ACQ_BASE + ACQ_BYTES - 16);
+        4: send_mwr(4, 0, len, rnd_fbe(len), rnd_lbe(len), 0, 0, 0, DATA_BASE + DATA_BYTES);               // just past the ring
+        default: begin
+          if ($urandom_range(0, 1)) send_mwr(4, 0, 2, 4'hF, 4'hF, 0, 0, 0, IOCQ_BASE + IOCQ_BYTES - 4);
+          else                      send_mwr(4, 0, 4, 4'hF, 4'hF, 0, 0, 0, DATA_BASE + DATA_BYTES - 8);  // straddles the end of the ring
+        end
       endcase
       return;
     end
@@ -255,7 +262,7 @@ module tb_writer;
   endtask
 
   task automatic compare_port_ref(input string name);
-    for (int r = 0; r < 3; r++)
+    for (int r = 0; r < 4; r++)
       for (int a = 0; a < region_size[r]; a++)
         if (port_mem[r][a] !== ref_mem[r][a]) begin
           fail($sformatf("%s: write-port memory %0d byte %0d: got %h exp %h", name, r, a, port_mem[r][a], ref_mem[r][a]));
@@ -278,10 +285,13 @@ module tb_writer;
     return v;
   endfunction
 
+  int cyc_cnt = 0;
+  always @(posedge clk) cyc_cnt <= cyc_cnt + 1;
+
   // ---------------- main ----------------
   initial begin
-    for (int r = 0; r < 3; r++)
-      for (int a = 0; a < 4096; a++) begin ref_mem[r][a] = 8'h00; port_mem[r][a] = 8'h00; end
+    for (int r = 0; r < 4; r++)
+      for (int a = 0; a < DATA_BYTES; a++) begin ref_mem[r][a] = 8'h00; port_mem[r][a] = 8'h00; end
     s_mwr_tvalid = 0; s_mwr_tdata = 0; s_mwr_tkeep = 0; s_mwr_tlast = 0; s_mwr_tuser = 0;
     repeat (4) @(posedge clk);
     rst <= 1'b0;
@@ -347,6 +357,24 @@ module tb_writer;
       compare_port_ref("part2");
       readback_cmp("part2");
       $display("Part 2 done, errors=%0d", errors);
+    end
+
+    // ===== Part 4: DATA region throughput (256 B MWr back to back) =====
+    begin
+      int          t0, nbeats0, npk;
+      real         bpc;
+      npk = 200;
+      repeat (10) @(posedge clk);
+      nbeats0 = n_beats;
+      t0 = cyc_cnt;
+      for (int n = 0; n < npk; n++) send_mwr(3, 256 * (n % (DATA_BYTES / 256)), 64, 4'hF, 4'hF);
+      while (n_beats - nbeats0 < npk * 16) @(posedge clk);
+      bpc = real'(npk * 256) / real'(cyc_cnt - t0);
+      $display("Part 4: %0d x 256 B DATA MWr in %0d cycles = %0.2f B/cycle = %0.0f MB/s @125 MHz",
+               npk, cyc_cnt - t0, bpc, bpc * 125.0);
+      if (bpc < 11.0) fail($sformatf("DATA path throughput %0.2f B/cycle < 11", bpc));
+      repeat (20) @(posedge clk);
+      compare_port_ref("part4");
     end
 
     // ===== Part 3: completer read mux =====

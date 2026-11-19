@@ -13,6 +13,8 @@
 #     capture_enum   same, trigger = sequencer enters ENUM
 #     len=<0..3>     generator length: 0 1 GiB (default), 1 8 GiB, 2 64 GiB, 3 unlimited (set BEFORE start)
 #     rate=<0..3>    generator rate: 0 full (default), 1 1/2, 2 1/4, 3 1/8
+#     verify_on | verify_off  verify run: START reads len= GiB back with NVMe Read and compares it with the pattern
+#                    (results: VERIFY: in the status line); recording: verify_off
 #     gen_on | gen_off  generator enable (VIO probe_out3, 0 after programming)
 #     probes         list the VIO probes with their properties (debugging this script)
 #   Commands run in the given order, e.g.  -tclargs program watch=5 status
@@ -43,14 +45,16 @@ proc rv {name} {
 }
 
 # probe value by VIO input port number (for the counters: their net names are cnt_s1*, tm_s1*)
+# a port may be split into several probes (one per connected net): combine them by PROBE_PORT_BITS
 proc rp {port} {
+    set v 0
     foreach p [get_hw_probes -of_objects [vio] -filter {TYPE == vio_input}] {
         if {[get_property PROBE_PORT $p] == $port} {
             set_property INPUT_VALUE_RADIX HEX $p
-            return [expr "0x[get_property INPUT_VALUE $p]"]
+            set v [expr {$v | ([expr "0x[get_property INPUT_VALUE $p]"] << [get_property PROBE_PORT_BITS $p])}]
         }
     }
-    return 0
+    return $v
 }
 
 set ltssm_names {
@@ -79,6 +83,11 @@ proc status {} {
     }
     if {$span_cyc > 0 && $bytes > 131072} {
         lappend c [format "span=%.3fs sustained=%.1fMB/s" [expr {$span_cyc / 125e6}] [expr {($bytes - 131072) / ($span_cyc / 125e6) / 1e6}]]
+    }
+    set vf [rp 16]
+    if {$vf & 2} {
+        set vb [rp 12]; set ve [rp 13]; set el [rp 14]; set eg [rp 15]
+        lappend c [format "VERIFY: limit_done=%d checked=%s err_beats=%d first_err_lba=%s exp=%08X got=%08X"             [expr {$vf & 1}] $vb $ve $el [expr {($eg >> 32) & 0xFFFFFFFF}] [expr {$eg & 0xFFFFFFFF}]]
     }
     puts [format "STATUS: link_up=%d gen2=%d width=%s ltssm=0x%s(%s) enum=%d nvme_ready=%d run=%d done=%d | err=0x%s(%s) detail=0x%02X flags=0x%02X lba_err=%d cmd_err_nz=%d | perst_pin=%d link_lost=%d link_fail=%d retries=%d start=%d stop=%d | %s"         [rv s_link_up] [rv s_gen2] $wid $lt $ltn [rv s_enum] [rv s_ready] [rv s_run] [rv s_done]         $err $errn [rv det_s1] [rv s_flags] [rv s_lba] [rv s_cmd_err_nz]         [rv perst_pin_s] [rv link_lost] [rv link_fail] [rv link_retries] [rv start_lat] [rv stop_lat] [join $c " "]]
 }
@@ -150,6 +159,8 @@ foreach a $argv {
                 }
                 len=*    { set p [get_hw_probes vio_len_sel -of_objects [vio]];  set_property OUTPUT_VALUE [string range $a 4 end] $p; commit_hw_vio $p; puts "LEN: [string range $a 4 end] (0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited)" }
                 rate=*   { set p [get_hw_probes vio_rate_sel -of_objects [vio]]; set_property OUTPUT_VALUE [string range $a 5 end] $p; commit_hw_vio $p; puts "RATE: [string range $a 5 end] (0 full, 1 1/2, 2 1/4, 3 1/8)" }
+                verify_on  { set p [get_hw_probes vio_verify -of_objects [vio]]; set_property OUTPUT_VALUE 1 $p; commit_hw_vio $p; puts "VERIFY: on (Read + compare, generator off)" }
+                verify_off { set p [get_hw_probes vio_verify -of_objects [vio]]; set_property OUTPUT_VALUE 0 $p; commit_hw_vio $p; puts "VERIFY: off" }
                 gen_on   { set p [get_hw_probes vio_gen_en -of_objects [vio]]; set_property OUTPUT_VALUE 1 $p; commit_hw_vio $p; puts "GEN: on" }
                 gen_off  { set p [get_hw_probes vio_gen_en -of_objects [vio]]; set_property OUTPUT_VALUE 0 $p; commit_hw_vio $p; puts "GEN: off" }
                 default  { puts "WARNING: unknown command $a" }

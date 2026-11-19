@@ -18,6 +18,8 @@
 //     ident  -> nvme_admin            (acq/iocq/ident are written by hostmem_writer)
 //  data_ring: user stream -> BRAM ring -> read by the completer (RSEL_DATA);
 //     slot_full -> nvme_write_engine, slot_free <- nvme_write_engine.
+//  verify_checker: verify mode only - the SSD's Read data (MWr into the DATA region, decoded
+//     by hostmem_writer as wr_en_data) is compared with the test pattern on the fly.
 //  host_sequencer: link -> enum -> Root Port cfg -> NVMe init -> run -> drain
 //     -> flush -> shutdown (see host_sequencer.sv).
 //
@@ -31,6 +33,15 @@
 // sequencer in IDLE with E_LINK_LOST after a link drop (the IP's user_reset would otherwise
 // erase the error and the still-high ctrl_start would restart the recording over its own data);
 // link_fail gives E_LINK_TIMEOUT.  Both default to 0 when left unconnected.
+//
+// Verify mode (verify_mode = 1, quasi-static, set before ctrl_start; ARCHITECTURE.md 5.19).  The
+// write engine issues NVMe Reads of the LBA range that a previous run recorded (the first
+// verify_cmds commands of SLOT_BYTES each, starting at START_LBA; 0 = unlimited) instead of
+// Writes; verify_checker compares every received byte with the pattern.  The user keeps the
+// data stream OFF (data_ring stays empty) and ends the run with ctrl_stop when cmd_limit_done
+// is high.  slot_free is not forwarded to data_ring in this mode.  vfy_* hold the result (valid
+// once the sequencer is past RUN; the checker needs 8 cycles after the last data beat).
+// vfy_* are cleared by the restart pulse of every run (init_start).
 //
 // Data path.  s_data_tready is held low while the core is in reset, while data_rst is
 // active and until the sequencer is in RUN (accept_enable = running) - see data_ring.
@@ -107,6 +118,8 @@ module nvme_host_core
   // ---- control (synchronous to user_clk) ----
   input  logic         ctrl_start,
   input  logic         ctrl_stop,
+  input  logic         verify_mode = 1'b0,       // 1: read back and compare instead of recording
+  input  logic [31:0]  verify_cmds = 32'd0,    // verify: number of Read commands (0 = unlimited)
 
   // ---- status ----
   output logic         status_link_up,
@@ -135,7 +148,14 @@ module nvme_host_core
   output logic [3:0]   stat_lbads,
   output logic [63:0]  stat_nsze,
   output logic [7:0]   stat_mdts,
-  output logic [63:0]  stat_first_error_lba      // SLBA of the first failed Write (status_flags[6])
+  output logic [63:0]  stat_first_error_lba,     // SLBA of the first failed Write (status_flags[6])
+  // ---- verify results (user_clk) ----
+  output logic         cmd_limit_done,           // verify_cmds data commands submitted and completed
+  output logic [63:0]  vfy_bytes,                // bytes compared
+  output logic [31:0]  vfy_err_beats,            // 16-byte beats with a mismatch
+  output logic [63:0]  vfy_first_err_lba,        // LBA of the first mismatching beat
+  output logic [31:0]  vfy_first_err_exp,        // expected / received DW of its first bad DW
+  output logic [31:0]  vfy_first_err_got
 );
 
   // ===========================================================================
@@ -295,16 +315,17 @@ module nvme_host_core
     .mps_code(mps_code), .completer_id(RP_ID),
     .rd_addr(cpl_rd_addr), .rd_sel(cpl_rd_sel), .rd_en(cpl_rd_en), .rd_data(cpl_rd_data));
 
-  logic         hw_wr_en_ident, hw_wr_en_acq, hw_wr_en_iocq;
+  logic         hw_wr_en_ident, hw_wr_en_acq, hw_wr_en_iocq, hw_wr_en_data;
   logic [31:0]  hw_wr_beat_addr;
   logic [127:0] hw_wr_data;
   logic [15:0]  hw_wr_be;
 
-  hostmem_writer u_writer (
+  hostmem_writer #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES)) u_writer (
     .clk(user_clk), .rst(user_rst),
     .s_mwr_tdata(mwr_tdata), .s_mwr_tkeep(mwr_tkeep), .s_mwr_tlast(mwr_tlast), .s_mwr_tuser(mwr_tuser),
     .s_mwr_tvalid(mwr_tvalid), .s_mwr_tready(mwr_tready),
     .wr_en_ident(hw_wr_en_ident), .wr_en_acq(hw_wr_en_acq), .wr_en_iocq(hw_wr_en_iocq),
+    .wr_en_data(hw_wr_en_data),
     .wr_beat_addr(hw_wr_beat_addr), .wr_data(hw_wr_data), .wr_be(hw_wr_be),
     .drop_cnt_inc(writer_drop_inc));
 
@@ -329,7 +350,10 @@ module nvme_host_core
     .iocq_rd_en(iocq_rd_en), .iocq_rd_addr(iocq_rd_addr), .iocq_rd_data(iocq_rd_data),
     .ident_rd_en(ident_rd_en), .ident_rd_addr(ident_rd_addr), .ident_rd_data(ident_rd_data));
 
-  logic [N_SLOTS-1:0]       slot_full, slot_free;
+  logic [N_SLOTS-1:0]       slot_full, slot_free, eng_slot_free;
+  logic [N_SLOTS*64-1:0]    slot_lba_flat;
+  // in verify mode the ring never filled the slot: data_ring must not see a free pulse
+  assign slot_free = eng_slot_free & {N_SLOTS{~verify_mode}};
   logic [$clog2(N_SLOTS):0] slots_used;
   logic                     ring_input_stalled;
 
@@ -430,8 +454,11 @@ module nvme_host_core
 
   nvme_write_engine #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .IO_TIMEOUT_MS(IO_TIMEOUT_MS)) u_write_engine (
     .clk(user_clk), .rst(user_rst), .tick_ms(tick_ms), .restart(seq_init_start),
-    .enable(seq_we_enable), .start_lba(START_LBA), .lbads(lbads), .nsze(nsze), .dstrd(dstrd),
-    .slot_full(slot_full), .slot_free(slot_free),
+    // verify run: no new Read after STOP (DRAIN only waits for the outstanding ones); a recording
+    // keeps submitting in DRAIN until the ring is empty
+    .enable(seq_we_enable && (!verify_mode || seq_running)), .start_lba(START_LBA), .lbads(lbads), .nsze(nsze), .dstrd(dstrd),
+    .slot_full(slot_full), .slot_free(eng_slot_free), .slot_lba_flat(slot_lba_flat),
+    .read_mode(verify_mode), .max_cmds(verify_cmds), .cmd_limit_done(cmd_limit_done),
     .iosq_wr_en(iosq_wr_en), .iosq_wr_addr(iosq_wr_addr), .iosq_wr_data(iosq_wr_data),
     .iocq_rd_en(iocq_rd_en), .iocq_rd_addr(iocq_rd_addr), .iocq_rd_data(iocq_rd_data),
     .req_valid(p1_req_valid), .req_ready(p1_req_ready), .req_op(p1_req_op), .req_addr(p1_req_addr),
@@ -446,6 +473,12 @@ module nvme_host_core
     .lba_range_err(status_lba_range_err), .doorbell_err(doorbell_err),
     .io_timeout(io_timeout), .flush_skipped(flush_skipped), .io_error(io_error),
     .first_error_lba(stat_first_error_lba));
+
+  verify_checker #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .START_LBA(START_LBA)) u_verify (
+    .clk(user_clk), .rst(user_rst), .clear(seq_init_start), .lbads(lbads), .slot_lba_flat(slot_lba_flat),
+    .wr_en(hw_wr_en_data), .wr_beat_addr(hw_wr_beat_addr), .wr_data(hw_wr_data), .wr_be(hw_wr_be),
+    .chk_bytes(vfy_bytes), .err_beats(vfy_err_beats), .first_err_lba(vfy_first_err_lba),
+    .first_err_exp(vfy_first_err_exp), .first_err_got(vfy_first_err_got), .err_seen());
 
   // ===========================================================================
   // Status

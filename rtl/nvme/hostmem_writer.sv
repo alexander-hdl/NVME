@@ -1,8 +1,8 @@
 // =============================================================================
 // hostmem_writer.sv — absorbs the SSD's Memory Write TLPs (ARCHITECTURE.md §5.6)
 //
-// The SSD writes completion queue entries (ACQ / IOCQ) and the Identify data
-// into host memory. This module turns one MWr TLP (header beat + payload
+// The SSD writes completion queue entries (ACQ / IOCQ), the Identify data and - in
+// the verify run, for NVMe Read commands - the read data into host memory. This module turns one MWr TLP (header beat + payload
 // beats, internal tlp_axis format) into a sequence of 16-byte-aligned memory
 // beats with per-byte write enables.
 //
@@ -10,7 +10,9 @@
 //   header beat : decode  H0 (fmt/type, Length), H1 (FBE/LBE), H2 (address).
 //                 4DW headers use the PCIe layout (H2 = addr[63:32], H3 = addr[31:2]);
 //                 a non-zero upper half is outside the 32-bit map -> drop.
-//                 Region decode (§2): Identify, ACQ, IOCQ — the WHOLE write must fit
+//                 Region decode (§2): Identify, ACQ, IOCQ, DATA (the data ring,
+//                 [DATA_BASE, DATA_BASE + N_SLOTS*SLOT_BYTES): read data of the verify
+//                 run, consumed by verify_checker) — the WHOLE write must fit
 //                 in one region. Anything else, a poisoned TLP (tuser[0]) or a TLP that
 //                 is not a memory write is consumed and counted on drop_cnt_inc.
 //   payload     : the DWs are in memory order starting at the DW address `addr`.
@@ -27,12 +29,20 @@
 //                 incremented by 16 per output beat.
 //
 // One MWr is processed at a time (header accepted only after the previous
-// packet has left dw_shift): CQE traffic is a few packets per command, so the
-// few idle cycles per packet are irrelevant. Outputs are registered.
+// packet has left dw_shift). Outputs are registered.
+// THROUGHPUT (verify run): per packet = 1 header cycle (ST_HDR) + N payload beats
+// (ST_PAY, one 16-byte beat per cycle, +1 beat if the address is not 16 B aligned)
+// + 1 drain cycle in ST_DRAIN (dw_shift output register -> last output beat).
+// For the maximum payload of 256 B (MPS) that is 18 cycles per 256 B = 14.2 B/cycle =
+// 1.78 GB/s at 125 MHz (measured in tb_writer Part 4; a Gen2 x2 link delivers < 1 GB/s).
+// For 128 B packets: 10 cycles = 12.8 B/cycle.  A CQE MWr costs about 4 cycles.
 // =============================================================================
 module hostmem_writer
   import nvme_host_pkg::*;
-(
+#(
+  parameter int unsigned N_SLOTS    = N_SLOTS_DEF,
+  parameter int unsigned SLOT_BYTES = SLOT_BYTES_DEF
+) (
   input  logic         clk,
   input  logic         rst,
   // MWr packets (tlp_axis)
@@ -42,10 +52,11 @@ module hostmem_writer
   input  logic [1:0]   s_mwr_tuser,
   input  logic         s_mwr_tvalid,
   output logic         s_mwr_tready,
-  // memory write port, shared by the three target RAMs
+  // memory write port, shared by the target RAMs / the verify checker
   output logic         wr_en_ident,
   output logic         wr_en_acq,
   output logic         wr_en_iocq,
+  output logic         wr_en_data,        // DATA region (address relative to DATA_BASE): verify_checker
   output logic [31:0]  wr_beat_addr,     // region-relative byte address of the 16 B beat
   output logic [127:0] wr_data,
   output logic [15:0]  wr_be,
@@ -55,7 +66,8 @@ module hostmem_writer
   // ---------------------------------------------------------------------------
   // Region decode
   // ---------------------------------------------------------------------------
-  localparam logic [1:0] WSEL_IDENT = 2'd0, WSEL_ACQ = 2'd1, WSEL_IOCQ = 2'd2;
+  localparam logic [1:0] WSEL_IDENT = 2'd0, WSEL_ACQ = 2'd1, WSEL_IOCQ = 2'd2, WSEL_DATA = 2'd3;
+  localparam logic [31:0] DATA_BYTES = 32'(N_SLOTS) * 32'(SLOT_BYTES);
 
   function automatic logic fits(input logic [31:0] addr, input logic [31:0] base,
                                 input logic [31:0] size, input logic [12:0] nbytes);
@@ -94,6 +106,8 @@ module hostmem_writer
       hd_sel = WSEL_ACQ;   hd_rel = hd_addr - ACQ_BASE;
     end else if (fits(hd_addr, IOCQ_BASE, IOCQ_BYTES, hd_nbytes)) begin
       hd_sel = WSEL_IOCQ;  hd_rel = hd_addr - IOCQ_BASE;
+    end else if (fits(hd_addr, DATA_BASE, DATA_BYTES, hd_nbytes)) begin
+      hd_sel = WSEL_DATA;  hd_rel = hd_addr - DATA_BASE;
     end else begin
       hd_hit = 1'b0;
     end
@@ -173,11 +187,13 @@ module hostmem_writer
       wr_en_ident   <= 1'b0;
       wr_en_acq     <= 1'b0;
       wr_en_iocq    <= 1'b0;
+      wr_en_data    <= 1'b0;
       drop_cnt_inc  <= 1'b0;
     end else begin
       wr_en_ident  <= 1'b0;
       wr_en_acq    <= 1'b0;
       wr_en_iocq   <= 1'b0;
+      wr_en_data   <= 1'b0;
       drop_cnt_inc <= 1'b0;
 
       // ---- output side: one 16-byte beat per dw_shift output beat ----
@@ -188,6 +204,7 @@ module hostmem_writer
         wr_en_ident  <= (p_sel == WSEL_IDENT);
         wr_en_acq    <= (p_sel == WSEL_ACQ);
         wr_en_iocq   <= (p_sel == WSEL_IOCQ);
+        wr_en_data   <= (p_sel == WSEL_DATA);
         o_addr       <= o_addr + 32'd16;
         o_first      <= 1'b0;
         if (dws_tlast) out_done_seen <= 1'b1;

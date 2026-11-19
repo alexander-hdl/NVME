@@ -1,6 +1,7 @@
 // =============================================================================
-// nvme_write_engine.sv - turns full data-ring slots into NVMe Write commands,
-// reaps the completions and releases the slots.   ARCHITECTURE.md section 5.16
+// nvme_write_engine.sv - turns full data-ring slots into NVMe Write commands (or, in
+// read mode, empty slots into NVMe Read commands for the verify run), reaps the
+// completions and releases the slots.   ARCHITECTURE.md section 5.16
 //
 // Overview
 // --------
@@ -13,6 +14,7 @@
 // Submit FSM  (sub_state)
 //   SUB_IDLE   pick the next ring slot (round robin) when
 //                enable && !flush_req && slot_full[k] && !busy[k] && SQ not full
+//                (read_mode: slot_full is ignored, see "Read mode")
 //              (busy[k] gates a slot until its CQE arrived; wait_clear[k] gates it
 //               until data_ring has dropped slot_full[k] after our slot_free pulse)
 //              or the Flush command when flush_req and no data command is busy.
@@ -26,6 +28,22 @@
 //   SLOT_BYTES<=4096 PRP2=0, for 8192 PRP2 = second data page),
 //   DW10/11 SLBA, DW12 NLB = (SLOT_BYTES>>lbads)-1, DW13 = 0x40 (sequential hint).
 // SQE (Flush): DW0 {CID=0xFF, 0, OPC=0}, DW1 NSID=1.
+//
+// Read mode (verify run).  `read_mode` (level, quasi-static during a run) turns every data
+// command into an NVMe Read (OPC 02h): same SQE (PRP1/PRP2 = the data-ring slot addresses
+// the SSD now WRITES into, SLBA = next_lba, same NLB), but a slot is submitted whenever it
+// is not busy - slot_full is ignored (the user data stream is off, the ring stays empty).
+// The SSD's data MWrs are checked by verify_checker (the core wires hostmem_writer's DATA
+// region to it); slot_lba_flat tells the checker which LBA each slot's command reads.  The
+// CQE is posted after the data MWrs (PCIe posted ordering) so a reaped CQE means the data
+// of that command has already reached hostmem_writer.  slot_free pulses are still generated
+// (the core gates them off in verify mode: data_ring never filled the slot).
+// bytes_done / cmds_done count the successful Reads in this mode.
+//
+// Command limit.  max_cmds != 0 (both modes) stops the submission of data commands once
+// max_cmds of them have been submitted since rst/restart.  cmd_limit_done = (max_cmds != 0)
+// and all of them submitted and completed (no data command busy): the board uses it to stop
+// the run (ctrl_stop) - the verify run reads exactly the range that was written.
 //
 // Doorbell FSM (db_state)
 //   Only requester command port 1 (MWr) is used.  Two requests are kept as
@@ -49,7 +67,7 @@
 //     status!=0   : cmd_errors++, last_status = {0, DW3[31:17]}
 //   head++ (wrap -> phase flips), CQ doorbell scheduled.
 //
-// Stats: bytes_done / cmds_done count successful Writes only; cmd_errors counts
+// Stats: bytes_done / cmds_done count successful data commands only (Writes, or Reads in read mode); cmd_errors counts
 //   failed or unexpected completions; max_latency_cycles = max over commands of
 //   (cycle of CQE reap) - (cycle the SQ doorbell MWr was accepted by the requester);
 //   sq_full_stall is high (and counted in sq_full_stall_cycles) while a slot is
@@ -88,6 +106,8 @@ module nvme_write_engine
   input  logic        restart,            // 1-cycle pulse: start a new run (see header)
 
   input  logic        enable,
+  input  logic        read_mode,          // 1: data commands are Reads, slot_full ignored (verify run)
+  input  logic [31:0] max_cmds,           // 0 = unlimited; else stop after max_cmds data commands
   input  logic [63:0] start_lba,
   input  logic [3:0]  lbads,
   input  logic [63:0] nsze,
@@ -95,6 +115,7 @@ module nvme_write_engine
 
   input  logic [N_SLOTS-1:0] slot_full,
   output logic [N_SLOTS-1:0] slot_free,   // 1-cycle pulse per released slot
+  output logic [N_SLOTS*64-1:0] slot_lba_flat, // SLBA of the last command submitted for slot k at [64k +: 64]
 
   // iosq_ram write port (entry*4 + beat), iocq_ram read port (2-cycle latency)
   output logic         iosq_wr_en,
@@ -116,6 +137,7 @@ module nvme_write_engine
 
   input  logic        flush_req,
   output logic        flush_done,         // level, stays 1 until flush_req drops
+  output logic        cmd_limit_done,     // max_cmds != 0 and all of them submitted and completed
 
   output logic [63:0] next_lba,
   output logic [63:0] bytes_done,
@@ -198,6 +220,9 @@ module nvme_write_engine
   logic [AGE_W-1:0]    flush_age;
   logic [63:0]         slot_lba [N_SLOTS];
 
+  // submitted data commands (command limit)
+  logic [31:0]         sub_cnt;
+
   // ---------------------------------------------------------------------------
   // Derived values
   // ---------------------------------------------------------------------------
@@ -212,7 +237,10 @@ module nvme_write_engine
   assign sq_blocked   = (outstanding >= 8'(MAX_OUTSTANDING));
   assign lba_overflow = ((65'(next_lba) + 65'(lba_per_slot)) > 65'(nsze)) || (lba_per_slot == 64'd0)
                         || (lba_per_slot > 64'd65536);
-  assign want_data    = enable && !flush_req && !lba_range_err && !io_timeout && slot_full[next_slot]
+  logic limit_hit;
+  assign limit_hit    = (max_cmds != 32'd0) && (sub_cnt >= max_cmds);
+  assign want_data    = enable && !flush_req && !lba_range_err && !io_timeout && !limit_hit
+                        && (slot_full[next_slot] || read_mode)
                         && !busy[next_slot] && !wait_clear[next_slot];
   assign want_flush   = flush_req && !flush_sent && !flush_complete && (busy == '0)
                         && (outstanding == 8'd0);
@@ -226,6 +254,8 @@ module nvme_write_engine
     flush_exp   = flush_sent && !flush_complete && (IO_TIMEOUT_MS != 0) && (flush_age >= AGE_W'(IO_TIMEOUT_MS));
     timeout_now = (|age_exp) || flush_exp;
   end
+  assign cmd_limit_done = (max_cmds != 32'd0) && (sub_cnt >= max_cmds) && (busy == '0)
+                          && (sub_state == SUB_IDLE);
   // Flush that cannot (or must not) be executed: a hung command is outstanding
   logic flush_abort;
   assign flush_abort = flush_req && !flush_complete && io_timeout && ((outstanding != 8'd0) || (busy != '0));
@@ -272,7 +302,7 @@ module nvme_write_engine
     case (cur_beat)
       2'd0: iosq_wr_data = {32'h0, 32'h0, NSID_1,
                             cur_flush ? {FLUSH_CID, 8'h00, NOPC_FLUSH}
-                                      : {16'(cur_slot), 8'h00, NOPC_WRITE}};
+                                      : {16'(cur_slot), 8'h00, read_mode ? NOPC_READ : NOPC_WRITE}};
       2'd1: iosq_wr_data = cur_flush ? 128'h0 : {32'h0, slot_data_addr, 64'h0};                  // DW7 DW6 DW5 DW4
       2'd2: iosq_wr_data = cur_flush ? 128'h0 : {cur_lba[63:32], cur_lba[31:0], 32'h0, prp2_value}; // DW11 DW10 DW9 DW8
       default: iosq_wr_data = cur_flush ? 128'h0 : {32'h0, 32'h0, DSM_SEQ_HINT, {16'h0, nlb_m1}};   // DW15 DW14 DW13 DW12
@@ -302,6 +332,8 @@ module nvme_write_engine
   assign sq_tail     = 7'(sq_tail_r);
   assign cq_head     = 7'(cq_head_r);
   assign flush_done  = flush_complete;
+  always_comb
+    for (int i = 0; i < N_SLOTS; i++) slot_lba_flat[64*i +: 64] = slot_lba[i];
   assign slots_idle  = (outstanding == 8'd0) && (sub_state == SUB_IDLE);
   assign sq_full_stall = want_data && !lba_overflow && sq_blocked && (sub_state == SUB_IDLE);
 
@@ -344,6 +376,7 @@ module nvme_write_engine
       ts_snap            <= '0;
       cyc                <= 32'd0;
       slot_free          <= '0;
+      sub_cnt            <= 32'd0;
       next_lba           <= 64'd0;
       bytes_done         <= 64'd0;
       cmds_done          <= 64'd0;
@@ -427,6 +460,7 @@ module nvme_write_engine
           if (!cur_flush) begin
             busy[cur_slot]       <= 1'b1;
             slot_lba[cur_slot]   <= cur_lba;
+            sub_cnt              <= sub_cnt + 1'b1;
             next_lba             <= next_lba + lba_per_slot;
             next_slot            <= (next_slot == last_slot_idx) ? '0 : next_slot + 1'b1;
           end

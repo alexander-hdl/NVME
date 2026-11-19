@@ -44,7 +44,7 @@ Research inputs: `research/01_open_source_survey.md`, `research/02_nvme_minimal_
 | I/O SQ (IOSQ, QID 1) | `0x1000_3000` | 64 × 64 B = 4 KiB | `iosq_ram` | SSD MRd |
 | I/O CQ (IOCQ, QID 1) | `0x1000_4000` | 64 × 16 B = 1 KiB | `iocq_ram` | SSD MWr |
 | PRP lists | `0x2000_0000 + k·0x1000` | one page per slot k | synthesized | SSD MRd |
-| Data ring | `0x4000_0000 + k·SLOT_BYTES` | `N_SLOTS` × `SLOT_BYTES` | `data_ring` BRAM | SSD MRd |
+| Data ring | `0x4000_0000 + k·SLOT_BYTES` | `N_SLOTS` × `SLOT_BYTES` | `data_ring` BRAM | SSD MRd (Write commands); SSD MWr in verify mode (Read commands) -> `verify_checker`, nothing is stored |
 | SSD BAR0 | `0xC000_0000` | ≥16 KiB (sized at enumeration) | inside the SSD | host MRd/MWr (registers, doorbells) |
 
 Anything else → `Cpl` with status UR (reads) / silently dropped (writes).
@@ -88,7 +88,7 @@ nvme_host_top                       (board-level: refclk, GT lanes, PERST#, user
     ├── tlp_rx_demux                by Fmt/Type: Cpl* -> requester, MRd -> completer, MWr -> writer, rest dropped
     ├── tlp_tx_arb                  2 inputs (completer high priority, requester) -> one tlp_axis
     ├── hostmem_completer           MRd -> CplD stream (split at MPS, BC/LA, UR for unknown addr); reads from mem sources
-    ├── hostmem_writer              MWr -> ident_ram / acq_ram / iocq_ram (byte-enable writes, DW realign); drops others
+    ├── hostmem_writer              MWr -> ident_ram / acq_ram / iocq_ram (byte-enable writes, DW realign) / DATA port (verify); drops others
     ├── hostmem_rams                asq_ram, iosq_ram, acq_ram, iocq_ram, ident_ram (dual-port BRAM, 128-bit wide)
     ├── prp_synth                   PRP window read generator (pure function)
     ├── data_ring                   input AXI-S (async) -> BRAM ring of N_SLOTS; slot_full/slot_free; 128-bit read port
@@ -99,6 +99,7 @@ nvme_host_top                       (board-level: refclk, GT lanes, PERST#, user
     ├── pcie_enum                   SSD config space: VID/DID, BAR0 sizing/assignment, cap walk, DevCtl MPS/MRRS, Command
     ├── nvme_admin                  CAP/CC/CSTS, AQA/ASQ/ACQ, enable, Identify ×2, Set Features, Create CQ/SQ, shutdown
     ├── nvme_write_engine           slot -> SQE in iosq_ram, SQ doorbell, CQ reaping (phase), slot release, Flush, stats
+    ├── verify_checker              verify mode: read data (hostmem_writer DATA region) vs. test pattern, error counters (§5.19)
     └── host_sequencer              top-level control FSM: link -> enum -> rp_cfg -> admin init -> run -> stop -> shutdown; error codes
 ```
 
@@ -280,13 +281,18 @@ Behaviour:
 input tlp_axis s_mwr; output s_mwr_tready;
 // write ports (128-bit, byte enables), one per target
 output [11:0] ident_wr_addr /*16B beats*/; output [127:0] wr_data; output [15:0] wr_be; output ident_wr_en, acq_wr_en, iocq_wr_en;
-output [ADDR_W-1:0] wr_beat_addr;   // shared beat address, region-relative
+output wr_en_data;                  // DATA region (verify run): same wr_beat_addr / wr_data / wr_be port, consumed by verify_checker
+output [ADDR_W-1:0] wr_beat_addr;   // shared beat address, region-relative (DATA: relative to DATA_BASE)
+parameter N_SLOTS, SLOT_BYTES;      // DATA region = [DATA_BASE, DATA_BASE + N_SLOTS*SLOT_BYTES)
 output drop_cnt_inc;                // MWr to unmapped address (e.g. MSI) or poisoned
 ```
 Behaviour: decode the address (3DW: H2; 4DW: H2 = Addr[63:32] must be 0 else drop, H3 = Addr[31:2]). Compute first-beat byte enables from `addr[3:2]` and First BE,
 last from Last BE and Length; use `dw_realign` to shift payload DWs **right** by `addr[3:2]` so each output beat
 is a 16-byte aligned memory beat with the proper `wr_be`. A MWr may cover several beats; MWr never crosses 4 KiB
-(core-checked). Regions: Identify buffer, ACQ, IOCQ; any other → consume and count.
+(core-checked). Regions: Identify buffer, ACQ, IOCQ, DATA (the data ring; read data of the verify run, §5.19); any other → consume and count.
+**Throughput.** One MWr is handled at a time: per packet 1 header cycle + N payload beats (one 16 B beat per cycle) + 1 drain cycle, i.e. 18 cycles
+for a 256 B (MPS) packet = 14.2 B/cycle = 1.78 GB/s at 125 MHz (measured in `tb_writer` Part 4, requirement > 8 B/cycle = 1 GB/s); a 128 B packet
+costs 10 cycles (12.8 B/cycle), a CQE MWr about 4 cycles.
 
 ### 5.7 `hostmem_rams`
 Five `sdp_ram` instances, all 128-bit wide with byte enables on the write port:
@@ -430,6 +436,10 @@ Polling interval for CSTS: every 1 ms. Doorbell addresses computed from `dstrd`.
 ### 5.16 `nvme_write_engine`
 ```
 input enable;  input [63:0] start_lba; input [3:0] lbads; input [63:0] nsze;
+input read_mode;                          // 1: data commands are NVMe Reads (OPC 02h), slot_full ignored (verify run, §5.19)
+input [31:0] max_cmds;                    // 0 = unlimited; else no more data commands after max_cmds submissions (both modes)
+output cmd_limit_done;                    // max_cmds != 0 && all submitted && none outstanding
+output [N_SLOTS*64-1:0] slot_lba_flat;    // SLBA of the last command of slot k at [64k +: 64] (consumed by verify_checker)
 input  [N_SLOTS-1:0] slot_full; output [N_SLOTS-1:0] slot_free;
 // iosq_ram write port (4 beats per SQE), iocq_ram read port
 // requester command port 1 (MWr doorbells only), input [3:0] dstrd
@@ -450,6 +460,11 @@ outstanding a `flush_req` is answered at once with `flush_done` + `flush_skipped
 `io_timeout` / `lba_range_err` (§5.17), so DRAIN always terminates and Flush/shutdown are still performed.
 **Failed writes (M6).** The slot is still freed (data lost, counted in cmd_errors / last_status); `io_error` + `first_error_lba` tell the user which
 LBA was lost first.
+**Read mode / command limit (verify).** With `read_mode=1` (quasi-static during a run) the SQE is identical except OPC = 02h (Read): PRP1/PRP2 are the
+data-ring slot addresses the SSD now writes into, SLBA = next_lba, NLB as for Writes; a slot is submitted whenever it is not busy (`slot_full` is ignored,
+the ring is empty). A submitted-command counter (reset by rst/restart) implements `max_cmds`: when `max_cmds != 0` no further data command is
+submitted after `max_cmds` of them, and `cmd_limit_done` goes high once the last one has completed. `bytes_done` / `cmds_done` count the successful Reads
+in read mode. `slot_free` pulses still occur; the core does not forward them to `data_ring` in verify mode.
 **Restart.** `restart` resets queue pointers/phase, busy/outstanding, started (next_lba reloads from start_lba), flush state, statistics and all
 sticky flags, but NOT next_slot (it must keep following the data ring's write slot). A second run without a reset therefore works after a
 clean DRAIN (all ring slots free); after `lba_range_err` / `io_timeout` slots may remain full and a user_reset is required.
@@ -510,6 +525,10 @@ output [7:0] status_flags;             // [0] shutdown_timeout  [1] doorbell_err
 output [63:0] stat_first_error_lba;    // SLBA of the first failed Write
 parameter IO_TIMEOUT_MS = 30000;
 ```
+**Verify ports (v1.2).** `nvme_host_core` / `nvme_host_top`: `input verify_mode; input [31:0] verify_cmds;` (top: asynchronous / quasi-static, 2-FF synchronised
+into user_clk like ctrl_start; set before `ctrl_start`) and `output cmd_limit_done; output [63:0] vfy_bytes; output [31:0] vfy_err_beats;
+output [63:0] vfy_first_err_lba; output [31:0] vfy_first_err_exp, vfy_first_err_got;` (all user_clk domain). See §5.19.
+
 `nvme_host_top` additionally exports `link_bringup`'s `link_lost`, `link_fail`, `link_retries` (link_clk domain, valid while the core is in reset).
 
 **Board top `kc705_top` (`rtl/board/kc705_top.sv`, B1).** Wraps `nvme_host_top` for the KC705 so that every port has a pin and
@@ -520,6 +539,37 @@ heartbeat) plus three debug pages on GPIO_SW_N/E/W (status_flags, link info, sta
 on `user_clk` (= `data_clk`, no separate data clock) and produces the beat `{~n, n ^ 32'hA5A5A5A5, n*7, n}` (n = beat counter, 32 bit), the
 same as `sim/tb/tb_top.sv`, so a recording starting at LBA 0 can be verified on a PC with `fpga/tools/check_pattern.py`. Buttons, latches and
 LEDs run on the free-running `link_clk` (they work while `user_clk` is dead).
+
+### 5.19 Verify mode (`verify_checker`, read-back compare)
+A recording (NVMe Writes of the generator pattern, §5.18) can be verified inside the FPGA without storing the data: a second run with
+`verify_mode=1` reads the same LBA range back and compares every byte with the pattern.
+* **Flow.** Board logic sets `verify_mode=1`, `verify_cmds = number of commands that were written` (each `SLOT_BYTES` long, starting at `START_LBA`), keeps the user
+  data generator OFF, and raises `ctrl_start` (after the previous run reached DONE: `ctrl_start` low -> IDLE -> high; the whole bring-up runs again). In RUN the
+  write engine (`read_mode`) submits NVMe Reads for the slots round robin, up to `max_cmds = verify_cmds` and at most `N_SLOTS` / queue depth outstanding.
+  The SSD DMA-writes the data (MWr, <= MPS) to the slot addresses `DATA_BASE + k*SLOT_BYTES`; the CQE follows the data (posted ordering).
+  **Termination:** when `cmd_limit_done` goes high every Read has completed; the board raises `ctrl_stop` (-> DRAIN -> FLUSH -> SHUTDOWN -> DONE as usual). The results
+  `vfy_*` are static from `cmd_limit_done` + 8 user_clk cycles (checker pipeline) and are cleared by the restart pulse (`init_start`) of the next run.
+  **Early stop:** `ctrl_stop` during a verify run (DRAIN) stops the submission of new Reads at once (the engine `enable` is `we_enable && (!verify_mode || RUN)`),
+  DRAIN waits for the outstanding ones; a recording keeps submitting in DRAIN until its ring is empty.  (Found on hardware 2026-11-19: before this fix a STOP in
+  verify mode kept reading until `verify_cmds`.)
+* **Data path.** `tlp_rx_demux` -> `hostmem_writer` (DATA region decode, `wr_en_data`, DATA-relative `wr_beat_addr`, `wr_data`, `wr_be`) -> `verify_checker`.
+  `data_ring` is not involved: `slot_free` towards it is gated off in verify mode (it must never see a free pulse for a slot it did not fill) and the
+  user stream must stay off.
+* **`verify_checker`** (`N_SLOTS`, `SLOT_BYTES` power of 2, `START_LBA`; inputs `clear` = the run restart, `lbads`, `slot_lba_flat`, the writer port). A beat at DATA-relative
+  address `a` is slot `k = a / SLOT_BYTES`, offset `off = a % SLOT_BYTES`; its pattern index is
+  `n = (((slot_lba[k] - START_LBA) << lbads) + off) >> 4` (32 LSB) and the expected beat is `{~n, n ^ 32'hA5A5A5A5, n*7, n}` (little-endian in memory, as the
+  generator of `kc705_top.sv` / `tb_top.sv`). Bytes are compared under `wr_be`. 8-stage pipeline, one beat per cycle: slot select, `d = lba - START`, `d << lbads`,
+  `+ off`, `n*7 = (n<<3) - n`, byte compare, reduce (any-error, first bad DW, popcount(be)), accumulate. Every stage holds at most one adder / byte compare / small mux
+  (125 MHz on Artix-7 -2). `slot_lba` is sampled in the first stage; the engine rewrites a slot's SLBA only after its previous command (and thereby its data) completed.
+* **Hardware (2026-11-19, AX7A200B, InnoGrit SSD).** 8 GiB recorded at 848 MB/s, read back and compared at 891 MB/s: 8 589 934 592 bytes, 0 error beats.
+  Negative check: a 64 GiB verify over the same SSD reported the first error exactly at LBA 16 777 216 (the first byte after the 8 GiB recording,
+  expected DW 0x20000000 = beat 2^29).
+* **Results.** `vfy_bytes` = enabled bytes compared (== read bytes for a clean run), `vfy_err_beats` = 16-byte beats with a mismatching enabled byte,
+  `vfy_first_err_lba` = LBA containing the first bad beat, `vfy_first_err_exp/got` = expected / received DW of the first bad DW in that beat (all hold the first error;
+  `vfy_err_beats` keeps counting). A missing beat (SSD sent less data) shows up as `vfy_bytes` below the expected count.
+* **Tests.** `tb_verify_checker` (random geometry, partial BEs, injected single-byte errors, wrap of n, clear), `tb_write_engine` H5/H6 (Read SQEs, no `slot_full`,
+  `max_cmds`, `cmd_limit_done`, `slot_lba_flat`), `tb_writer` Part 4 (DATA region + throughput), `tb_top` T-10 / T-11 (recording -> verify run with 0 errors ->
+  second verify run with `corrupt_read_at_byte`: exactly 1 error beat, predicted LBA / DWs). The SSD model implements Read (PRP list like Write, data MWr, CQE after the data).
 
 ---
 

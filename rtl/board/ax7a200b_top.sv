@@ -67,7 +67,12 @@ module ax7a200b_top #(
   logic         board_rst_n;
   logic         vio_rst, vio_start, vio_stop;                // VIO probe_out (link_clk)
   logic         vio_gen_en;                                  // VIO probe_out3: generator enable (0 after configuration)
-  logic [1:0]   vio_len_sel, vio_rate_sel;                   // VIO probe_out4 / 5: 0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited /
+  logic [1:0]   vio_len_sel, vio_rate_sel;
+  logic         vio_verify;                                  // VIO probe_out6: 1 = verify run (NVMe Read + compare), generator forced off
+  logic [31:0]  verify_cmds;                                 // from len_sel: 1 / 8 / 64 GiB of 128 KiB commands, 0 = unlimited
+  logic         cmd_limit_done;
+  logic [63:0]  vfy_bytes, vfy_first_err_lba;
+  logic [31:0]  vfy_err_beats, vfy_first_err_exp, vfy_first_err_got;                   // VIO probe_out4 / 5: 0 1 GiB, 1 8 GiB, 2 64 GiB, 3 unlimited /
                                                              //   0 full, 1 1/2, 2 1/4, 3 1/8
   assign board_rst_n = rst_key_n & ~vio_rst;
 
@@ -109,7 +114,17 @@ module ax7a200b_top #(
     .stat_max_latency(stat_max_latency),
     .status_flags(status_flags), .stat_first_error_lba(), .link_retries(link_retries),
     .link_lost(link_lost), .link_fail(link_fail),
-    .link_clk_out(link_clk), .user_clk_out(user_clk), .dbg_ltssm_state(dbg_ltssm), .dbg_uc(dbg_uc));
+    .link_clk_out(link_clk), .user_clk_out(user_clk), .dbg_ltssm_state(dbg_ltssm), .dbg_uc(dbg_uc),
+    .verify_mode(vio_verify), .verify_cmds(verify_cmds), .cmd_limit_done(cmd_limit_done),
+    .vfy_bytes(vfy_bytes), .vfy_err_beats(vfy_err_beats), .vfy_first_err_lba(vfy_first_err_lba),
+    .vfy_first_err_exp(vfy_first_err_exp), .vfy_first_err_got(vfy_first_err_got));
+
+  // verify run length = the recording length selected with len_sel (SLOT_BYTES = 128 KiB per command)
+  always_ff @(posedge link_clk)
+    verify_cmds <= (vio_len_sel == 2'd0) ? 32'd8192 :      // 1 GiB
+                   (vio_len_sel == 2'd1) ? 32'd65536 :     // 8 GiB
+                   (vio_len_sel == 2'd2) ? 32'd524288 :    // 64 GiB
+                                           32'd0;          // unlimited
 
   // ILA on user_clk: TLP-level view of the PCIe core interface (bit map in nvme_host_top, dbg_uc)
   ila_pcie u_ila (.clk(user_clk), .probe0(dbg_uc));
@@ -134,9 +149,11 @@ module ax7a200b_top #(
   logic start_lat, stop_lat;
   logic gen_quiet;                                         // user_clk domain
   (* ASYNC_REG = "TRUE" *) logic [1:0] quiet_sync;         // generator finished: user_clk -> link_clk
+  (* ASYNC_REG = "TRUE" *) logic [1:0] lim_sync;           // cmd_limit_done (verify run finished): user_clk -> link_clk
 
   always_ff @(posedge link_clk) begin
     quiet_sync <= {quiet_sync[0], gen_quiet};
+    lim_sync   <= {lim_sync[0], cmd_limit_done & vio_verify};
     if (lrst) begin
       start_lat  <= 1'b0;
       stop_lat   <= 1'b0;
@@ -146,7 +163,8 @@ module ax7a200b_top #(
       if (sw_start || vio_start)              start_lat <= 1'b1;
       if ((sw_stop || vio_stop) && start_lat) stop_lat  <= 1'b1;
       ctrl_start <= start_lat;
-      ctrl_stop  <= start_lat && quiet_sync[1];
+      // stop after the generator has stopped (recording) or after all Reads completed (verify run)
+      ctrl_stop  <= start_lat && (quiet_sync[1] || lim_sync[1]);
     end
   end
 
@@ -174,6 +192,7 @@ module ax7a200b_top #(
   (* ASYNC_REG = "TRUE" *) logic [7:0]   det_s0, det_s1;    // status_error_detail (fail_step of the failing module)
   (* ASYNC_REG = "TRUE" *) logic [191:0] cnt_s0, cnt_s1;    // {max_latency, cmd_errors, cmds_done, bytes_done}
   (* ASYNC_REG = "TRUE" *) logic [79:0]  tm_s0, tm_s1;      // {span_cyc, run_cyc} (user_clk timers, see below)
+  (* ASYNC_REG = "TRUE" *) logic [223:0] vfy_s0, vfy_s1;    // verify results (static once the run is done)
   always_ff @(posedge link_clk) begin
     ltssm_s0 <= dbg_ltssm;
     ltssm_s1 <= ltssm_s0;
@@ -184,6 +203,8 @@ module ax7a200b_top #(
     cnt_s1   <= cnt_s0;
     tm_s0    <= {span_cyc, run_cyc};
     tm_s1    <= tm_s0;
+    vfy_s0   <= {vfy_first_err_exp, vfy_first_err_got, vfy_first_err_lba, vfy_err_beats, vfy_bytes};
+    vfy_s1   <= vfy_s0;
   end
 
   vio_status u_vio (
@@ -200,12 +221,18 @@ module ax7a200b_top #(
     .probe_in9(cnt_s1[191:160]),                                                          // 32 stat_max_latency
     .probe_in10(tm_s1[39:0]),                                                             // 40 run_cyc  (RUN + DRAIN)
     .probe_in11(tm_s1[79:40]),                                                            // 40 span_cyc (1st..last completion)
+    .probe_in12(vfy_s1[63:0]),                                                            // 64 vfy_bytes
+    .probe_in13(vfy_s1[95:64]),                                                           // 32 vfy_err_beats
+    .probe_in14(vfy_s1[159:96]),                                                          // 64 vfy_first_err_lba
+    .probe_in15(vfy_s1[223:160]),                                                         // 64 {first_err_exp, first_err_got}
+    .probe_in16({vio_verify, lim_sync[1]}),                                               // 2 {verify mode, cmd_limit_done}
     .probe_out0(vio_rst),                                                                 // 1 board reset (hold high)
     .probe_out1(vio_start),                                                               // 1 START
     .probe_out2(vio_stop),                                                                // 1 STOP
     .probe_out3(vio_gen_en),                                                              // 1 generator enable
     .probe_out4(vio_len_sel),                                                             // 2 length select
-    .probe_out5(vio_rate_sel));                                                           // 2 rate select
+    .probe_out5(vio_rate_sel),                                                            // 2 rate select
+    .probe_out6(vio_verify));                                                             // 1 verify run
 
   logic [25:0] hb_cnt;
   always_ff @(posedge link_clk) hb_cnt <= hb_cnt + 1'b1;      // free running, no reset needed
@@ -238,7 +265,7 @@ module ax7a200b_top #(
   (* ASYNC_REG = "TRUE" *) logic [1:0] halt_sync, gen_en_sync;
   always_ff @(posedge user_clk) begin
     halt_sync   <= {halt_sync[0], stop_lat};
-    gen_en_sync <= {gen_en_sync[0], vio_gen_en};
+    gen_en_sync <= {gen_en_sync[0], vio_gen_en & ~vio_verify};   // verify run: generator always off
   end
   logic halt;
   assign halt = halt_sync[1];

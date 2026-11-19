@@ -36,6 +36,13 @@
 //   T-8  shutdown: Flush after the last Write, then Delete SQ, Delete CQ, then CC.SHN=01b,
 //        then a CSTS read returning SHST=10b
 //   T-9  no $error in the models (u_core.err_count == 0, u_ssd.err_count == 0)
+//   T-10 verify run (after the recording, same DUT, no reset): ctrl_start low -> IDLE, verify_mode = 1,
+//        verify_cmds = N_CMDS, generator off, ctrl_start high.  The host re-runs the whole bring-up, reads
+//        the recorded 1 MiB back with N_CMDS NVMe Reads (opcode 02h, checked in the SSD event log) and
+//        compares it with the pattern inside the DUT: cmd_limit_done rises, then ctrl_stop; expect
+//        vfy_err_beats == 0, vfy_bytes == 1 MiB, stat_bytes_done == 1 MiB, no command error, orderly DONE.
+//   T-11 second verify run with the SSD corrupting one bit of namespace byte VFY_CORRUPT_BYTE on the Read
+//        path: exactly 1 error beat, first_err_lba / first_err_exp / first_err_got as predicted.
 //   Metric: TX-bus valid-beat ratio in the steady-state window (first .. last data CplD
 //   accepted by the core) is printed (ARCHITECTURE.md §7 target >= 0.9 with tready always
 //   high; note the 100 MHz x 16 B = 1.6 GB/s source limits the ratio to roughly 0.85).
@@ -95,6 +102,11 @@ module tb_top;
   wire  [7:0]   stat_mdts;
   wire  [7:0]   status_flags;
   wire  [63:0]  stat_first_error_lba;
+  logic         verify_mode;
+  logic [31:0]  verify_cmds;
+  wire          cmd_limit_done;
+  wire  [63:0]  vfy_bytes, vfy_first_err_lba;
+  wire  [31:0]  vfy_err_beats, vfy_first_err_exp, vfy_first_err_got;
 
   // ---------------------------------------------------------------------------
   // Models
@@ -137,7 +149,7 @@ module tb_top;
     .link_ready(link_ready), .link_gen2(link_gen2), .link_width(link_width),
     .data_clk(data_clk), .data_rst(data_rst),
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
-    .ctrl_start(ctrl_start), .ctrl_stop(ctrl_stop),
+    .ctrl_start(ctrl_start), .ctrl_stop(ctrl_stop), .verify_mode(verify_mode), .verify_cmds(verify_cmds),
     .status_link_up(status_link_up), .status_gen2(status_gen2), .status_link_width(status_link_width),
     .status_enum_done(status_enum_done), .status_nvme_ready(status_nvme_ready), .status_running(status_running),
     .status_done(status_done), .status_error(status_error), .status_error_detail(status_error_detail),
@@ -148,7 +160,9 @@ module tb_top;
     .stat_beats_in(stat_beats_in), .stat_stall_cycles(stat_stall_cycles),
     .stat_sq_full_stall_cycles(stat_sq_full_stall_cycles), .stat_unexpected_cpl(stat_unexpected_cpl),
     .stat_lbads(stat_lbads), .stat_nsze(stat_nsze), .stat_mdts(stat_mdts),
-    .status_flags(status_flags), .stat_first_error_lba(stat_first_error_lba));
+    .status_flags(status_flags), .stat_first_error_lba(stat_first_error_lba),
+    .cmd_limit_done(cmd_limit_done), .vfy_bytes(vfy_bytes), .vfy_err_beats(vfy_err_beats),
+    .vfy_first_err_lba(vfy_first_err_lba), .vfy_first_err_exp(vfy_first_err_exp), .vfy_first_err_got(vfy_first_err_got));
 
   // ---------------------------------------------------------------------------
   // Error bookkeeping
@@ -378,6 +392,69 @@ module tb_top;
   endtask
 
   // ---------------------------------------------------------------------------
+  // Verify runs (T-10 / T-11): read the recorded range back and compare it inside the DUT
+  // ---------------------------------------------------------------------------
+  localparam longint unsigned VFY_CORRUPT_BYTE = 700001;       // namespace byte address flipped in T-11
+
+  task automatic verify_run(input string name, input longint unsigned corrupt_at, input bit expect_err);
+    int          t;
+    int          reads0, i_rd;
+    logic [31:0] n_bad, exp_dw, got_dw;
+    logic [3:0]  exp_states[$];
+    longint unsigned lba_bad;
+    // back to IDLE (start low, stop low), arm verify mode, generator stays off (src_cnt == TOTAL_BEATS)
+    ctrl_start <= 1'b0; ctrl_stop <= 1'b0;
+    t = 0; while (status_seq_state !== 4'd0 && t < 2000) begin @(posedge user_clk); t++; end
+    if (status_seq_state !== 4'd0) tb_err($sformatf("%s: sequencer did not return to IDLE (state %0d)", name, status_seq_state));
+    repeat (10) @(posedge user_clk);
+    verify_mode <= 1'b1; verify_cmds <= N_CMDS;
+    u_ssd.corrupt_read_at_byte = (corrupt_at == 0) ? -1 : longint'(corrupt_at);
+    reads0 = u_ssd.n_io_reads;
+    seq_trace.delete();
+    @(posedge user_clk);
+    ctrl_start <= 1'b1;
+    t = 0; while (status_running !== 1'b1 && status_error == 0 && t < 400000) begin @(posedge user_clk); t++; end
+    if (status_running !== 1'b1) tb_err($sformatf("%s: never reached RUN (state %0d, error %02h/%02h)", name, status_seq_state, status_error, status_error_detail));
+    t = 0; while (cmd_limit_done !== 1'b1 && status_error == 0 && t < 600000) begin @(posedge user_clk); t++; end
+    if (cmd_limit_done !== 1'b1) tb_err($sformatf("%s: cmd_limit_done never came (error %02h/%02h, SSD reads %0d)", name, status_error, status_error_detail, u_ssd.n_io_reads - reads0));
+    $display("[tb_top @%0t] %s: cmd_limit_done after %0d cycles in RUN, SSD executed %0d Reads", $time, name, t, u_ssd.n_io_reads - reads0);
+    repeat (50) @(posedge user_clk);
+    ctrl_stop <= 1'b1;
+    t = 0; while (status_done !== 1'b1 && status_error == 0 && t < 400000) begin @(posedge user_clk); t++; end
+    repeat (50) @(posedge user_clk);
+
+    // ---- checks ----
+    if (status_done !== 1'b1 || status_error != 0)
+      tb_err($sformatf("%s: no orderly DONE (done %0b, error %02h/%02h)", name, status_done, status_error, status_error_detail));
+    exp_states = {4'd0, 4'd1, 4'd2, 4'd3, 4'd4, 4'd5, 4'd6, 4'd7, 4'd8, 4'd9};
+    if (seq_trace != exp_states)
+      tb_err($sformatf("%s: sequencer state trace %p", name, seq_trace));
+    if (u_ssd.n_io_reads - reads0 != N_CMDS) tb_err($sformatf("%s: SSD executed %0d Reads, expected %0d", name, u_ssd.n_io_reads - reads0, N_CMDS));
+    i_rd = 0;
+    foreach (u_ssd.ev_log[i]) if (u_ssd.ev_log[i].kind == EV_IO && u_ssd.ev_log[i].a == 8'h02) i_rd++;
+    if (i_rd < N_CMDS) tb_err($sformatf("%s: only %0d Read opcodes (02h) in the SSD event log", name, i_rd));
+    if (stat_bytes_done != TOTAL_BYTES || stat_cmds_done != N_CMDS)
+      tb_err($sformatf("%s: stat_bytes_done %0d / stat_cmds_done %0d, expected %0d / %0d", name, stat_bytes_done, stat_cmds_done, TOTAL_BYTES, N_CMDS));
+    if (stat_cmd_errors != 0) tb_err($sformatf("%s: stat_cmd_errors = %0d", name, stat_cmd_errors));
+    if (status_flags !== 8'h00) tb_err($sformatf("%s: status_flags = %02h", name, status_flags));
+    if (vfy_bytes != TOTAL_BYTES) tb_err($sformatf("%s: vfy_bytes = %0d, expected %0d", name, vfy_bytes, TOTAL_BYTES));
+    if (!expect_err) begin
+      if (vfy_err_beats != 0) tb_err($sformatf("%s: vfy_err_beats = %0d, expected 0 (first bad LBA %0d)", name, vfy_err_beats, vfy_first_err_lba));
+      else $display("[tb_top] %s OK: %0d bytes read back and compared, 0 error beats", name, vfy_bytes);
+    end else begin
+      n_bad   = corrupt_at / 16;
+      lba_bad = corrupt_at / 512;
+      exp_dw  = pattern(n_bad) >> (32 * ((corrupt_at % 16) / 4));
+      got_dw  = exp_dw ^ (32'h1 << (8 * (corrupt_at % 4)));
+      if (vfy_err_beats != 1) tb_err($sformatf("%s: vfy_err_beats = %0d, expected exactly 1", name, vfy_err_beats));
+      if (vfy_first_err_lba != lba_bad) tb_err($sformatf("%s: vfy_first_err_lba = %0d, expected %0d", name, vfy_first_err_lba, lba_bad));
+      if (vfy_first_err_exp != exp_dw || vfy_first_err_got != got_dw)
+        tb_err($sformatf("%s: first_err exp/got = %08h/%08h, expected %08h/%08h", name, vfy_first_err_exp, vfy_first_err_got, exp_dw, got_dw));
+      else $display("[tb_top] %s OK: 1 error beat, LBA %0d, exp %08h got %08h", name, vfy_first_err_lba, vfy_first_err_exp, vfy_first_err_got);
+    end
+  endtask
+
+  // ---------------------------------------------------------------------------
   // Main
   // ---------------------------------------------------------------------------
   initial begin
@@ -386,6 +463,7 @@ module tb_top;
     data_rst   = 1'b1;
     link_ready = 1'b0; link_gen2 = 1'b0; link_width = 2'b00;
     ctrl_start = 1'b0; ctrl_stop = 1'b0;
+    verify_mode = 1'b0; verify_cmds = 32'd0;
     apply_plusargs();
     #(1us);
     sys_rst_n = 1'b1;
@@ -435,6 +513,9 @@ module tb_top;
              $time, status_seq_state, status_error, status_error_detail, stat_bytes_done, stat_cmds_done,
              stat_cmd_errors, stat_max_latency, stat_unexpected_cpl);
     final_checks();
+    // T-10 / T-11: read the recording back and compare it inside the DUT
+    verify_run("T-10 verify", 0, 0);
+    verify_run("T-11 verify with corruption", VFY_CORRUPT_BYTE, 1);
     $display("--------------------------------------------------------------------------");
     $display(" tb_top summary: core TX TLPs %0d, RX TLPs %0d (straddles %0d, SOF@DW2 %0d)",
              u_core.tx_tlps, u_core.rx_tlps, u_core.n_straddles, u_core.n_sof_dw2);
@@ -449,7 +530,7 @@ module tb_top;
 
   // Global timeout with a diagnostic dump
   initial begin
-    #(20ms);
+    #(80ms);
     $display("[tb_top] TIMEOUT: seq state %0d, error %02h/%02h, running %0d, bytes %0d, cmds %0d, src %0d beats, SSD writes %0d",
              status_seq_state, status_error, status_error_detail, status_running, stat_bytes_done, stat_cmds_done,
              src_cnt, u_ssd.n_io_writes);

@@ -37,6 +37,7 @@ rtl/nvme/hostmem_writer.sv
 rtl/nvme/data_ring.sv
 rtl/nvme/nvme_admin.sv
 rtl/nvme/nvme_write_engine.sv
+rtl/nvme/verify_checker.sv
 rtl/nvme/host_sequencer.sv
 rtl/nvme/nvme_host_core.sv
 

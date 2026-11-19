@@ -98,6 +98,8 @@ module kc705_top #(
     .data_clk(user_clk),
     .s_data_tdata(s_data_tdata), .s_data_tvalid(s_data_tvalid), .s_data_tready(s_data_tready),
     .ctrl_start(ctrl_start), .ctrl_stop(ctrl_stop),
+    .verify_mode(1'b0), .verify_cmds(32'd0),
+    .cmd_limit_done(), .vfy_bytes(), .vfy_err_beats(), .vfy_first_err_lba(), .vfy_first_err_exp(), .vfy_first_err_got(),
     .status_link_up(status_link_up), .status_gen2(status_gen2), .status_enum_done(status_enum_done),
     .status_nvme_ready(status_nvme_ready), .status_running(status_running), .status_done(status_done),
     .status_error(status_error), .status_error_detail(status_error_detail),
