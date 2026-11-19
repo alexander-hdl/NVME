@@ -21,11 +21,19 @@
 #     format_on | format_off  NVMe Format NVM (SES=0, all data lost) during the bring-up of the next START
 #     gen_on | gen_off  generator enable (VIO probe_out3, 0 after programming)
 #     probes         list the VIO probes with their properties (debugging this script)
+#     bitname=<name> (first argument only) use fpga/build/<name>.bit/.ltx
 #   Commands run in the given order, e.g.  -tclargs program watch=5 status
 # =============================================================================
 set repo_root [file normalize [file join [file dirname [info script]] .. ..]]
-set bit [file join $repo_root fpga build ax7a200b_top.bit]
-set ltx [file join $repo_root fpga build ax7a200b_top.ltx]
+# optional first argument bitname=<name>: use fpga/build/<name>.bit/.ltx instead of ax7a200b_top
+set bitname ax7a200b_top
+if {[llength $argv] > 0 && [string match bitname=* [lindex $argv 0]]} {
+    set bitname [string range [lindex $argv 0] 8 end]; set argv [lrange $argv 1 end]
+} elseif {[llength $argv] > 1 && [lindex $argv 0] eq "bitname"} {   ;# vivado.bat splits key=value
+    set bitname [lindex $argv 1]; set argv [lrange $argv 2 end]
+}
+set bit [file join $repo_root fpga build $bitname.bit]
+set ltx [file join $repo_root fpga build $bitname.ltx]
 
 open_hw_manager
 connect_hw_server -allow_non_jtag
