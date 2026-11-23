@@ -1,7 +1,7 @@
 """was_done.md -> was_done.pdf (A4) via python-markdown + headless Edge.
 
 usage: python tools/md2pdf.py [in.md] [out.pdf]
-Figures from docs/10_slc_cache.html (Fig. 10.2 and 10.4) are inserted after subsections 10.3 and 10.5 of the report.
+Figures from docs/10_slc_cache.html (Fig. 10.2, 10.4, 10.5) are inserted after subsections 10.3 and 10.5 and under the 10.9 heading.
 """
 import os, re, subprocess, sys, tempfile, time
 import markdown
@@ -37,6 +37,8 @@ def fig(label, caption):
     return f'<figure>{m.group(0)}<figcaption>{caption}</figcaption></figure>' if m else ''
 body = body.replace('<h3>10.4.', fig('Скорость записи по мере',
     'Рис. 1. Скорость записи по мере заполнения диска (интервалы 10 с, лог. шкала).') + '<h3>10.4.', 1)
+body = re.sub(r'(<h3>10\.9\..*?</h3>)', lambda m: m.group(1) + fig('Профили записи всего диска',
+    'Рис. 3. Запись всего диска на полной скорости: три SSD (интервалы 10 с, лог. шкала).'), body, count=1)
 body = body.replace('<h3>10.6.', fig('Потребная память',
     'Рис. 2. Память для записи без потерь в зависимости от скорости источника. Зелёная полоса — BRAM XC7A200T.') + '<h3>10.6.', 1)
 
