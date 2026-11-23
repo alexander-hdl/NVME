@@ -89,6 +89,7 @@ module nvme_host_top
   output logic [31:0]  stat_max_latency,
   output logic         stat_cpl_evt,          // user_clk pulse: a data command completed
   output logic [31:0]  stat_cpl_lat,          // its latency in user_clk cycles
+  output logic [15:0]  stat_rx_msgs,          // user_clk: received Messages (discarded), see nvme_host_core.sv
   output logic [7:0]   status_flags,          // see nvme_host_core.sv: [0] shutdown_timeout .. [7] rx_drop
   output logic [63:0]  stat_first_error_lba,  // SLBA of the first failed Write (status_flags[6])
   output logic         format_done,           // user_clk: sticky, Format NVM completed OK (cleared at the start of every run)
@@ -273,7 +274,7 @@ module nvme_host_top
     .status_seq_state(dbg_seq_state), .status_lba_range_err(status_lba_range_err), .status_shutdown_timeout(),
     .status_flags(status_flags),
     .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
-    .stat_max_latency(stat_max_latency), .stat_cpl_evt(stat_cpl_evt), .stat_cpl_lat(stat_cpl_lat), .stat_last_status(), .stat_next_lba(), .stat_beats_in(),
+    .stat_max_latency(stat_max_latency), .stat_cpl_evt(stat_cpl_evt), .stat_cpl_lat(stat_cpl_lat), .stat_rx_msgs(stat_rx_msgs), .stat_last_status(), .stat_next_lba(), .stat_beats_in(),
     .stat_stall_cycles(), .stat_sq_full_stall_cycles(), .stat_unexpected_cpl(),
     .stat_lbads(stat_lbads), .stat_nsze(stat_nsze), .stat_mdts(),
     .stat_first_error_lba(stat_first_error_lba),

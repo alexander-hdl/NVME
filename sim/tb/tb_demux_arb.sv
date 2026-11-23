@@ -52,7 +52,7 @@ module tb_demux_arb;
   logic [15:0]  c_tkeep, r_tkeep, w_tkeep;
   logic         c_tlast, r_tlast, w_tlast, c_tvalid, r_tvalid, w_tvalid, c_tready, r_tready, w_tready;
   logic [1:0]   c_tuser, r_tuser, w_tuser;
-  logic         drop_cnt_inc;
+  logic         drop_cnt_inc, msg_cnt_inc;
 
   tlp_rx_demux u_demux (
     .clk(clk), .rst(rst),
@@ -64,11 +64,11 @@ module tb_demux_arb;
     .m_mrd_tvalid(r_tvalid), .m_mrd_tready(r_tready),
     .m_mwr_tdata(w_tdata), .m_mwr_tkeep(w_tkeep), .m_mwr_tlast(w_tlast), .m_mwr_tuser(w_tuser),
     .m_mwr_tvalid(w_tvalid), .m_mwr_tready(w_tready),
-    .drop_cnt_inc(drop_cnt_inc));
+    .drop_cnt_inc(drop_cnt_inc), .msg_cnt_inc(msg_cnt_inc));
 
   beat_t src_beats [$];             // all input beats
   beat_t exp_q [3][$];              // expected beats per output (0 cpl, 1 mrd, 2 mwr)
-  int    exp_drops = 0;
+  int    exp_drops = 0, exp_msgs = 0, got_msgs = 0;
   int    exp_cnt [3];
   int    perf_first_beat;
   int    a_total_beats;
@@ -106,7 +106,7 @@ module tb_demux_arb;
       if (i == ND_RAND) perf_first_beat = src_beats.size();
       rt = route_of(ft, poison);
       n_route[rt]++;
-      if (rt == 3) exp_drops++;
+      if (rt == 3) begin if (ft[4:3] == 2'b10) exp_msgs++; else exp_drops++; end
       for (int b = 0; b < nb; b++) begin
         beat_t bt;
         bt.d = {$urandom, $urandom, $urandom, $urandom};
@@ -187,6 +187,8 @@ module tb_demux_arb;
     if (r_tvalid && r_tready) check_out(1, r_tdata, r_tkeep, r_tlast, r_tuser);
     if (w_tvalid && w_tready) check_out(2, w_tdata, w_tkeep, w_tlast, w_tuser);
     if (drop_cnt_inc) got_drops++;
+    if (msg_cnt_inc)  got_msgs++;
+    if (drop_cnt_inc && msg_cnt_inc) fail("demux: drop and msg pulse together");
     // exclusivity
     if ((c_tvalid + r_tvalid + w_tvalid) > 1) fail("demux: more than one output valid");
   end
@@ -366,11 +368,13 @@ module tb_demux_arb;
     repeat (30) @(posedge clk);
     if (exp_q[0].size() != 0 || exp_q[1].size() != 0 || exp_q[2].size() != 0) fail("demux: expected beats missing");
     if (got_drops != exp_drops) fail($sformatf("demux: drop_cnt_inc pulses %0d, expected %0d", got_drops, exp_drops));
+    if (got_msgs != exp_msgs) fail($sformatf("demux: msg_cnt_inc pulses %0d, expected %0d", got_msgs, exp_msgs));
+    if (exp_msgs == 0) fail("demux: no messages generated");
     if (dm_perf_stall != 0) fail($sformatf("demux PERF: s_tlp_tready low %0d times with all sinks ready", dm_perf_stall));
     if (sat_idle != 0) fail($sformatf("arb saturation: %0d idle output cycles", sat_idle));
     if (ao_tvalid) fail("arb: extra output at end");
-    $display("DEMUX: routes cpl=%0d mrd=%0d mwr=%0d dropped=%0d TLPs (%0d drop pulses)",
-             n_route[0], n_route[1], n_route[2], n_route[3], got_drops);
+    $display("DEMUX: routes cpl=%0d mrd=%0d mwr=%0d dropped=%0d TLPs (%0d drop + %0d msg pulses)",
+             n_route[0], n_route[1], n_route[2], n_route[3], got_drops, got_msgs);
     $display("ARB: %0d beats total, saturation phase %0d beats in %0d cycles, %0d idle",
              a_out_beats, a_sat_beats, sat_last_cyc - sat_start_cyc + 1, sat_idle);
     if (errors == 0) $display("TEST PASSED");

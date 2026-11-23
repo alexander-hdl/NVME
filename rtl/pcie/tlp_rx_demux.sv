@@ -10,8 +10,11 @@
 // in route_q for the remaining beats of the packet.  Routing is purely
 // combinational (no extra latency, no bubble): tvalid of the selected output
 // follows s_tlp_tvalid, s_tlp_tready follows the selected output's tready; a
-// dropped packet is consumed at full rate.  drop_cnt_inc is a registered one-clock
-// pulse per dropped TLP.
+// dropped packet is consumed at full rate.  Registered one-clock pulses per dropped TLP:
+//   msg_cnt_inc  - a Message (Type 10rrr).  The host acts on no message; the spec has receivers
+//                  discard unsupported ones silently (e.g. the Device Readiness Status VDM that
+//                  some SSDs send right after link-up), so this is statistics, not an error.
+//   drop_cnt_inc - anything else (poisoned MWr, Cfg, unknown Fmt/Type): an unexpected TLP.
 // =============================================================================
 module tlp_rx_demux (
   input  logic         clk,
@@ -45,7 +48,8 @@ module tlp_rx_demux (
   output logic         m_mwr_tvalid,
   input  logic         m_mwr_tready,
   // statistics
-  output logic         drop_cnt_inc
+  output logic         drop_cnt_inc,
+  output logic         msg_cnt_inc
 );
 
   import nvme_host_pkg::*;
@@ -67,6 +71,9 @@ module tlp_rx_demux (
     else if (tlp_is_mwr(h0)) first_route = s_tlp_tuser[TU_ERR_FWD] ? RT_DROP : RT_MWR;
     else                     first_route = RT_DROP;
   end
+
+  logic first_is_msg;
+  assign first_is_msg = (s_tlp_tdata[28:27] == 2'b10);   // Type 10rrr: Msg / MsgD (beat 0 only)
 
   assign route = first_q ? first_route : route_q;
 
@@ -95,12 +102,17 @@ module tlp_rx_demux (
     if (rst) begin
       first_q      <= 1'b1;
       drop_cnt_inc <= 1'b0;
+      msg_cnt_inc  <= 1'b0;
     end else begin
       drop_cnt_inc <= 1'b0;
+      msg_cnt_inc  <= 1'b0;
       if (s_tlp_tvalid && s_tlp_tready) begin
         if (first_q) begin
           route_q <= route;
-          if (route == RT_DROP) drop_cnt_inc <= 1'b1;
+          if (route == RT_DROP) begin
+            if (first_is_msg) msg_cnt_inc  <= 1'b1;
+            else              drop_cnt_inc <= 1'b1;
+          end
         end
         first_q <= s_tlp_tlast;
       end

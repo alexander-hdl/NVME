@@ -98,6 +98,7 @@ module ax7a200b_top #(
   logic [31:0]  stat_max_latency;
   logic         stat_cpl_evt;
   logic [31:0]  stat_cpl_lat;
+  logic [15:0]  stat_rx_msgs;                                // received (discarded) PCIe Messages
   logic [31:0]  vio_slow_thr;                                // VIO probe_out10: slow-command threshold, user_clk cycles (0 = off)
   logic [9:0]   vio_slow_addr;                               // VIO probe_out11: slow-command log read address
   logic [103:0] slow_rd_data;
@@ -124,7 +125,7 @@ module ax7a200b_top #(
     .status_error(status_error), .status_error_detail(status_error_detail),
     .status_link_width(status_link_width), .status_lba_range_err(status_lba_range_err),
     .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
-    .stat_max_latency(stat_max_latency), .stat_cpl_evt(stat_cpl_evt), .stat_cpl_lat(stat_cpl_lat),
+    .stat_max_latency(stat_max_latency), .stat_cpl_evt(stat_cpl_evt), .stat_cpl_lat(stat_cpl_lat), .stat_rx_msgs(stat_rx_msgs),
     .status_flags(status_flags), .stat_first_error_lba(), .link_retries(link_retries),
     .link_lost(link_lost), .link_fail(link_fail),
     .link_clk_out(link_clk), .user_clk_out(user_clk), .dbg_ltssm_state(dbg_ltssm), .dbg_uc(dbg_uc),
@@ -211,6 +212,7 @@ module ax7a200b_top #(
   (* ASYNC_REG = "TRUE" *) logic [223:0] vfy_s0, vfy_s1;    // verify results (static once the run is done)
   (* ASYNC_REG = "TRUE" *) logic [67:0]  ns_s0, ns_s1;      // {lbads, nsze}
   (* ASYNC_REG = "TRUE" *) logic [32:0]  fmt_s0, fmt_s1;    // {format_done, format_ms}
+  (* ASYNC_REG = "TRUE" *) logic [15:0]  msg_s0, msg_s1;    // received Messages (quasi-static counter)
   (* ASYNC_REG = "TRUE" *) logic [135:0] slw_s0, slw_s1;    // {slow_count, slow_rd_data} (read between JTAG polls)
   (* ASYNC_REG = "TRUE" *) logic [119:0] src_s0, src_s1;    // {due, backlog_now, backlog_max} (beats, 40 bit each)
   always_ff @(posedge link_clk) begin
@@ -231,6 +233,8 @@ module ax7a200b_top #(
     fmt_s1   <= fmt_s0;
     slw_s0   <= {slow_count, slow_rd_data};
     slw_s1   <= slw_s0;
+    msg_s0   <= stat_rx_msgs;
+    msg_s1   <= msg_s0;
     src_s0   <= {due_cnt, backlog_q, backlog_max};
     src_s1   <= src_s0;
   end
@@ -262,6 +266,7 @@ module ax7a200b_top #(
     .probe_in22(fmt_s1),                                                                  // 33 {format_done, format_ms}
     .probe_in23(slw_s1[103:0]),                                                           // 104 slow log entry {t_cpl, idx, lat}
     .probe_in24(slw_s1[135:104]),                                                         // 32 slow commands counted
+    .probe_in25(msg_s1),                                                                  // 16 PCIe Messages received (discarded)
     .probe_out0(vio_rst),                                                                 // 1 board reset (hold high)
     .probe_out1(vio_start),                                                               // 1 START
     .probe_out2(vio_stop),                                                                // 1 STOP

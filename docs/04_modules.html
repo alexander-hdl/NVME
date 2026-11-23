@@ -610,10 +610,11 @@
 <tr><td>MRd32 <code>00</code>, MRd64 <code>20</code></td><td><code>m_mrd</code></td><td>пакет из одного beat'а</td></tr>
 <tr><td>MWr32 <code>40</code>, MWr64 <code>60</code>, <code>tuser[0] = 0</code></td><td><code>m_mwr</code></td><td>CQE, данные Identify; MSI от SSD — тоже MWr</td></tr>
 <tr><td>MWr с <code>tuser[0] = 1</code> (poisoned)</td><td>сброс</td><td><code>drop_cnt_inc</code></td></tr>
-<tr><td>Msg/MsgD, CfgRd1/CfgWr1, неизвестные</td><td>сброс</td><td><code>drop_cnt_inc</code>; весь пакет поглощается со скоростью 1 beat/такт</td></tr>
+<tr><td>Msg/MsgD (Type 10rrr)</td><td>сброс</td><td><code>msg_cnt_inc</code>: сообщения хост не обрабатывает, неподдерживаемые по спецификации молча отбрасываются (например, DRS, глава 10.9.4)</td></tr>
+<tr><td>CfgRd1/CfgWr1, неизвестные</td><td>сброс</td><td><code>drop_cnt_inc</code>; весь пакет поглощается со скоростью 1 beat/такт</td></tr>
 </table>
 
-<p><b>Алгоритм.</b> Решение принимается комбинационно по H0 beat'а 0 (флаг <code>first_q</code>) и запоминается в <code>route_q</code> до <code>tlast</code>. Данные, <code>tkeep</code>, <code>tlast</code>, <code>tuser</code> разведены на все три выхода одинаково. Отличаются только <code>tvalid</code>: <code>m_X_tvalid = s_tvalid && (route == X)</code>. А <code>s_tready</code> равен <code>tready</code> выбранного выхода (для сброса — 1). Задержки нет, пустых тактов тоже. <code>drop_cnt_inc</code> — регистровый импульс на каждый выброшенный TLP. В ядре он заведён в отладочную цепь, но не в статус.</p>
+<p><b>Алгоритм.</b> Решение принимается комбинационно по H0 beat'а 0 (флаг <code>first_q</code>) и запоминается в <code>route_q</code> до <code>tlast</code>. Данные, <code>tkeep</code>, <code>tlast</code>, <code>tuser</code> разведены на все три выхода одинаково. Отличаются только <code>tvalid</code>: <code>m_X_tvalid = s_tvalid && (route == X)</code>. А <code>s_tready</code> равен <code>tready</code> выбранного выхода (для сброса — 1). Задержки нет, пустых тактов тоже. <code>drop_cnt_inc</code> и <code>msg_cnt_inc</code> — регистровые импульсы на каждый выброшенный TLP: первый для неожиданных, второй для сообщений. В ядре первый взводит <code>status_flags[7]</code> (<code>rx_drop</code>), второй считается в <code>stat_rx_msgs</code>.</p>
 
 <table class="ports" id="tab-ports_tlp_rx_demux">
 <caption>Таблица 4.22. Порты tlp_rx_demux</caption>
@@ -628,7 +629,8 @@
 <tr><td><code>m_mrd_tready</code></td><td>вход</td><td class="num">1</td><td>готовность приёмника этого потока (обратное давление)</td></tr>
 <tr><td><code>m_mwr_tdata</code><br><code>m_mwr_tkeep</code><br><code>m_mwr_tlast</code><br><code>m_mwr_tuser</code><br><code>m_mwr_tvalid</code></td><td>выход</td><td class="num">128, 16, 1, 2, 1</td><td>MWr → hostmem_writer</td></tr>
 <tr><td><code>m_mwr_tready</code></td><td>вход</td><td class="num">1</td><td>готовность приёмника этого потока (обратное давление)</td></tr>
-<tr><td><code>drop_cnt_inc</code></td><td>выход</td><td class="num">1</td><td>импульс на каждый отброшенный TLP</td></tr>
+<tr><td><code>drop_cnt_inc</code></td><td>выход</td><td class="num">1</td><td>импульс на каждый отброшенный неожиданный TLP (не сообщение)</td></tr>
+<tr><td><code>msg_cnt_inc</code></td><td>выход</td><td class="num">1</td><td>импульс на каждое отброшенное сообщение (Type 10rrr)</td></tr>
 </table>
 
 <!-- ------------------------------------------------------------ arb -->
@@ -1352,7 +1354,7 @@ rd_data  = {entry(i+1), entry(i)}                     (16 байт = 2 запи�
 <tr><td class="num">4</td><td><code>link_fail</code></td><td>линк не поднялся за все попытки</td></tr>
 <tr><td class="num">5</td><td><code>link_lost</code></td><td>линк пропадал после link-up (переживает <code>user_reset</code>)</td></tr>
 <tr><td class="num">6</td><td><code>io_error</code></td><td>Write завершился с ошибкой; SLBA — в <code>stat_first_error_lba</code></td></tr>
-<tr><td class="num">7</td><td><code>rx_drop</code></td><td>принятый TLP отброшен (demux или writer)</td></tr>
+<tr><td class="num">7</td><td><code>rx_drop</code></td><td>отброшен неожиданный TLP (demux: poisoned MWr, Cfg, неизвестный тип; writer: MWr по неизвестному адресу). Сообщения сюда не входят — они в <code>stat_rx_msgs</code></td></tr>
 </table>
 
 <p><b>Параметры:</b> <code>N_SLOTS</code> = 8, <code>SLOT_BYTES</code> = 131 072, <code>SIM_FAST</code> = 0, <code>REQ_TIMEOUT_CYCLES</code> = 1 250 000, <code>CLK_HZ</code> = 125 000 000, <code>IO_TIMEOUT_MS</code> = 30 000, <code>START_LBA</code> = 0.</p>

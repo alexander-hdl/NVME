@@ -5,6 +5,7 @@
 #   vivado -mode batch -nojournal -nolog -source fpga/tools/hw_status.tcl -tclargs <cmd> [<cmd> ...]
 #     program        load fpga/build/ax7a200b_top.bit (+ .ltx), volatile (JTAG only, flash untouched)
 #     status         read and decode all VIO inputs once
+#                    (msgs=N: PCIe Messages received and discarded, e.g. DRS after link-up; not an error)
 #     watch=<s>      read every second for <s> seconds (one line each)
 #     reset          pulse the VIO board reset (new PERST#/bring-up cycle, clears START/STOP)
 #     start | stop   pulse the VIO START / STOP button.  START runs enum + NVMe init + RUN; data is written to the SSD
@@ -109,6 +110,8 @@ proc status {} {
     set last_bytes $bytes; set last_cyc $run_cyc; set last_done [rv s_done]; set last_err [expr {[rv s_err] != 0 || [rv s_lba]}]
     set sc [rp 24]
     if {$sc > 0} { lappend c "slow=$sc" }
+    set mc [rp 25]
+    if {$mc > 0} { lappend c "msgs=$mc" }
     set fm [rp 22]
     if {$fm != 0} { lappend c [format "FORMAT: done=%d took=%d ms" [expr {($fm >> 32) & 1}] [expr {$fm & 0xFFFFFFFF}]] }
     set vf [rp 16]

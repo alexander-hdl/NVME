@@ -61,7 +61,8 @@
 //   [4] link_fail         link never came up (link_bringup retries exhausted)
 //   [5] link_lost         the link dropped after link-up (survives user_reset)
 //   [6] io_error          a Write completed with status != 0 (stat_first_error_lba = its SLBA)
-//   [7] rx_drop           a received TLP was dropped (demux: Msg/IO/unknown/poisoned, writer: unmapped MWr)
+//   [7] rx_drop           an unexpected TLP was dropped (demux: IO/Cfg/unknown/poisoned, writer: unmapped MWr).
+//                         Messages are not counted here but in stat_rx_msgs: they are discarded by design.
 // =============================================================================
 module nvme_host_core
   import nvme_host_pkg::*;
@@ -147,6 +148,7 @@ module nvme_host_core
   output logic [31:0]  stat_max_latency,
   output logic         stat_cpl_evt,             // pulse: a data command completed (write engine cpl_evt)
   output logic [31:0]  stat_cpl_lat,             // its latency in user_clk cycles
+  output logic [15:0]  stat_rx_msgs,             // received Messages (discarded), saturating, cleared by user_rst
   output logic [15:0]  stat_last_status,
   output logic [63:0]  stat_next_lba,
   output logic [63:0]  stat_beats_in,
@@ -197,7 +199,7 @@ module nvme_host_core
 
   logic np_backpressure;
   logic [4:0] np_count;
-  logic demux_drop_inc, writer_drop_inc;
+  logic demux_drop_inc, writer_drop_inc, demux_msg_inc;
 
   pcie7x_rx_adapt u_rx_adapt (
     .clk(user_clk), .rst(user_rst),
@@ -217,7 +219,7 @@ module nvme_host_core
     .m_mrd_tvalid(mrd_tvalid), .m_mrd_tready(mrd_tready),
     .m_mwr_tdata(mwr_tdata), .m_mwr_tkeep(mwr_tkeep), .m_mwr_tlast(mwr_tlast), .m_mwr_tuser(mwr_tuser),
     .m_mwr_tvalid(mwr_tvalid), .m_mwr_tready(mwr_tready),
-    .drop_cnt_inc(demux_drop_inc));
+    .drop_cnt_inc(demux_drop_inc), .msg_cnt_inc(demux_msg_inc));
 
   tlp_tx_arb u_tx_arb (
     .clk(user_clk), .rst(user_rst),
@@ -506,6 +508,11 @@ module nvme_host_core
   always_ff @(posedge user_clk) begin
     if (user_rst)                            rx_drop_q <= 1'b0;
     else if (demux_drop_inc || writer_drop_inc) rx_drop_q <= 1'b1;
+  end
+
+  always_ff @(posedge user_clk) begin
+    if (user_rst)                                   stat_rx_msgs <= 16'd0;
+    else if (demux_msg_inc && stat_rx_msgs != 16'hFFFF) stat_rx_msgs <= stat_rx_msgs + 16'd1;
   end
 
   assign status_flags = {rx_drop_q, io_error, link_lost_uc, link_fail_uc,

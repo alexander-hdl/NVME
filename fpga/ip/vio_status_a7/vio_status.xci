@@ -749,7 +749,7 @@
         "C_PROBE_IN28_WIDTH": [ { "value": "1", "resolve_type": "user", "format": "long", "usage": "all" } ],
         "C_PROBE_IN27_WIDTH": [ { "value": "1", "resolve_type": "user", "format": "long", "usage": "all" } ],
         "C_PROBE_IN26_WIDTH": [ { "value": "1", "resolve_type": "user", "format": "long", "usage": "all" } ],
-        "C_PROBE_IN25_WIDTH": [ { "value": "1", "resolve_type": "user", "format": "long", "usage": "all" } ],
+        "C_PROBE_IN25_WIDTH": [ { "value": "16", "value_src": "user", "resolve_type": "user", "format": "long", "usage": "all" } ],
         "C_PROBE_IN24_WIDTH": [ { "value": "32", "value_src": "user", "resolve_type": "user", "format": "long", "usage": "all" } ],
         "C_PROBE_IN23_WIDTH": [ { "value": "104", "value_src": "user", "resolve_type": "user", "format": "long", "usage": "all" } ],
         "C_PROBE_IN22_WIDTH": [ { "value": "33", "value_src": "user", "resolve_type": "user", "format": "long", "usage": "all" } ],
@@ -778,7 +778,7 @@
         "C_EN_SYNCHRONIZATION": [ { "value": "1", "resolve_type": "user", "format": "long", "usage": "all" } ],
         "C_NUM_PROBE_OUT": [ { "value": "12", "value_src": "user", "resolve_type": "user", "format": "long", "usage": "all" } ],
         "C_EN_PROBE_IN_ACTIVITY": [ { "value": "1", "resolve_type": "user", "format": "long", "usage": "all" } ],
-        "C_NUM_PROBE_IN": [ { "value": "25", "value_src": "user", "resolve_type": "user", "format": "long", "usage": "all" } ],
+        "C_NUM_PROBE_IN": [ { "value": "26", "value_src": "user", "resolve_type": "user", "format": "long", "usage": "all" } ],
         "Component_Name": [ { "value": "vio_status", "resolve_type": "user", "usage": "all" } ]
       },
       "model_parameters": {
@@ -800,7 +800,7 @@
         "C_PIPE_IFACE": [ { "value": "0", "format": "long", "usage": "all" } ],
         "C_BUS_ADDR_WIDTH": [ { "value": "17", "format": "long", "usage": "all" } ],
         "C_BUS_DATA_WIDTH": [ { "value": "16", "format": "long", "usage": "all" } ],
-        "C_NUM_PROBE_IN": [ { "value": "25", "resolve_type": "generated", "format": "long", "usage": "all" } ],
+        "C_NUM_PROBE_IN": [ { "value": "26", "resolve_type": "generated", "format": "long", "usage": "all" } ],
         "C_EN_PROBE_IN_ACTIVITY": [ { "value": "1", "resolve_type": "generated", "format": "long", "usage": "all" } ],
         "C_NUM_PROBE_OUT": [ { "value": "12", "resolve_type": "generated", "format": "long", "usage": "all" } ],
         "C_EN_SYNCHRONIZATION": [ { "value": "1", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
@@ -829,7 +829,7 @@
         "C_PROBE_IN22_WIDTH": [ { "value": "33", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
         "C_PROBE_IN23_WIDTH": [ { "value": "104", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
         "C_PROBE_IN24_WIDTH": [ { "value": "32", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
-        "C_PROBE_IN25_WIDTH": [ { "value": "1", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
+        "C_PROBE_IN25_WIDTH": [ { "value": "16", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
         "C_PROBE_IN26_WIDTH": [ { "value": "1", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
         "C_PROBE_IN27_WIDTH": [ { "value": "1", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
         "C_PROBE_IN28_WIDTH": [ { "value": "1", "resolve_type": "dependent", "format": "long", "usage": "all" } ],
@@ -1625,6 +1625,7 @@
         "probe_in22": [ { "direction": "in", "size_left": "32", "size_right": "0", "driver_value": "0" } ],
         "probe_in23": [ { "direction": "in", "size_left": "103", "size_right": "0", "driver_value": "0" } ],
         "probe_in24": [ { "direction": "in", "size_left": "31", "size_right": "0", "driver_value": "0" } ],
+        "probe_in25": [ { "direction": "in", "size_left": "15", "size_right": "0", "driver_value": "0" } ],
         "probe_out0": [ { "direction": "out", "size_left": "0", "size_right": "0" } ],
         "probe_out1": [ { "direction": "out", "size_left": "0", "size_right": "0" } ],
         "probe_out2": [ { "direction": "out", "size_left": "0", "size_right": "0" } ],
@@ -1660,5 +1661,5 @@
       }
     }
   },
-  "checksum": "d360f403"
+  "checksum": "08b1090f"
 }
