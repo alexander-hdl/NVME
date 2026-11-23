@@ -96,6 +96,12 @@ module ax7a200b_top #(
   logic         link_lost, link_fail;
   logic [63:0]  stat_bytes_done, stat_cmds_done;
   logic [31:0]  stat_max_latency;
+  logic         stat_cpl_evt;
+  logic [31:0]  stat_cpl_lat;
+  logic [31:0]  vio_slow_thr;                                // VIO probe_out10: slow-command threshold, user_clk cycles (0 = off)
+  logic [9:0]   vio_slow_addr;                               // VIO probe_out11: slow-command log read address
+  logic [103:0] slow_rd_data;
+  logic [31:0]  slow_count;
   logic [5:0]   dbg_ltssm;
   logic         host_perst_n;                                // PERST# requested by link_bringup
   logic [303:0] dbg_uc;                                      // user_clk debug bus -> ILA
@@ -118,7 +124,7 @@ module ax7a200b_top #(
     .status_error(status_error), .status_error_detail(status_error_detail),
     .status_link_width(status_link_width), .status_lba_range_err(status_lba_range_err),
     .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
-    .stat_max_latency(stat_max_latency),
+    .stat_max_latency(stat_max_latency), .stat_cpl_evt(stat_cpl_evt), .stat_cpl_lat(stat_cpl_lat),
     .status_flags(status_flags), .stat_first_error_lba(), .link_retries(link_retries),
     .link_lost(link_lost), .link_fail(link_fail),
     .link_clk_out(link_clk), .user_clk_out(user_clk), .dbg_ltssm_state(dbg_ltssm), .dbg_uc(dbg_uc),
@@ -205,6 +211,7 @@ module ax7a200b_top #(
   (* ASYNC_REG = "TRUE" *) logic [223:0] vfy_s0, vfy_s1;    // verify results (static once the run is done)
   (* ASYNC_REG = "TRUE" *) logic [67:0]  ns_s0, ns_s1;      // {lbads, nsze}
   (* ASYNC_REG = "TRUE" *) logic [32:0]  fmt_s0, fmt_s1;    // {format_done, format_ms}
+  (* ASYNC_REG = "TRUE" *) logic [135:0] slw_s0, slw_s1;    // {slow_count, slow_rd_data} (read between JTAG polls)
   (* ASYNC_REG = "TRUE" *) logic [119:0] src_s0, src_s1;    // {due, backlog_now, backlog_max} (beats, 40 bit each)
   always_ff @(posedge link_clk) begin
     ltssm_s0 <= dbg_ltssm;
@@ -222,6 +229,8 @@ module ax7a200b_top #(
     ns_s1    <= ns_s0;
     fmt_s0   <= {format_done, format_ms};
     fmt_s1   <= fmt_s0;
+    slw_s0   <= {slow_count, slow_rd_data};
+    slw_s1   <= slw_s0;
     src_s0   <= {due_cnt, backlog_q, backlog_max};
     src_s1   <= src_s0;
   end
@@ -251,6 +260,8 @@ module ax7a200b_top #(
     .probe_in20(src_s1[79:40]),                                                           // 40 backlog now (beats)
     .probe_in21(src_s1[119:80]),                                                          // 40 beats produced by the source (due)
     .probe_in22(fmt_s1),                                                                  // 33 {format_done, format_ms}
+    .probe_in23(slw_s1[103:0]),                                                           // 104 slow log entry {t_cpl, idx, lat}
+    .probe_in24(slw_s1[135:104]),                                                         // 32 slow commands counted
     .probe_out0(vio_rst),                                                                 // 1 board reset (hold high)
     .probe_out1(vio_start),                                                               // 1 START
     .probe_out2(vio_stop),                                                                // 1 STOP
@@ -260,7 +271,9 @@ module ax7a200b_top #(
     .probe_out6(vio_verify),                                                              // 1 verify run
     .probe_out7(vio_rate_step),                                                           // 32 real-time source rate step
     .probe_out8(vio_len_cmds),                                                            // 32 run length in commands
-    .probe_out9(vio_format));                                                             // 1 Format NVM at the next bring-up
+    .probe_out9(vio_format),                                                              // 1 Format NVM at the next bring-up
+    .probe_out10(vio_slow_thr),                                                           // 32 slow-command threshold (cycles)
+    .probe_out11(vio_slow_addr));                                                         // 10 slow log read address
 
   logic [25:0] hb_cnt;
   always_ff @(posedge link_clk) hb_cnt <= hb_cnt + 1'b1;      // free running, no reset needed
@@ -321,6 +334,18 @@ module ax7a200b_top #(
       end
     end
   end
+
+  // ---- slow-command log (debug): every data command with latency >= vio_slow_thr, see slow_cmd_log.sv ------
+  (* ASYNC_REG = "TRUE" *) logic [41:0] slw_c0, slw_c1;       // {read address, threshold} (quasi-static)
+  always_ff @(posedge user_clk) begin
+    slw_c0 <= {vio_slow_addr, vio_slow_thr};
+    slw_c1 <= slw_c0;
+  end
+  slow_cmd_log #(.DEPTH(1024)) u_slow_log (
+    .clk(user_clk), .rst(urst),
+    .evt(stat_cpl_evt), .lat(stat_cpl_lat), .t_now(run_cyc), .idx(stat_cmds_done[31:0]),
+    .thr(slw_c1[31:0]), .rd_addr(slw_c1[41:32]),
+    .rd_data(slow_rd_data), .count(slow_count));
 
   // rate / length select from the VIO (quasi-static, set before START)
   (* ASYNC_REG = "TRUE" *) logic [67:0] sel_s0, sel_s1;

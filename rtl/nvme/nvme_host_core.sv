@@ -145,6 +145,8 @@ module nvme_host_core
   output logic [63:0]  stat_cmds_done,
   output logic [31:0]  stat_cmd_errors,
   output logic [31:0]  stat_max_latency,
+  output logic         stat_cpl_evt,             // pulse: a data command completed (write engine cpl_evt)
+  output logic [31:0]  stat_cpl_lat,             // its latency in user_clk cycles
   output logic [15:0]  stat_last_status,
   output logic [63:0]  stat_next_lba,
   output logic [63:0]  stat_beats_in,
@@ -476,7 +478,8 @@ module nvme_host_core
     .flush_req(seq_flush_req), .flush_done(flush_done),
     .next_lba(stat_next_lba), .bytes_done(stat_bytes_done), .cmds_done(stat_cmds_done),
     .cmd_errors(stat_cmd_errors), .last_status(stat_last_status),
-    .max_latency_cycles(stat_max_latency), .sq_full_stall(sq_full_stall),
+    .max_latency_cycles(stat_max_latency), .cpl_evt(stat_cpl_evt), .cpl_lat(stat_cpl_lat),
+    .sq_full_stall(sq_full_stall),
     .sq_full_stall_cycles(stat_sq_full_stall_cycles),
     .sq_tail(sq_tail), .cq_head(cq_head), .slots_idle(slots_idle),
     .lba_range_err(status_lba_range_err), .doorbell_err(doorbell_err),

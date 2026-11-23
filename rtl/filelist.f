@@ -48,4 +48,5 @@ rtl/nvme_host_top.sv
 rtl/board/kc705_top.sv
 
 # --- board top (ALINX AX7A200B: pins in fpga/constraints/ax7a200b_board.xdc; reuses kc705_debounce) ---
+rtl/board/slow_cmd_log.sv
 rtl/board/ax7a200b_top.sv

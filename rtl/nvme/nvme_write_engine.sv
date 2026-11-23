@@ -145,6 +145,8 @@ module nvme_write_engine
   output logic [31:0] cmd_errors,
   output logic [15:0] last_status,
   output logic [31:0] max_latency_cycles,
+  output logic        cpl_evt,            // 1-cycle pulse: a data command completed (any status)
+  output logic [31:0] cpl_lat,            // its latency in clk cycles (submit commit .. CQE reap), valid with cpl_evt
   output logic        sq_full_stall,
   output logic [31:0] sq_full_stall_cycles,
   output logic [6:0]  sq_tail,
@@ -383,6 +385,8 @@ module nvme_write_engine
       cmd_errors         <= 32'd0;
       last_status        <= 16'd0;
       max_latency_cycles <= 32'd0;
+      cpl_evt            <= 1'b0;
+      cpl_lat            <= 32'd0;
       sq_full_stall_cycles <= 32'd0;
       lba_range_err      <= 1'b0;
       doorbell_err       <= 1'b0;
@@ -399,6 +403,7 @@ module nvme_write_engine
     end else begin
       cyc       <= cyc + 1'b1;
       slot_free <= '0;
+      cpl_evt   <= 1'b0;
       rd_v1     <= 1'b1;
       rd_v2     <= rd_v1;
       skip_r    <= reap_hit;                 // the read issued before this consume is stale
@@ -497,6 +502,8 @@ module nvme_write_engine
               cmds_done  <= cmds_done + 64'd1;
             end
             if (lat > max_latency_cycles) max_latency_cycles <= lat;
+            cpl_evt <= 1'b1;
+            cpl_lat <= lat;
           end
         end
       end

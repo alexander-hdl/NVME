@@ -19,6 +19,9 @@
 #     verify_on | verify_off  verify run: START reads len= GiB back with NVMe Read and compares it with the pattern
 #                    (results: VERIFY: in the status line); recording: verify_off
 #     format_on | format_off  NVMe Format NVM (SES=0, all data lost) during the bring-up of the next START
+#     slow_thr=<ms>  slow-command log: every data command with latency >= ms is counted (slow= in STATUS) and the
+#                    first 1024 are logged {time, command index, latency}; 0 = off; set before START
+#     slowlog[=<file>] read the log into fpga/build/<file> (default slowlog.csv): n,t_s,cmd_idx,written_GiB,lat_ms
 #     gen_on | gen_off  generator enable (VIO probe_out3, 0 after programming)
 #     probes         list the VIO probes with their properties (debugging this script)
 #     bitname=<name> (first argument only) use fpga/build/<name>.bit/.ltx
@@ -104,6 +107,8 @@ proc status {} {
     }
     global last_bytes last_cyc last_done last_err
     set last_bytes $bytes; set last_cyc $run_cyc; set last_done [rv s_done]; set last_err [expr {[rv s_err] != 0 || [rv s_lba]}]
+    set sc [rp 24]
+    if {$sc > 0} { lappend c "slow=$sc" }
     set fm [rp 22]
     if {$fm != 0} { lappend c [format "FORMAT: done=%d took=%d ms" [expr {($fm >> 32) & 1}] [expr {$fm & 0xFFFFFFFF}]] }
     set vf [rp 16]
@@ -127,7 +132,7 @@ proc pulse {name} {
 # vivado.bat splits 'key=value' into 'key value': merge them back
 set argv_m {}
 foreach a $argv {
-    if {[llength $argv_m] && [lindex $argv_m end] in {watch len rate rate_bps len_cmds len_gib until}} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
+    if {[llength $argv_m] && [lindex $argv_m end] in {watch len rate rate_bps len_cmds len_gib until slow_thr} || ([lindex $argv_m end] eq "slowlog" && [string match *.csv $a])} { lset argv_m end "[lindex $argv_m end]=$a" } else { lappend argv_m $a }
 }
 set argv $argv_m
 
@@ -178,6 +183,34 @@ foreach a $argv {
                         write_hw_ila_data -force -csv_file $csv $d
                         puts "CAPTURE: written $csv"
                     }
+                }
+                slow_thr=* {
+                    # slow-command log: count/log every data command with latency >= <ms> (0 = off); set before START
+                    set ms [string range $a 9 end]
+                    set thr [expr {wide(round(double($ms) * 125000.0))}]
+                    set p [get_hw_probes vio_slow_thr -of_objects [vio]]
+                    set_property OUTPUT_VALUE_RADIX UNSIGNED $p; set_property OUTPUT_VALUE $thr $p; commit_hw_vio $p
+                    puts [format "SLOW_THR: %s ms -> %d cycles" $ms $thr]
+                }
+                slowlog - slowlog=* {
+                    # read the slow-command log (first 1024 entries) and write fpga/build/<file> (default slowlog.csv)
+                    set fn [expr {[string match slowlog=* $a] ? [string range $a 8 end] : "slowlog.csv"}]
+                    set csv [file join $repo_root fpga build $fn]
+                    refresh_hw_vio [vio]
+                    set n [rp 24]; set m [expr {$n < 1024 ? $n : 1024}]
+                    set pa [get_hw_probes vio_slow_addr -of_objects [vio]]
+                    set_property OUTPUT_VALUE_RADIX UNSIGNED $pa
+                    set fh [open $csv w]
+                    puts $fh "n,t_s,cmd_idx,written_GiB,lat_ms"
+                    for {set i 0} {$i < $m} {incr i} {
+                        set_property OUTPUT_VALUE $i $pa; commit_hw_vio $pa
+                        refresh_hw_vio [vio]
+                        set d [rp 23]
+                        set t [expr {($d >> 64) & 0xFFFFFFFFFF}]; set ix [expr {($d >> 32) & 0xFFFFFFFF}]; set l [expr {$d & 0xFFFFFFFF}]
+                        puts $fh [format "%d,%.6f,%d,%.4f,%.3f" $i [expr {$t / 125e6}] $ix [expr {$ix / 8192.0}] [expr {$l / 125e3}]]
+                    }
+                    close $fh
+                    puts "SLOWLOG: count=$n read=$m -> $csv"
                 }
                 rate_bps=* {
                     # real-time source: R bytes/s -> step = R * 2^32 / 2e9 (0 = off, back to rate=)
