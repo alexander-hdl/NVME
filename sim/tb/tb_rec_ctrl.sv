@@ -838,6 +838,13 @@ module tb_rec_ctrl;
     wait_st(4, 40, "CORE_STOP by end_found"); wait_idle();
     chk(dut.rsid_user_q === 1'b0, "READ SID is used once");
     cleanup();
+    // race: Identify NS publishes nsze before lbads: snapshots with nsze != 0, lbads = 0 must not start the capacity engine
+    m_nsze = 64'h10_0000; m_lbads = 4'd0;
+    ok0(OP_READ_END); wait_cyc(400);
+    chk(int'(dut.st_q) == 1 && dut.cap_busy_q === 1'b0 && dut.cap_valid_q === 1'b0, "lbads=0 snapshot: capacity engine waits");
+    m_lbads = 4'd9; wait_st(2, 3000, "RUN"); wait_cyc(20);
+    chk(verify_cmds === 32'd4096, $sformatf("READ END after lbads 0 -> 9: verify_cmds %0d", verify_cmds));
+    pulse_key(1); wait_st(4, 40, "CORE_STOP by KEY2"); wait_idle(); cleanup();
     m_nsze = 64'h20000; m_lbads = 4'd12;
     ok0(OP_READ_END); wait_st(2, 3000, "RUN"); wait_cyc(20);
     chk(verify_cmds === 32'd4096, $sformatf("READ END (lbads 12) verify_cmds %0d", verify_cmds));

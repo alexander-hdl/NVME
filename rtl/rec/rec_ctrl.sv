@@ -184,6 +184,7 @@ module rec_ctrl
   logic [63:0]  t0_q, t_run_q, t_start_q, t_done_q, lt0_q;
   logic [63:0]  tab_q [1:6];
   logic [6:1]   tv_q;
+  logic [6:1]   tw, tw_q;              // phase time stamp requests (tab_q is written one clock later: timing)
   logic [3:0]   fin_q;
   logic         fin_act_q;
   logic [4:0]   last_res_kind_q;
@@ -299,7 +300,7 @@ module rec_ctrl
   logic         rcap_loc_q, rcap_clr_q, rcap_core_q;
   rec_mode_e    rcap_md_q;
   logic [63:0]  ldur_q;
-  logic         nsze_nz_q;
+  logic         nsze_nz_q, lb_ok_q;   // lb_ok_q: lbads >= 9 (Identify NS publishes nsze before the LBA format)
   logic         prog_to_q, uwd_to_q;       // registered watchdog expiry (prog_q is cleared one clock after a state change: gated by s_chg)
   logic         wr0_q;
   logic [39:0]  lpos_sub_q;
@@ -511,6 +512,7 @@ module rec_ctrl
     gx_mem = 1'b0; gx_dtest = 1'b0; gx_rdk = 2'd0; gx_n = 64'd0;
     gx_ev_stop = 1'b0; gx_ev_pf = 1'b0; gx_ev_pf_key = 1'b0; gx_ev_abort = 1'b0;
     do_capture = 1'b0;
+    tw = 6'd0;
     st_n = st_q; md_n = md_q;
     errored_n = errored_q;
     exec_n = 1'b0; pq_busy_n = pq_busy_q;
@@ -519,6 +521,7 @@ module rec_ctrl
     st_prev_q <= st_q;
     ldur_q    <= t64_q - lt0_q;
     nsze_nz_q <= (core_stat.nsze != 64'd0);
+    lb_ok_q   <= (core_stat.lbads >= 4'd9);
     prog_to_q <= (prog_q >= WD_PROG);
     uwd_to_q  <= (uwd_q >= WD_UI);
 
@@ -772,7 +775,7 @@ module rec_ctrl
       // ------------------------------------------------------------------ BRINGUP
       ST_BRINGUP: begin
         // capacity (REC and READ END): start once the core knows the namespace
-        if (!cap_valid_q && !cap_busy_q && core_age_ok && nsze_nz_q &&
+        if (!cap_valid_q && !cap_busy_q && core_age_ok && nsze_nz_q && lb_ok_q &&
             (md_q == MD_REC || md_q == MD_PF || (md_q == MD_READ && rd_kind_q == 2'd2))) begin
           cap_busy_q <= 1'b1; cap_val_q <= core_stat.nsze;
           cap_cnt_q <= (5'd17 - {1'b0, core_stat.lbads});
@@ -789,11 +792,11 @@ module rec_ctrl
           st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; do_capture = 1'b1;
           pf_inb_q <= 1'b1; pf_src_q <= ev_pf_key;
           if (md_q == MD_REC) md_n = MD_PF;
-          for (k = 1; k <= 3; k = k + 1) tab_q[k] <= t64_q;    // no source yet: phases 1..3 are empty
+          for (k = 1; k <= 3; k = k + 1) tw[k] = 1'b1;    // no source yet: phases 1..3 are empty
           tv_q[3:1] <= 3'b111;
         end else if (ev_stop) begin
           st_n = ST_CORE_STOP; ctrl_stop <= 1'b1;
-          for (k = 1; k <= 3; k = k + 1) tab_q[k] <= t64_q;
+          for (k = 1; k <= 3; k = k + 1) tw[k] = 1'b1;
           tv_q[3:1] <= 3'b111;
         end else if (cs_run_q &&
             !(md_q == MD_READ && rd_kind_q == 2'd2 && !vc_loaded_q)) begin   // review fix F: READ END waits for its capacity limit
@@ -809,7 +812,7 @@ module rec_ctrl
           case (rs_q)
             3'd0: begin
               if (cap_valid_q) rs_q <= 3'd1;
-              else if (!cap_busy_q && core_age_ok) begin
+              else if (!cap_busy_q && core_age_ok && nsze_nz_q && lb_ok_q) begin
                 cap_busy_q <= 1'b1; cap_val_q <= core_stat.nsze;
                 cap_cnt_q <= (5'd17 - {1'b0, core_stat.lbads});
               end
@@ -833,11 +836,11 @@ module rec_ctrl
         if (cs_err_q) begin
           st_n = ST_ERROR;
         end else if (md_q == MD_FORMAT) begin
-          st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; tab_q[3] <= t64_q; tv_q[3] <= 1'b1;
+          st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; tw[3] = 1'b1; tv_q[3] <= 1'b1;
         end else if (cs_fl_q) begin
           // the core stopped on its own (io_timeout, lba_range_err ...)
           st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; errored_n = 1'b1;
-          tab_q[3] <= t64_q; tv_q[3] <= 1'b1;
+          tw[3] = 1'b1; tv_q[3] <= 1'b1;
           if (md_q == MD_REC && !src_stopped_q) begin
             src_stopped_q <= 1'b1; sp_kind_q <= 2'd1;
           end
@@ -854,53 +857,53 @@ module rec_ctrl
           // READ / MON
           if (ev_pf || ev_stop ||
               (md_q == MD_READ && ((core_age_ok && core_stat.cmd_limit_done) || (ui_age_ok && ui_stat.end_found)))) begin
-            st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; tab_q[3] <= t64_q; tv_q[3] <= 1'b1;
+            st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; tw[3] = 1'b1; tv_q[3] <= 1'b1;
           end
         end
       end
 
       // ------------------------------------------------------------------ SRC_STOP
       ST_SRC_STOP: begin
-        if (ui_age_ok && !tv_q[1] && (!ui_stat.src_active || rs_q == 3'd5)) begin tab_q[1] <= t64_q; tv_q[1] <= 1'b1; end
-        if (ui_age_ok && !tv_q[2] && src_done_eff)    begin tab_q[2] <= t64_q; tv_q[2] <= 1'b1; end
+        if (ui_age_ok && !tv_q[1] && (!ui_stat.src_active || rs_q == 3'd5)) begin tw[1] = 1'b1; tv_q[1] <= 1'b1; end
+        if (ui_age_ok && !tv_q[2] && src_done_eff)    begin tw[2] = 1'b1; tv_q[2] <= 1'b1; end
         if (cs_err_q) begin
           st_n = ST_ERROR;
         end else if (cs_fl_q) begin
           st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; errored_n = 1'b1;
-          tab_q[3] <= t64_q; tv_q[3] <= 1'b1;
+          tw[3] = 1'b1; tv_q[3] <= 1'b1;
           if (!src_stopped_q) begin src_stopped_q <= 1'b1; sp_kind_q <= 2'd1; end
         end else if (drain_hold_q >= 3'd2) begin
-          st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; tab_q[3] <= t64_q; tv_q[3] <= 1'b1;
-          if (!tv_q[1]) begin tab_q[1] <= t64_q; tv_q[1] <= 1'b1; end
-          if (!tv_q[2]) begin tab_q[2] <= t64_q; tv_q[2] <= 1'b1; end
+          st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; tw[3] = 1'b1; tv_q[3] <= 1'b1;
+          if (!tv_q[1]) begin tw[1] = 1'b1; tv_q[1] <= 1'b1; end
+          if (!tv_q[2]) begin tw[2] = 1'b1; tv_q[2] <= 1'b1; end
         end else if (prog_to_q || uwd_to_q) begin
           // review fix D: the drain makes no progress (stuck ddr_idle / drain_eq) or ui_clk is dead: stop the core, report !E
-          st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; errored_n = 1'b1; tab_q[3] <= t64_q; tv_q[3] <= 1'b1;
-          if (!tv_q[1]) begin tab_q[1] <= t64_q; tv_q[1] <= 1'b1; end
-          if (!tv_q[2]) begin tab_q[2] <= t64_q; tv_q[2] <= 1'b1; end
+          st_n = ST_CORE_STOP; ctrl_stop <= 1'b1; errored_n = 1'b1; tw[3] = 1'b1; tv_q[3] <= 1'b1;
+          if (!tv_q[1]) begin tw[1] = 1'b1; tv_q[1] <= 1'b1; end
+          if (!tv_q[2]) begin tw[2] = 1'b1; tv_q[2] <= 1'b1; end
         end else if (ev_pf) begin
           md_n = MD_PF; do_capture = 1'b1; pf_late_q <= 1'b1; pf_src_q <= ev_pf_key;
-          for (k = 1; k <= 6; k = k + 1) if (tv_q[k]) tab_q[k] <= t64_q;
+          for (k = 1; k <= 6; k = k + 1) if (tv_q[k]) tw[k] = 1'b1;
         end
       end
 
       // ------------------------------------------------------------------ CORE_STOP
       ST_CORE_STOP: begin
         if (md_q == MD_REC || md_q == MD_PF) begin
-          if (ui_age_ok && !tv_q[1] && (!ui_stat.src_active || rs_q == 3'd5)) begin tab_q[1] <= t64_q; tv_q[1] <= 1'b1; end
-          if (ui_age_ok && !tv_q[2] && src_done_eff)    begin tab_q[2] <= t64_q; tv_q[2] <= 1'b1; end
+          if (ui_age_ok && !tv_q[1] && (!ui_stat.src_active || rs_q == 3'd5)) begin tw[1] = 1'b1; tv_q[1] <= 1'b1; end
+          if (ui_age_ok && !tv_q[2] && src_done_eff)    begin tw[2] = 1'b1; tv_q[2] <= 1'b1; end
         end
         if (cs_fl_q && !tv_q[4]) begin
-          tab_q[4] <= t64_q; tv_q[4] <= 1'b1;
+          tw[4] = 1'b1; tv_q[4] <= 1'b1;
         end
         if (cs_sd_q && !tv_q[5]) begin
-          tab_q[5] <= t64_q; tv_q[5] <= 1'b1;
+          tw[5] = 1'b1; tv_q[5] <= 1'b1;
         end
         if (cs_err_q) begin
           st_n = ST_ERROR;
         end else if (cs_done_q) begin
           st_n = ST_RELEASE; ctrl_start <= 1'b0; t_done_q <= t64_q;
-          tab_q[6] <= t64_q; tv_q[6] <= 1'b1;
+          tw[6] = 1'b1; tv_q[6] <= 1'b1;
           errored_n = errored_q || (core_stat.error != 8'h00) || core_stat.flags[0] || core_stat.flags[2] ||
                       core_stat.flags[3];
           fin_act_q <= 1'b1; fin_q <= 4'd0;
@@ -917,7 +920,7 @@ module rec_ctrl
           end
         end else if (ev_pf && md_q == MD_REC) begin
           md_n = MD_PF; do_capture = 1'b1; pf_late_q <= 1'b1; pf_src_q <= ev_pf_key;
-          for (k = 1; k <= 6; k = k + 1) if (tv_q[k]) tab_q[k] <= t64_q;
+          for (k = 1; k <= 6; k = k + 1) if (tv_q[k]) tw[k] = 1'b1;
         end
       end
 
@@ -1027,6 +1030,9 @@ module rec_ctrl
       res_q <= res_loc_img;
       if (rcap_clr_q) ui_clear <= 1'b1;       // after the image: ui_clear resets the ui status counters
     end
+
+    tw_q <= tw;
+    for (k = 1; k <= 6; k = k + 1) if (tw_q[k]) tab_q[k] <= t64_q;
 
     // ---- finalisation after DONE (phase times, duration), one step per clock
     if (fin_act_q && st_q == ST_RELEASE) begin
