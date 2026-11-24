@@ -35,7 +35,7 @@ set tj_list {25 50 70 85}
 set rate_max 1.6e9
 # bit-toggle probability of random data per clock at the maximum stream: 50 %
 set tr_data_max 50.0
-set data_nets {*u_rec_framer* *u_ddr_fifo* *u_data_ring* *u_rec_verify* *u_vrf_tap*}
+set data_nets {*u_rec_framer *u_ddr_fifo *u_data_ring *u_rec_verify *u_vrf_tap}
 if {[info exists ::env(PT_DATA_NETS)]} { set data_nets $::env(PT_DATA_NETS) }
 set tr_ctrl 2.0
 if {[info exists ::env(PT_CTRL_TOGGLE)]} { set tr_ctrl $::env(PT_CTRL_TOGGLE) }
@@ -69,11 +69,13 @@ proc parse_power {rpt} {
 
 # --- run ---------------------------------------------------------------------
 open_checkpoint $dcp
+set_param tcl.collectionResultDisplayLimit 0   ;# data-path net lists have thousands of nets
 set tmp [file join [file dirname [file normalize $out_csv]] _power_tmp.rpt]
 
 set data_objs {}
 foreach pat $data_nets {
-    set n [get_nets -hierarchical -quiet $pat]
+    # match nets INSIDE the instance (full hierarchical name), not top-level nets named after it
+    set n [get_nets -hierarchical -quiet -filter "NAME =~ ${pat}/*"]
     if {[llength $n] == 0} { puts "WARNING: no nets match data pattern '$pat'" }
     lappend data_objs {*}$n
 }
