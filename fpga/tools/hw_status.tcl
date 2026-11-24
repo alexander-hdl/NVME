@@ -6,6 +6,9 @@
 #     program        load fpga/build/ax7a200b_top.bit (+ .ltx), volatile (JTAG only, flash untouched)
 #     status         read and decode all VIO inputs once
 #                    (msgs=N: PCIe Messages received and discarded, e.g. DRS after link-up; not an error)
+#     rstatus        recorder bitstream (bitname=ax7a200b_rec_top): VIO probes by port number with the recorder labels
+#                    (probe_in10/11 = src/wr blocks, 12 vb, 13 ve, 14 fep, 15 {exp,got}, 19/20/21 = ddrm/16, ddr/16, drp;
+#                    pulse start/stop/reset work as before: probe_out1/2/0)
 #     watch=<s>      read every second for <s> seconds (one line each)
 #     reset          pulse the VIO board reset (new PERST#/bring-up cycle, clears START/STOP)
 #     start | stop   pulse the VIO START / STOP button.  START runs enum + NVMe init + RUN; data is written to the SSD
@@ -130,6 +133,13 @@ proc pulse {name} {
     puts "PULSE: $name"
 }
 
+# recorder bitstream (ax7a200b_rec_top, STAND/RECORDER_SPEC.md 4.5): the probes are read by port number (net names differ)
+proc rstatus {} {
+    refresh_hw_vio [vio]
+    set p0 [rp 0]
+    puts [format "RSTATUS: link_up=%d gen2=%d run=%d done=%d lba_err=%d cmd_err_nz=%d | err=0x%02X detail=0x%02X flags=0x%02X width=%d | link_lost=%d link_fail=%d retries=%d ltssm=0x%02X | bytes=%s cmds=%s cmd_err=%s max_lat=%s | src_blk=%s wr_blk=%s | vb=%s ve=%s fep=%s exp/got=%016X | ddrm=%d KiB ddr=%d KiB drp=%s | nsze=%s lbads=%s | msgs=%s"         [expr {$p0 & 1}] [expr {($p0 >> 1) & 1}] [expr {($p0 >> 4) & 1}] [expr {($p0 >> 5) & 1}] [expr {($p0 >> 6) & 1}] [expr {($p0 >> 7) & 1}]         [expr {[rp 1] & 0xFF}] [expr {([rp 1] >> 8) & 0xFF}] [rp 2] [rp 3]         [expr {([rp 4] >> 2) & 1}] [expr {([rp 4] >> 3) & 1}] [expr {[rp 4] & 3}] [rp 5]         [rp 6] [rp 7] [rp 8] [rp 9] [rp 10] [rp 11] [rp 12] [rp 13] [rp 14] [rp 15]         [expr {[rp 19] * 16 / 1024}] [expr {[rp 20] * 16 / 1024}] [rp 21] [rp 17] [rp 18] [rp 25]]
+}
+
 # which cnt_s1* probe is which counter: decided from the probe's bit range (PROBE_PORT_BITS / name), see "probes"
 
 # vivado.bat splits 'key=value' into 'key value': merge them back
@@ -162,6 +172,7 @@ foreach a $argv {
                     }
                 }
                 status   { status }
+                rstatus  { rstatus }
                 watch=*  { set n [string range $a 6 end]; for {set i 0} {$i < $n} {incr i} { status; after 1000 } }
                 reset    { pulse vio_rst }
                 start    { pulse vio_start }

@@ -1,0 +1,4 @@
+# WP9 PC tools. Core and --selftest need only the Python 3 standard library.
+pyserial>=3.5      # only for --port (real UART); imported lazily
+matplotlib         # optional, not used by v1 tools
+pytest             # optional: tests are plain unittest, also run by pytest

@@ -11,6 +11,9 @@
 //   * fills ident_ram with realistic (and deliberately noisy) Identify data,
 //   * posts the CQE into acq_ram as two 8-byte halves with the phase bit last,
 //   * checks doorbell values (SQ tail = last+1, CQ head = number of CQEs).
+// WP5 (recorder): Get Log Page 02h tests T21..T25 (SQE, SMART layout, RTD3E, >= 130 logs in a row = 4 admin queue
+//   revolutions while a second requester port (req_mux port 1) rings doorbells continuously, status / CID / doorbell
+//   failures, timeout + late CQE absorbed during Delete SQ, start_shutdown during a log, log_req ignored after SHUTDOWN).
 // Scenarios: see the "tests" section at the end (T1..T14).
 //   T11 MDTS smaller than SLOT_BYTES -> F_MDTS (0x14); T12 MDTS = 0 / larger / SQES 0x76 / CQES 0x54
 //   are accepted; T13 SQES required size 7 or CQES maximum 3 are rejected (nibble-wise check);
@@ -74,6 +77,24 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   logic [7:0]   ident_rd_addr;
   logic [127:0] ident_rd_data;
 
+  // Get Log Page ports
+  logic        log_req = 1'b0;
+  logic        log_busy, log_done, log_err;
+  logic [SMART_W-1:0] log_smart;
+  logic [15:0] log_cnt, log_err_cnt, log_status;
+  logic [31:0] rtd3e_us;
+  // DUT side of the command port (port 0 of req_mux)
+  logic        d_req_valid, d_req_ready, d_rsp_valid;
+  logic [1:0]  d_req_op;
+  logic [31:0] d_req_addr, d_req_wdata, d_rsp_rdata;
+  logic [3:0]  d_req_be;
+  logic [2:0]  d_rsp_status;
+  // port 1 (continuous doorbell generator, enabled by p1_on)
+  logic        p1_on = 1'b0;
+  logic        p1_req_valid = 1'b0, p1_req_ready, p1_rsp_valid;
+  logic [2:0]  p1_rsp_status;
+  logic [31:0] p1_rsp_rdata;
+
   nvme_admin #(.RDY_TIMEOUT_MS_MAX(40), .ADMIN_TIMEOUT_MS(30), .SHUTDOWN_TIMEOUT_MS(20), .FORMAT_TIMEOUT_MS(100)) dut (
     .clk(clk), .rst(rst), .tick_ms(tick_ms),
     .start_init(start_init), .format_req(format_req), .format_done(format_done), .format_ms(format_ms),
@@ -83,9 +104,11 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     .lbads(lbads), .nsze(nsze), .mdts(mdts), .dstrd(dstrd), .vwc(vwc),
     .clear_cqs(clear_cqs), .clear_done(clear_done),
     .dbg_asq_tail(dbg_asq_tail), .dbg_acq_head(dbg_acq_head),
-    .req_valid(req_valid), .req_ready(req_ready), .req_op(req_op), .req_addr(req_addr),
-    .req_wdata(req_wdata), .req_be(req_be), .rsp_valid(rsp_valid), .rsp_status(rsp_status),
-    .rsp_rdata(rsp_rdata),
+    .log_req(log_req), .log_busy(log_busy), .log_done(log_done), .log_err(log_err), .log_smart(log_smart),
+    .log_cnt(log_cnt), .log_err_cnt(log_err_cnt), .log_status(log_status), .rtd3e_us(rtd3e_us),
+    .req_valid(d_req_valid), .req_ready(d_req_ready), .req_op(d_req_op), .req_addr(d_req_addr),
+    .req_wdata(d_req_wdata), .req_be(d_req_be), .rsp_valid(d_rsp_valid), .rsp_status(d_rsp_status),
+    .rsp_rdata(d_rsp_rdata),
     .asq_wr_en(asq_wr_en), .asq_wr_addr(asq_wr_addr), .asq_wr_data(asq_wr_data),
     .acq_rd_en(acq_rd_en), .acq_rd_addr(acq_rd_addr), .acq_rd_data(acq_rd_data),
     .ident_rd_en(ident_rd_en), .ident_rd_addr(ident_rd_addr), .ident_rd_data(ident_rd_data));
@@ -124,10 +147,55 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   int          cfg_cqes      = 8'h44; // CQES byte
   bit          cfg_rdy_stale = 0;     // power-up with CC.EN = 0 but CSTS.RDY = 1 (reset still running)
 
+  int          cfg_log_stat_at   = -1;   // log ordinal (log_cmds) whose CQE carries cfg_log_stat
+  logic [14:0] cfg_log_stat      = 15'h0006;
+  int          cfg_log_badcid_at = -1;   // log ordinal whose CQE carries a wrong CID
+  int          cfg_log_delay_at  = -1;   // log ordinal whose CQE is delayed by cfg_log_delay_ms
+  int          cfg_log_delay_ms  = 40;   // > ADMIN_TIMEOUT_MS = 30
+  int          cfg_cqdb_err_at   = -1;   // CQ0 head doorbell number (cq_db_cnt) that gets an error response
+
   assign format_req = cfg_format;
   function automatic int n_init_cmds(); return cfg_format ? 6 : 5; endfunction
 
   localparam logic [63:0] NSZE_VALUE = 64'h0000_0000_7470_0000;
+  localparam logic [31:0] RTD3E_VALUE = 32'h00A1_B2C3;
+
+  // admin port 0 and the doorbell generator share the controller model through the real req_mux (as in the core)
+  int        p1_cnt = 0, p1_gap = 0, p1_done = 0;
+  req_mux u_req_mux (
+    .clk(clk), .rst(rst),
+    .p0_req_valid(d_req_valid), .p0_req_ready(d_req_ready), .p0_req_op(d_req_op), .p0_req_addr(d_req_addr),
+    .p0_req_wdata(d_req_wdata), .p0_req_be(d_req_be),
+    .p0_rsp_valid(d_rsp_valid), .p0_rsp_status(d_rsp_status), .p0_rsp_rdata(d_rsp_rdata),
+    .p1_req_valid(p1_req_valid), .p1_req_ready(p1_req_ready), .p1_req_op(2'd3),
+    .p1_req_addr(doorbell_addr(4'(cfg_dstrd), 1, 1'b0)), .p1_req_wdata(32'(p1_cnt & 63)), .p1_req_be(4'hF),
+    .p1_rsp_valid(p1_rsp_valid), .p1_rsp_status(p1_rsp_status), .p1_rsp_rdata(p1_rsp_rdata),
+    .r_req_valid(req_valid), .r_req_ready(req_ready), .r_req_op(req_op), .r_req_addr(req_addr),
+    .r_req_wdata(req_wdata), .r_req_be(req_be),
+    .r_rsp_valid(rsp_valid), .r_rsp_status(rsp_status), .r_rsp_rdata(rsp_rdata));
+
+  // port 1 generator: back-to-back MWr to the IO SQ1 tail doorbell while p1_on
+  typedef enum logic [1:0] { P1_IDLE, P1_REQ, P1_WAIT } p1_state_t;
+  p1_state_t p1_st = P1_IDLE;
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      p1_req_valid <= 1'b0; p1_st <= P1_IDLE; p1_gap <= 0;
+    end else begin
+      case (p1_st)
+        P1_IDLE: if (p1_on) begin
+          if (p1_gap > 0) p1_gap <= p1_gap - 1;
+          else begin p1_req_valid <= 1'b1; p1_st <= P1_REQ; end
+        end
+        P1_REQ: if (p1_req_ready) begin p1_req_valid <= 1'b0; p1_st <= P1_WAIT; end
+        P1_WAIT: if (p1_rsp_valid) begin
+          p1_gap <= $urandom % 3; p1_cnt <= p1_cnt + 1; p1_done <= p1_done + 1; p1_st <= P1_IDLE;
+        end
+        default: p1_st <= P1_IDLE;
+      endcase
+    end
+  end
+
+
 
   // --------------------------------------------------------------------------
   // RAMs (2-cycle read latency).  asq_mem is always a testbench shadow copy of
@@ -205,11 +273,16 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   int          clear_cnt;
 
   // CQE posting
-  logic        cqe_pend;
-  int          cqe_delay;
+  typedef struct { logic [15:0] cid; logic [14:0] stat; longint dl; } cqe_ent_t;
+  cqe_ent_t    cqe_q [$];             // CQEs in submission order; the head is posted once cyc_m reaches its deadline
+  longint      cyc_m = 0;
+  always_ff @(posedge clk) cyc_m <= cyc_m + 1;
   logic [15:0] cqe_cid;
   logic [14:0] cqe_stat;
-  logic [31:0] cqe_dw0;
+  logic [31:0] cqe_dw0 = 32'h0;
+  int          log_cmds;              // Get Log Page SQEs seen by the model (ordinal of the next log)
+  int          log_seed, smart_ok_seed;   // content seed of the last log / of the last log that is expected to be accepted
+  int          cq_db_cnt, p1_db_cnt, last_cq_db;
   logic [1:0]  cqe_phase_st;          // 0 idle, 1 lower half written -> waiting, 2 done
   int          cqe_wait;
   int          cqe_slot;
@@ -232,7 +305,7 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
   function automatic logic [511:0] expected_sqe(input int idx);
     logic [511:0] s;
     s = '0;
-    case (cmd_kind_of(idx))
+    case (cmd_kind_of(idx - log_cmds))
       0: begin s[31:0] = {16'(idx), 8'h00, 8'h06}; s[191+32:192] = IDENT_BASE; s[32*10+:32] = 32'h1; end
       1: begin s[31:0] = {16'(idx), 8'h00, 8'h06}; s[63:32] = 32'h1; s[32*6+:32] = IDENT_BASE; s[32*10+:32] = 32'h0; end
       2: begin s[31:0] = {16'(idx), 8'h00, 8'h09}; s[32*10+:32] = 32'h7; end
@@ -262,11 +335,62 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     ident_set_byte(512, cfg_bad_qes ? 8'h55 : 8'(cfg_sqes));   // SQES
     ident_set_byte(513, 8'(cfg_cqes));             // CQES
     ident_set_byte(525, 8'h01);                    // VWC
+    for (int i = 0; i < 4; i++) ident_set_byte(88 + i, RTD3E_VALUE[8*i +: 8]);   // RTD3E
     ident_set_byte(78, 8'h00);                     // neighbours of the fields
     ident_set_byte(76, 8'h00);
     ident_set_byte(524, 8'h00);
     ident_set_byte(526, 8'h00);
   endtask
+  // ----- SMART log content derived from a seed (same table as exp_smart) -----
+  function automatic logic [383:0] exp_smart(input int sd);
+    logic [383:0] e;
+    e = '0;
+    e[7:0]     = 8'(sd);
+    e[23:8]    = 16'(300 + sd);
+    e[31:24]   = 8'(100 - (sd % 50));
+    e[39:32]   = 8'(sd % 100);
+    e[111:48]  = 64'h1111_2222_0000_0000 + 64'(sd);
+    e[175:112] = 64'h3333_4444_0000_0000 + 64'(2*sd);
+    e[207:176] = 32'h5000_0000 + 32'(sd);
+    e[239:208] = 32'h6000_0000 + 32'(3*sd);
+    e[271:240] = 32'h7000_0000 + 32'(5*sd);
+    e[303:272] = 32'h8000_0000 + 32'(7*sd);
+    e[335:304] = 32'h9000_0000 + 32'(sd);
+    e[367:336] = 32'hA000_0000 + 32'(2*sd);
+    e[383:368] = 16'(500 + sd);
+    return e;
+  endfunction
+  task automatic ident_put(input int off, input int n, input logic [63:0] v);
+    for (int i = 0; i < n; i++) ident_set_byte(off + i, v[8*i +: 8]);
+  endtask
+  task automatic ident_fill_log(input int sd);
+    logic [383:0] e;
+    e = exp_smart(sd);
+    ident_noise();
+    ident_put(0,   1, e[7:0]);
+    ident_put(1,   2, e[23:8]);
+    ident_put(3,   1, e[31:24]);
+    ident_put(5,   1, e[39:32]);
+    ident_put(32,  8, e[111:48]);
+    ident_put(48,  8, e[175:112]);
+    ident_put(112, 4, e[207:176]);
+    ident_put(128, 4, e[239:208]);
+    ident_put(144, 4, e[271:240]);
+    ident_put(160, 4, e[303:272]);
+    ident_put(192, 4, e[335:304]);
+    ident_put(196, 4, e[367:336]);
+    ident_put(200, 2, e[383:368]);
+  endtask
+  function automatic logic [511:0] expected_log_sqe(input int idx);
+    logic [511:0] s;
+    s = '0;
+    s[31:0]       = {16'(idx), 8'h00, 8'h02};          // OPC 02h
+    s[63:32]      = 32'hFFFF_FFFF;                     // NSID
+    s[32*6 +: 32] = IDENT_BASE;                        // PRP1
+    s[32*10 +: 32] = {16'd127, 8'h00, 8'h02};          // NUMDL = 127 (512 B), LID 02h
+    return s;
+  endfunction
+
   task automatic ident_fill_ns();
     logic [31:0] dw;
     ident_noise();
@@ -316,6 +440,9 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     int          q, k;
     logic [511:0] got, exp;
     logic [31:0] rd;
+    bit          is_log, inj_cid, inj_dly;
+    logic [14:0] inj_stat;
+    cqe_ent_t    ent;
 
     rsp_valid <= 1'b0;
     rsp_status <= 3'd0;
@@ -341,7 +468,8 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
       cq_phase_m  <= 1'b1;
       clear_seen  <= 1'b0; clear_busy <= 1'b0; clear_cnt <= 0;
       clear_done_m <= 1'b1;              // level, high while idle
-      cqe_pend    <= 1'b0; cqe_phase_st <= 2'd0;
+      cqe_q.delete(); cqe_phase_st <= 2'd0;
+      log_cmds <= 0; log_seed <= 0; smart_ok_seed <= 0; cq_db_cnt <= 0; p1_db_cnt <= 0; last_cq_db <= 0;
       wlog_off.delete(); wlog_data.delete();
     end else begin
       // ------------------------------------------------------------ RDY/SHST
@@ -429,33 +557,66 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
                     q = (off[15:0] - NVME_DBL_BASE);
                     check((q % db_stride()) == 0, "doorbell offset not stride aligned");
                     q = q / db_stride();
-                    check((q / 2) == 0, "doorbell for non-admin queue");
+                    if ((q / 2) != 0) begin
+                      check(p1_on || p1_cnt > 0, "doorbell for non-admin queue");
+                      p1_db_cnt <= p1_db_cnt + 1;
+                    end
                     check(m_wdata[31:16] == 16'h0, "doorbell upper bits must be 0");
-                    if ((q % 2) == 0) begin
+                    if ((q / 2) != 0) begin
+                      // port 1 traffic: nothing to model
+                    end else if ((q % 2) == 0) begin
                       // ------------- SQ0 tail doorbell -------------
                       check(m_wdata[15:0] == 16'((sq_tail_m + 1) % 32), "SQ0TDBL value");
                       sq_tail_m <= (sq_tail_m + 1) % 32;
                       // fetch + check the SQE
                       for (int b = 0; b < 4; b++) got[128*b +: 128] = asq_mem[sq_head_m*4 + b];
-                      exp = expected_sqe(cmd_idx);
+                      is_log = (got[7:0] == 8'h02);
+                      exp = is_log ? expected_log_sqe(cmd_idx) : expected_sqe(cmd_idx);
                       check(got == exp, $sformatf("SQE %0d content mismatch\n got=%h\n exp=%h", cmd_idx, got, exp));
                       check(cc_r[0] && rdy_r, "doorbell rung before controller ready");
                       check(got[31:16] == 16'(cmd_idx), "CID != command index");
                       sq_head_m <= (sq_head_m + 1) % 32;
-                      // Identify data lands in ident_ram before the CQE
-                      if (cmd_idx == 0) ident_fill_ctrl();
-                      if (cmd_idx == 1) ident_fill_ns();
-                      if (REAL_RAMS && cmd_idx < 2) ident_burst = 0;
-                      cqe_cid   <= got[31:16];
-                      cqe_stat  <= (cmd_idx == cfg_err_cmd) ? 15'h0002 : 15'h0;
-                      cqe_dw0   <= 32'h0;
-                      cqe_pend  <= (cmd_idx != cfg_drop_cmd);
-                      cqe_delay <= (cmd_kind_of(cmd_idx) == 7) ? (cfg_fmt_ms * TICK_PERIOD + ($urandom % 10))
-                                                               : ((REAL_RAMS ? 300 : 6) + ($urandom % 10));   // REAL_RAMS: let the Identify burst finish first
+                      if (is_log) begin
+                        // Get Log Page: the 512 B land in ident_ram before the CQE (a faulty log still writes data)
+                        inj_stat = (log_cmds == cfg_log_stat_at)   ? cfg_log_stat : 15'h0;
+                        inj_cid  = (log_cmds == cfg_log_badcid_at);
+                        inj_dly  = (log_cmds == cfg_log_delay_at);
+                        if (inj_stat == 15'h0 && !inj_cid && !inj_dly) begin
+                          log_seed      <= log_seed + 1;
+                          smart_ok_seed <= log_seed + 1;
+                          ident_fill_log(log_seed + 1);
+                        end else begin
+                          ident_fill_log(1000 + log_cmds);
+                        end
+                        if (REAL_RAMS) ident_burst = 0;
+                        ent.cid  = inj_cid ? (got[31:16] ^ 16'h0100) : got[31:16];
+                        ent.stat = inj_stat;
+                        ent.dl   = cyc_m + (inj_dly ? (cfg_log_delay_ms * TICK_PERIOD + ($urandom % 10))
+                                                    : ((REAL_RAMS ? 300 : 6) + ($urandom % 10)));
+                        cqe_q.push_back(ent);
+                        log_cmds <= log_cmds + 1;
+                      end else begin
+                        // Identify data lands in ident_ram before the CQE
+                        if (cmd_idx == 0) ident_fill_ctrl();
+                        if (cmd_idx == 1) ident_fill_ns();
+                        if (REAL_RAMS && cmd_idx < 2) ident_burst = 0;
+                        ent.cid  = got[31:16];
+                        ent.stat = (cmd_idx == cfg_err_cmd) ? 15'h0002 : 15'h0;
+                        ent.dl   = cyc_m + ((cmd_kind_of(cmd_idx - log_cmds) == 7) ? (cfg_fmt_ms * TICK_PERIOD + ($urandom % 10))
+                                                                 : ((REAL_RAMS ? 300 : 6) + ($urandom % 10)));   // REAL_RAMS: let the Identify burst finish first
+                        if (cmd_idx != cfg_drop_cmd) cqe_q.push_back(ent);
+                      end
                       cmd_idx   <= cmd_idx + 1;
                     end else begin
                       // ------------- CQ0 head doorbell -------------
-                      check(m_wdata[15:0] == 16'(cq_tail_m), $sformatf("CQ0HDBL value %0d expected %0d", m_wdata[15:0], cq_tail_m));
+                      if (cfg_log_delay_at < 0)
+                        check(m_wdata[15:0] == 16'(cq_tail_m), $sformatf("CQ0HDBL value %0d expected %0d", m_wdata[15:0], cq_tail_m));
+                      else   // a late (absorbed) CQE: the head doorbell may lag behind the posted CQEs, but moves by 1 and never passes them
+                        check(m_wdata[15:0] == 16'((last_cq_db + 1) % 32) && cq_db_cnt < cqe_posted,
+                              $sformatf("CQ0HDBL value %0d (previous %0d, posted %0d)", m_wdata[15:0], last_cq_db, cqe_posted));
+                      last_cq_db <= int'(m_wdata[15:0]);
+                      cq_db_cnt  <= cq_db_cnt + 1;
+                      if (cq_db_cnt == cfg_cqdb_err_at) rsp_status <= 3'd1;      // injected BAR0 access error on this doorbell
                     end
                   end else begin
                     fail_msg($sformatf("write to unexpected BAR0 offset 0x%0h", off));
@@ -476,9 +637,10 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
       // ------------------------------------------------------------ CQE posting
       // lower 8 bytes (DW0, DW1) first, then DW2 and DW3 (with the phase bit) - P is written last
       case (cqe_phase_st)
-        2'd0: if (cqe_pend) begin
-          if (cqe_delay > 0) cqe_delay <= cqe_delay - 1;
-          else begin
+        2'd0: if (cqe_q.size() > 0 && cyc_m >= cqe_q[0].dl) begin
+          begin
+            cqe_cid  <= cqe_q[0].cid;
+            cqe_stat <= cqe_q[0].stat;
             if (!REAL_RAMS) acq_mem[cq_tail_m][63:0] <= {32'h0, cqe_dw0};
             else begin hw_en_acq <= 1'b1; hw_addr <= 32'(cq_tail_m * 16); hw_data <= {64'h0, 32'h0, cqe_dw0}; hw_be <= 16'h00FF; end
             cqe_slot     <= cq_tail_m;
@@ -497,7 +659,7 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
           end
         end
         2'd2: begin
-          cqe_pend     <= 1'b0;
+          void'(cqe_q.pop_front());
           cqe_phase_st <= 2'd0;
           cqe_posted   <= cqe_posted + 1;
           if (cq_tail_m == 31) begin cq_tail_m <= 0; cq_phase_m <= ~cq_phase_m; end
@@ -588,7 +750,63 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     cfg_err_cmd = -1; cfg_drop_cmd = -1; cfg_bad_qes = 0; cfg_shn_never = 0;
     cfg_flbas = 0; cfg_ms = 0; cfg_lbads = 9; cfg_format = 0; cfg_fmt_ms = 50;
     cfg_mdts = 5; cfg_sqes = 8'h66; cfg_cqes = 8'h44; cfg_rdy_stale = 0;
+    cfg_log_stat_at = -1; cfg_log_badcid_at = -1; cfg_log_delay_at = -1; cfg_log_delay_ms = 40; cfg_cqdb_err_at = -1;
+    p1_on = 1'b0;
   endtask
+
+  // ---- Get Log Page helpers ----
+  bit lg_done, lg_err;
+  task automatic do_log(input int maxclk = 400000);
+    int n;
+    lg_done = 1'b0; lg_err = 1'b0; n = 0;
+    @(posedge clk); log_req <= 1'b1;
+    @(posedge clk); log_req <= 1'b0;
+    while (!lg_done && !lg_err && n < maxclk) begin
+      @(posedge clk); n++;
+      if (log_done === 1'b1) lg_done = 1'b1;
+      if (log_err  === 1'b1) lg_err  = 1'b1;
+    end
+    check(n < maxclk, "watchdog: log neither done nor err");
+    repeat (2) @(posedge clk);
+  endtask
+  // a log_req that must be ignored: no activity for 150 clocks
+  task automatic log_must_be_ignored(input string name);
+    int c0 = cmd_idx;
+    int l0 = log_cmds;
+    @(posedge clk); log_req <= 1'b1;
+    @(posedge clk); log_req <= 1'b0;
+    repeat (150) begin
+      @(posedge clk);
+      check(log_busy !== 1'b1, {name, ": log_busy rose"});
+    end
+    check(cmd_idx == c0 && log_cmds == l0, {name, ": a command was submitted"});
+  endtask
+  task automatic check_log_ok(input string name, input int exp_cnt);
+    check(lg_done && !lg_err, {name, ": log_done expected"});
+    check(log_smart == exp_smart(smart_ok_seed), $sformatf("%s: log_smart %h expected %h", name, log_smart, exp_smart(smart_ok_seed)));
+    check(log_cnt == 16'(exp_cnt), $sformatf("%s: log_cnt %0d expected %0d", name, log_cnt, exp_cnt));
+    check(log_status == 16'h0, {name, ": log_status"});
+    check(!log_busy, {name, ": log_busy after the log"});
+  endtask
+  task automatic check_init_intact(input string name);
+    check(init_done && !init_fail && fail_step == 8'h00 && cqe_status_last == 16'h0, {name, ": init flags / fail_step disturbed"});
+  endtask
+
+  // output pulse monitors
+  int lg_done_run = 0, lg_err_run = 0;
+  always @(posedge clk) if (!rst) begin
+    if (log_done === 1'b1 && log_err === 1'b1) fail_msg("log_done and log_err in the same cycle");
+    if (log_done === 1'b1) begin
+      lg_done_run++;
+      if (lg_done_run > 1) fail_msg("log_done longer than one cycle");
+      if (log_busy === 1'b1) fail_msg("log_busy still high with log_done");
+    end else lg_done_run = 0;
+    if (log_err === 1'b1) begin
+      lg_err_run++;
+      if (lg_err_run > 1) fail_msg("log_err longer than one cycle");
+      if (log_busy === 1'b1) fail_msg("log_busy still high with log_err");
+    end else lg_err_run = 0;
+  end
 
   task automatic expect_fail(input string name, input logic [7:0] code);
     check(init_fail, {name, ": init_fail not set"});
@@ -860,6 +1078,185 @@ module tb_nvme_admin #(parameter bit REAL_RAMS = 1'b0);
     end
     do_reset();                           // abandon the second init (the controller model is not re-armed)
     repeat (20) @(posedge clk);
+
+    // =========================================================================
+    // WP5: Get Log Page 02h (SMART), RECORDER_SPEC 6.3
+    // =========================================================================
+
+    // ---- T21: SQE, SMART layout, RTD3E, log_req ignored before init / while busy ----
+    $display("T21: Get Log Page basic, RTD3E, ignore rules");
+    reset_knobs();
+    do_reset();
+    log_must_be_ignored("T21 before init");
+    check(log_cnt == 0 && log_err_cnt == 0 && wlog_off.size() == 0, "T21: counters / doorbells before init");
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done && !init_fail, "T21: init_done");
+    check(rtd3e_us == RTD3E_VALUE, $sformatf("T21: rtd3e_us %h expected %h", rtd3e_us, RTD3E_VALUE));
+    check(mdts == 8'd5 && vwc == 1'b1 && lbads == 4'd9 && nsze == NSZE_VALUE, "T21: Identify results disturbed by the RTD3E step");
+    check_init_log(1'b0);
+    check(log_smart == '0, "T21: log_smart before the first log");
+    do_log();
+    check_log_ok("T21 log 1", 1);
+    check(log_err_cnt == 0 && cmd_idx == 6, "T21: counters after log 1");
+    check_init_intact("T21 after log 1");
+    // a 2-cycle log_req is one command (the second cycle falls into a busy FSM)
+    @(posedge clk); log_req <= 1'b1;
+    @(posedge clk);
+    @(posedge clk); log_req <= 1'b0;
+    begin
+      automatic int n = 0;
+      lg_done = 0;
+      while (!lg_done && n < 100000) begin @(posedge clk); n++; if (log_done === 1'b1) lg_done = 1; end
+      check(lg_done, "T21: second log never finished");
+    end
+    repeat (150) @(posedge clk);
+    check(log_cnt == 2 && cmd_idx == 7 && log_cmds == 2, "T21: a held log_req started more than one command");
+    check(log_smart == exp_smart(smart_ok_seed), "T21: log_smart after log 2");
+
+    // ---- T22: 130 logs in a row (4 admin queue revolutions) with continuous port-1 doorbells ----
+    $display("T22: 130 logs in a row with port-1 doorbells");
+    p1_on = 1'b1;
+    begin
+      automatic int base_cnt = log_cnt;
+      automatic int db0 = p1_db_cnt;
+      for (int i = 0; i < 130; i++) begin
+        do_log();
+        check_log_ok($sformatf("T22 log %0d", i), base_cnt + i + 1);
+        if (errors > 20) break;
+      end
+      check(log_err_cnt == 0, "T22: log_err_cnt");
+      check(cmd_idx == 5 + 2 + 130, $sformatf("T22: cmd_idx %0d", cmd_idx));
+      check(cmd_idx / 32 >= 4, "T22: admin queue index did not wrap at least 4 times");
+      check(p1_db_cnt - db0 > 100, $sformatf("T22: only %0d port-1 doorbells overlapped the logs", p1_db_cnt - db0));
+      check(dbg_asq_tail == 8'(cmd_idx % 32) && dbg_acq_head == 8'(cmd_idx % 32), "T22: queue pointers");
+      check_init_intact("T22");
+      $display("  T22 -> 130 logs OK, %0d port-1 doorbells in parallel, cmd_idx %0d", p1_db_cnt - db0, cmd_idx);
+    end
+    // shutdown with port 1 still busy, then: log_req after SHUTDOWN is ignored
+    pulse_start_shutdown();
+    wait_shutdown(400000);
+    check(shutdown_done && !shutdown_timeout, "T22: shutdown ok");
+    check(last_cq_db == cq_tail_m, $sformatf("T22: last CQ doorbell %0d, CQ tail %0d", last_cq_db, cq_tail_m));
+    p1_on = 1'b0;
+    repeat (50) @(posedge clk);
+    log_must_be_ignored("T22 after shutdown");
+    check(log_cnt == 132 && log_err_cnt == 0, "T22: counters after shutdown");
+
+    // ---- T23: status != 0, wrong CID, doorbell error: log_err only, init state untouched, CQ stays consistent ----
+    $display("T23: log failures");
+    reset_knobs();
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done, "T23: init_done");
+    p1_on = 1'b1;
+    do_log();
+    check_log_ok("T23 good log", 1);
+    // (a) CQE status != 0
+    cfg_log_stat_at = log_cmds; cfg_log_stat = 15'h0006;
+    do_log();
+    check(lg_err && !lg_done, "T23a: log_err expected");
+    check(log_err_cnt == 1 && log_cnt == 1, "T23a: counters");
+    check(log_status == 16'h0006, $sformatf("T23a: log_status %h", log_status));
+    check(log_smart == exp_smart(smart_ok_seed), "T23a: log_smart changed by a failed log");
+    check_init_intact("T23a");
+    do_log();
+    check_log_ok("T23a next log", 2);
+    // (b) wrong CID
+    cfg_log_badcid_at = log_cmds;
+    do_log();
+    check(lg_err && !lg_done, "T23b: log_err expected");
+    check(log_err_cnt == 2 && log_cnt == 2, "T23b: counters");
+    check(log_smart == exp_smart(smart_ok_seed), "T23b: log_smart changed by a failed log");
+    check_init_intact("T23b");
+    do_log();
+    check_log_ok("T23b next log", 3);
+    // (c) error response of the CQ doorbell write
+    cfg_cqdb_err_at = cq_db_cnt;
+    begin
+      automatic int seed_before = smart_ok_seed;           // the model counts this log as good, the DUT must discard it
+      do_log();
+      check(lg_err && !lg_done, "T23c: log_err expected");
+      check(log_err_cnt == 3 && log_cnt == 3, "T23c: counters");
+      check(log_smart == exp_smart(seed_before), "T23c: log_smart changed by a failed log");
+    end
+    check_init_intact("T23c");
+    do_log();
+    check_log_ok("T23c next log", 4);
+    // (d) start_shutdown during a log: the log completes first, then the shutdown runs
+    @(posedge clk); log_req <= 1'b1;
+    @(posedge clk); log_req <= 1'b0;
+    @(posedge clk);
+    @(posedge clk); start_shutdown <= 1'b1;
+    @(posedge clk); start_shutdown <= 1'b0;
+    begin
+      automatic int n = 0;
+      lg_done = 0;
+      while (!lg_done && !log_err && n < 100000) begin
+        @(posedge clk); n++;
+        if (log_done === 1'b1) lg_done = 1;
+        check(!(shutdown_done && log_busy), "T23d: shutdown finished while the log was running");
+      end
+      check(lg_done, "T23d: the log did not complete");
+    end
+    wait_shutdown(400000);
+    check(shutdown_done && !shutdown_timeout, "T23d: shutdown after the log");
+    check(log_cnt == 5 && log_err_cnt == 3, "T23d: counters");
+    check(last_cq_db == cq_tail_m, "T23d: CQ not fully consumed");
+    p1_on = 1'b0;
+    repeat (50) @(posedge clk);
+    log_must_be_ignored("T23 after shutdown");
+
+    // ---- T24: log timeout, log_dis, late CQE absorbed during Delete SQ ----
+    $display("T24: log timeout + late CQE");
+    reset_knobs();
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done, "T24: init_done");
+    cfg_log_delay_at = log_cmds; cfg_log_delay_ms = 40;          // CQE after 40 "ms" > ADMIN_TIMEOUT_MS (30)
+    begin
+      automatic longint c0 = $time / 8;
+      do_log();
+      check(lg_err && !lg_done, "T24: log_err (timeout) expected");
+      check(log_err_cnt == 1 && log_cnt == 0, "T24: counters");
+      check($time / 8 - c0 >= 29 * TICK_PERIOD, "T24: log gave up before ADMIN_TIMEOUT_MS");
+    end
+    check_init_intact("T24");
+    check(cqe_q.size() == 1, "T24: the late CQE should still be pending in the model");
+    log_must_be_ignored("T24 log_dis");                         // log_dis: no new log until the next start_init
+    pulse_start_shutdown();                                      // the late CQE arrives while Delete SQ is polled
+    wait_shutdown(400000);
+    check(shutdown_done && !shutdown_timeout, "T24: shutdown ok");
+    check(cmd_idx == 8, $sformatf("T24: cmd_idx %0d", cmd_idx));
+    repeat (50) @(posedge clk);
+    check(cq_tail_m == 8 && last_cq_db == 8, $sformatf("T24: CQ tail %0d, last CQ doorbell %0d (the stale CQE was not absorbed)", cq_tail_m, last_cq_db));
+    log_must_be_ignored("T24 after shutdown");
+    // a new start_init re-enables logs (the controller model is not re-armed: only the flag is checked)
+    @(posedge clk); start_init <= 1'b1;
+    @(posedge clk); start_init <= 1'b0;
+    repeat (5) @(posedge clk);
+    check(log_cnt == 0 && log_err_cnt == 0, "T24: log counters not cleared by start_init");
+    do_reset();
+
+    // ---- T25: DSTRD = 2 (doorbell stride 16), a few logs with port 1 active ----
+    $display("T25: logs with DSTRD=2");
+    reset_knobs(); cfg_dstrd = 2;
+    do_reset();
+    pulse_start_init();
+    wait_init(200000);
+    check(init_done && !init_fail, "T25: init_done");
+    p1_on = 1'b1;
+    for (int i = 0; i < 5; i++) begin
+      do_log();
+      check_log_ok($sformatf("T25 log %0d", i), i + 1);
+    end
+    p1_on = 1'b0;
+    repeat (30) @(posedge clk);
+    pulse_start_shutdown();
+    wait_shutdown(400000);
+    check(shutdown_done && !shutdown_timeout, "T25: shutdown ok");
 
     // ---- done ----
     repeat (20) @(posedge clk);

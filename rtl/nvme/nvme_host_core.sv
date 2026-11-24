@@ -53,6 +53,11 @@
 // The write engine is restarted (pointers, flags, statistics) on every init_start, so
 // DONE/ERROR -> IDLE -> start runs the whole flow again without a reset.
 //
+// Get Log Page (recorder, RECORDER_SPEC 4.6 / 6): log_req (default 0 = unused) is passed to nvme_admin only while the
+// sequencer is in RUN or DRAIN (a log never delays the shutdown); log_* / rtd3e_us are nvme_admin's results.
+// Tap: tap_* export the SSD's Read data (writer decode of the DATA region) and the slot -> LBA table for an external
+// verifier; VERIFY_INTERNAL = 0 drops the built-in verify_checker (vfy_* = 0).  Defaults keep the old behaviour.
+//
 // status_flags[7:0] (all sticky until reset / the next init_start where noted):
 //   [0] shutdown_timeout  SHST=10b not seen (or a bus error) during the NVMe shutdown
 //   [1] doorbell_err      a doorbell MWr was not completed with SC
@@ -73,7 +78,8 @@ module nvme_host_core
   parameter int unsigned REQ_TIMEOUT_CYCLES = 1_250_000,        // 10 ms @ 125 MHz
   parameter int unsigned CLK_HZ             = 125_000_000,
   parameter int unsigned IO_TIMEOUT_MS      = 30000,            // write engine: per-command timeout (0 = off)
-  parameter logic [63:0] START_LBA          = 64'd0               // first LBA written
+  parameter logic [63:0] START_LBA          = 64'd0,              // first LBA written
+  parameter bit          VERIFY_INTERNAL    = 1'b1                // 0: no verify_checker instance (vfy_* = 0), use the tap_* port
 ) (
   input  logic         user_clk,
   input  logic         user_rst,                 // synchronous, active high
@@ -127,6 +133,7 @@ module nvme_host_core
   input  logic         verify_mode = 1'b0,       // 1: read back and compare instead of recording
   input  logic [31:0]  verify_cmds = 32'd0,    // verify: number of Read commands (0 = unlimited)
   input  logic         format_req = 1'b0,        // 1: issue NVMe Format NVM during bring-up (sampled at init_start; quasi-static)
+  input  logic         log_req = 1'b0,           // pulse: Get Log Page 02h; passed on only in RUN / DRAIN (see nvme_admin)
 
   // ---- status ----
   output logic         status_link_up,
@@ -161,6 +168,22 @@ module nvme_host_core
   output logic [63:0]  stat_first_error_lba,     // SLBA of the first failed Write (status_flags[6])
   output logic         format_done,              // sticky: Format NVM completed OK (cleared at init_start)
   output logic [31:0]  format_ms,                // ms the Format NVM took (SQ doorbell -> CQE)
+  // ---- Get Log Page results (user_clk), see nvme_admin ----
+  output logic         log_busy,
+  output logic         log_done,                 // 1-cycle pulse
+  output logic         log_err,                  // 1-cycle pulse
+  output logic [SMART_W-1:0] log_smart,
+  output logic [15:0]  log_cnt,
+  output logic [15:0]  log_err_cnt,
+  output logic [15:0]  log_status,
+  output logic [31:0]  rtd3e_us,
+  // ---- tap of the SSD's Read data (user_clk): hostmem_writer DATA-region writes + slot LBA table ----
+  output logic         tap_wr_en,
+  output logic [31:0]  tap_wr_addr,
+  output logic [127:0] tap_wr_data,
+  output logic [15:0]  tap_wr_be,
+  output logic [N_SLOTS*64-1:0] tap_slot_lba_flat,
+  output logic         tap_verify_mode,
   // ---- verify results (user_clk) ----
   output logic         cmd_limit_done,           // verify_cmds data commands submitted and completed
   output logic [63:0]  vfy_bytes,                // bytes compared
@@ -446,12 +469,18 @@ module nvme_host_core
   logic        shutdown_timeout;
   logic [7:0]  dbg_asq_tail, dbg_acq_head;
 
+  // Get Log Page only while the sequencer runs (RUN = 5, DRAIN = 6): never during FLUSH / SHUTDOWN (M2)
+  logic log_req_g;
+  assign log_req_g = log_req && (status_seq_state == 4'd5 || status_seq_state == 4'd6);
+
   nvme_admin #(.SLOT_BYTES(SLOT_BYTES)) u_admin (
     .clk(user_clk), .rst(user_rst), .tick_ms(tick_ms),
     .start_init(seq_init_start), .format_req(format_req), .format_done(format_done), .format_ms(format_ms),
     .init_done(init_done), .init_fail(init_fail), .fail_step(init_fail_step),
     .cqe_status_last(admin_cqe_status),
     .start_shutdown(seq_shutdown_start), .shutdown_done(shutdown_done), .shutdown_timeout(shutdown_timeout),
+    .log_req(log_req_g), .log_busy(log_busy), .log_done(log_done), .log_err(log_err), .log_smart(log_smart),
+    .log_cnt(log_cnt), .log_err_cnt(log_err_cnt), .log_status(log_status), .rtd3e_us(rtd3e_us),
     .lbads(lbads), .nsze(nsze), .mdts(mdts), .dstrd(dstrd), .vwc(vwc),
     .clear_cqs(clear_cqs), .clear_done(clear_done),
     .dbg_asq_tail(dbg_asq_tail), .dbg_acq_head(dbg_acq_head),
@@ -488,11 +517,27 @@ module nvme_host_core
     .io_timeout(io_timeout), .flush_skipped(flush_skipped), .io_error(io_error),
     .first_error_lba(stat_first_error_lba));
 
-  verify_checker #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .START_LBA(START_LBA)) u_verify (
-    .clk(user_clk), .rst(user_rst), .clear(seq_init_start), .lbads(lbads), .slot_lba_flat(slot_lba_flat),
-    .wr_en(hw_wr_en_data), .wr_beat_addr(hw_wr_beat_addr), .wr_data(hw_wr_data), .wr_be(hw_wr_be),
-    .chk_bytes(vfy_bytes), .err_beats(vfy_err_beats), .first_err_lba(vfy_first_err_lba),
-    .first_err_exp(vfy_first_err_exp), .first_err_got(vfy_first_err_got), .err_seen());
+  if (VERIFY_INTERNAL) begin : g_verify
+    verify_checker #(.N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .START_LBA(START_LBA)) u_verify (
+      .clk(user_clk), .rst(user_rst), .clear(seq_init_start), .lbads(lbads), .slot_lba_flat(slot_lba_flat),
+      .wr_en(hw_wr_en_data), .wr_beat_addr(hw_wr_beat_addr), .wr_data(hw_wr_data), .wr_be(hw_wr_be),
+      .chk_bytes(vfy_bytes), .err_beats(vfy_err_beats), .first_err_lba(vfy_first_err_lba),
+      .first_err_exp(vfy_first_err_exp), .first_err_got(vfy_first_err_got), .err_seen());
+  end else begin : g_no_verify
+    assign vfy_bytes         = 64'd0;
+    assign vfy_err_beats     = 32'd0;
+    assign vfy_first_err_lba = 64'd0;
+    assign vfy_first_err_exp = 32'd0;
+    assign vfy_first_err_got = 32'd0;
+  end
+
+  // tap of the Read data for an external verifier (WP6 vrf_tap)
+  assign tap_wr_en         = hw_wr_en_data;
+  assign tap_wr_addr       = hw_wr_beat_addr;
+  assign tap_wr_data       = hw_wr_data;
+  assign tap_wr_be         = hw_wr_be;
+  assign tap_slot_lba_flat = slot_lba_flat;
+  assign tap_verify_mode   = verify_mode;
 
   // ===========================================================================
   // Status

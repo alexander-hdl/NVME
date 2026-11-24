@@ -47,7 +47,8 @@ module nvme_host_top
   parameter bit          SIM_FAST           = 1'b0,
   parameter int unsigned REQ_TIMEOUT_CYCLES = 1_250_000,
   parameter int unsigned LINK_CLK_HZ        = 200_000_000,
-  parameter logic [63:0] START_LBA          = 64'd0
+  parameter logic [63:0] START_LBA          = 64'd0,
+  parameter bit          VERIFY_INTERNAL    = 1'b1      // 0: no verify_checker in the core (vfy_* = 0); use the tap_* port
 ) (
   // ---- board ----
   input  logic         sys_clk_p,            // 100 MHz PCIe reference clock (shared with the SSD)
@@ -73,6 +74,7 @@ module nvme_host_top
   input  logic         verify_mode,           // 1: read back + compare (verify run); async / quasi-static, set before ctrl_start
   input  logic [31:0]  verify_cmds,           // verify run: number of Read commands (SLOT_BYTES each, from START_LBA); 0 = unlimited; quasi-static
   input  logic         format_req = 1'b0,     // 1: NVMe Format NVM during bring-up (SSD back to "fresh"); async / quasi-static, set before ctrl_start
+  input  logic         log_req = 1'b0,        // user_clk pulse: Get Log Page 02h (SMART); the core passes it on only in RUN / DRAIN
   output logic         status_link_up,
   output logic         status_gen2,
   output logic         status_enum_done,
@@ -94,6 +96,25 @@ module nvme_host_top
   output logic [63:0]  stat_first_error_lba,  // SLBA of the first failed Write (status_flags[6])
   output logic         format_done,           // user_clk: sticky, Format NVM completed OK (cleared at the start of every run)
   output logic [31:0]  format_ms,             // user_clk: ms the Format NVM took (valid with format_done)
+  // Get Log Page results (user_clk), see nvme_admin.sv / RECORDER_SPEC 6.3
+  output logic         log_busy,
+  output logic         log_done,              // 1-cycle pulse
+  output logic         log_err,               // 1-cycle pulse
+  output logic [SMART_W-1:0] log_smart,
+  output logic [15:0]  log_cnt,
+  output logic [15:0]  log_err_cnt,
+  output logic [15:0]  log_status,
+  output logic [31:0]  rtd3e_us,
+  // tap of the SSD's Read data (user_clk), for an external verifier
+  output logic         tap_wr_en,
+  output logic [31:0]  tap_wr_addr,
+  output logic [127:0] tap_wr_data,
+  output logic [15:0]  tap_wr_be,
+  output logic [N_SLOTS*64-1:0] tap_slot_lba_flat,
+  output logic         tap_verify_mode,
+  // extra status (user_clk)
+  output logic [63:0]  stat_beats_in,         // 16-byte beats accepted from the user stream
+  output logic [3:0]   stat_seq_state,        // host_sequencer state
   // verify results (user_clk domain, valid once the run is stopped; cleared at the start of every run)
   output logic [3:0]   stat_lbads,            // user_clk: LBA size = 1 << stat_lbads (Identify Namespace)
   output logic [63:0]  stat_nsze,             // user_clk: namespace size in LBAs (capacity = nsze << lbads)
@@ -108,6 +129,7 @@ module nvme_host_top
   output logic         link_fail,             // link_clk domain, sticky; valid while user_clk is dead
   output logic         link_clk_out,          // free-running 200 MHz link_clk (BUFG output)
   output logic         user_clk_out,
+  output logic         user_rst_out,          // user_clk, synchronous reset of the core (= pcie_7x user_reset_out); see the note at the assignment
   output logic [5:0]   dbg_ltssm_state,       // debug: pl_ltssm_state of the core (pipe clock domain, raw)
   // debug bus, user_clk domain (for an ILA): see the assignment below for the bit map
   output logic [303:0] dbg_uc
@@ -155,6 +177,11 @@ module nvme_host_top
     .pl_link_gen2_cap(pl_link_gen2_cap), .pl_link_partner_gen2_supported(pl_link_partner_gen2_supported));
 
   assign user_clk_out = user_clk;
+  // user_rst_out = the IP's user_reset_out, synchronous to user_clk, asserted whenever the core is in reset (also during
+  // PERST# / link bring-up).  When user_clk stops (PERST# asserted, pcie_7x in reset) the signal freezes at its last value
+  // (normally 1: user_reset_out is asserted before the clock stops), so consumers must treat it as "reset" while their
+  // user_clk-derived logic is idle; board logic that must not depend on it uses link_clk_out domain resets instead.
+  assign user_rst_out = user_reset;
 
   // ===========================================================================
   // Link bring-up on the free-running refclk-derived clock
@@ -186,6 +213,7 @@ module nvme_host_top
   //  [18] cfg_mgmt_rd_en [19] cfg_mgmt_wr_en [20] cfg_mgmt_rd_wr_done [21] rx_np_ok [23:22] 0
   //  [151:24] s_axis_tx_tdata  [279:152] m_axis_rx_tdata  [301:280] m_axis_rx_tuser  [303:302] 0
   logic [3:0] dbg_seq_state;
+  assign stat_seq_state = dbg_seq_state;
   assign dbg_uc = {2'b00, m_axis_rx_tuser, m_axis_rx_tdata, s_axis_tx_tdata, 2'b00, rx_np_ok,
                    cfg_mgmt_rd_wr_done, cfg_mgmt_wr_en, cfg_mgmt_rd_en, tx_buf_av,
                    m_axis_rx_tlast, m_axis_rx_tready, m_axis_rx_tvalid,
@@ -247,7 +275,7 @@ module nvme_host_top
   // ===========================================================================
   nvme_host_core #(
     .N_SLOTS(N_SLOTS), .SLOT_BYTES(SLOT_BYTES), .SIM_FAST(SIM_FAST),
-    .REQ_TIMEOUT_CYCLES(REQ_TIMEOUT_CYCLES), .START_LBA(START_LBA)
+    .REQ_TIMEOUT_CYCLES(REQ_TIMEOUT_CYCLES), .START_LBA(START_LBA), .VERIFY_INTERNAL(VERIFY_INTERNAL)
   ) u_core (
     .user_clk(user_clk), .user_rst(user_reset),
     .m_axis_rx_tdata(m_axis_rx_tdata), .m_axis_rx_tkeep(m_axis_rx_tkeep), .m_axis_rx_tlast(m_axis_rx_tlast),
@@ -267,6 +295,10 @@ module nvme_host_top
     .ctrl_start(ctrl_start_uc), .ctrl_stop(ctrl_stop_uc),
     .verify_mode(verify_mode_sync[1]), .verify_cmds(verify_cmds_sync1),
     .format_req(format_req_sync[1]), .format_done(format_done), .format_ms(format_ms),
+    .log_req(log_req), .log_busy(log_busy), .log_done(log_done), .log_err(log_err), .log_smart(log_smart),
+    .log_cnt(log_cnt), .log_err_cnt(log_err_cnt), .log_status(log_status), .rtd3e_us(rtd3e_us),
+    .tap_wr_en(tap_wr_en), .tap_wr_addr(tap_wr_addr), .tap_wr_data(tap_wr_data), .tap_wr_be(tap_wr_be),
+    .tap_slot_lba_flat(tap_slot_lba_flat), .tap_verify_mode(tap_verify_mode),
     .status_link_up(status_link_up), .status_gen2(status_gen2), .status_link_width(status_link_width),
     .status_enum_done(status_enum_done), .status_nvme_ready(status_nvme_ready),
     .status_running(status_running), .status_done(status_done),
@@ -274,7 +306,7 @@ module nvme_host_top
     .status_seq_state(dbg_seq_state), .status_lba_range_err(status_lba_range_err), .status_shutdown_timeout(),
     .status_flags(status_flags),
     .stat_bytes_done(stat_bytes_done), .stat_cmds_done(stat_cmds_done), .stat_cmd_errors(stat_cmd_errors),
-    .stat_max_latency(stat_max_latency), .stat_cpl_evt(stat_cpl_evt), .stat_cpl_lat(stat_cpl_lat), .stat_rx_msgs(stat_rx_msgs), .stat_last_status(), .stat_next_lba(), .stat_beats_in(),
+    .stat_max_latency(stat_max_latency), .stat_cpl_evt(stat_cpl_evt), .stat_cpl_lat(stat_cpl_lat), .stat_rx_msgs(stat_rx_msgs), .stat_last_status(), .stat_next_lba(), .stat_beats_in(stat_beats_in),
     .stat_stall_cycles(), .stat_sq_full_stall_cycles(), .stat_unexpected_cpl(),
     .stat_lbads(stat_lbads), .stat_nsze(stat_nsze), .stat_mdts(),
     .stat_first_error_lba(stat_first_error_lba),

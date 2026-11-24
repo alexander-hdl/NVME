@@ -1,3 +1,4 @@
+rtl/pcie/req_mux.sv
 rtl/common/sdp_ram.sv
 rtl/nvme/prp_synth.sv
 rtl/nvme/hostmem_rams.sv

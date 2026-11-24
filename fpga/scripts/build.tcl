@@ -8,8 +8,9 @@
 #                              reports in fpga/build/reports/
 #           impl             : synth + impl_1 up to route_design (post-route reports)
 #           bit              : synth + impl + write_bitstream (fpga/build/nvme_host_top.bit)
-#   board=kc705|ax7a200b : target board (default kc705); ax7a200b -> project nvme_host_ax7a200b,
-#                          reports in fpga/build/reports_ax7a200b/
+#   board=kc705|ax7a200b|ax7a200b_rec : target board (default kc705); ax7a200b -> project nvme_host_ax7a200b,
+#                          reports in fpga/build/reports_ax7a200b/;  ax7a200b_rec (recorder prototype, WP8) -> project
+#                          fpga/build/rec/nvme_host_rec, reports in fpga/build/rec/reports/, bitstream fpga/build/rec/ax7a200b_rec_top.bit
 #   strategy=<name>   : implementation strategy of impl_1 (e.g. Performance_ExplorePostRoutePhysOpt); default: the run's current one
 #   impl_only         : skip synthesis (re-use synth_1), only implementation / bitstream
 #   jobs=N  parallel runs (default 4)
@@ -63,11 +64,17 @@ foreach a $argv {
 switch -- $board {
     kc705    { set proj_name nvme_host;          if {$top_name eq ""} { set top_name kc705_top } }
     ax7a200b { set proj_name nvme_host_ax7a200b; if {$top_name eq ""} { set top_name ax7a200b_top } }
-    default  { error "board=$board : must be kc705 or ax7a200b" }
+    ax7a200b_rec {
+        set proj_name nvme_host_rec
+        if {$top_name eq ""} { set top_name ax7a200b_rec_top }
+        set build_dir [file join $build_dir rec]
+        set rpt_dir   [file join $build_dir reports]
+    }
+    default  { error "board=$board : must be kc705, ax7a200b or ax7a200b_rec" }
 }
 set xpr [file join $build_dir $proj_name ${proj_name}.xpr]
 # per-board report directory (kc705 keeps fpga/build/reports)
-if {$board ne "kc705"} { set rpt_dir [file join $build_dir reports_$board] }
+if {$board ni {kc705 ax7a200b_rec}} { set rpt_dir [file join $build_dir reports_$board] }
 file mkdir $rpt_dir
 
 if {$recreate || ![file exists $xpr]} {

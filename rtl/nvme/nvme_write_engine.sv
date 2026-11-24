@@ -234,6 +234,11 @@ module nvme_write_engine
   logic [SLOT_W-1:0] last_slot_idx;
   assign last_slot_idx = SLOT_W'(N_SLOTS - 1);
 
+  // D24: Reads use their own slot pointer rd_slot; next_slot is the ring's WRITE slot and only moves with Writes.
+  logic [SLOT_W-1:0] rd_slot;
+  logic [SLOT_W-1:0] act_slot;
+  assign act_slot = read_mode ? rd_slot : next_slot;
+
   // submit decision
   logic want_data, lba_overflow, sq_blocked, want_flush;
   assign sq_blocked   = (outstanding >= 8'(MAX_OUTSTANDING));
@@ -243,7 +248,7 @@ module nvme_write_engine
   assign limit_hit    = (max_cmds != 32'd0) && (sub_cnt >= max_cmds);
   assign want_data    = enable && !flush_req && !lba_range_err && !io_timeout && !limit_hit
                         && (slot_full[next_slot] || read_mode)
-                        && !busy[next_slot] && !wait_clear[next_slot];
+                        && !busy[act_slot] && !wait_clear[act_slot];
   assign want_flush   = flush_req && !flush_sent && !flush_complete && (busy == '0)
                         && (outstanding == 8'd0);
 
@@ -356,7 +361,7 @@ module nvme_write_engine
       cq_phase           <= 1'b1;
       busy               <= '0;
       wait_clear         <= '0;
-      if (rst) next_slot <= '0;               // restart keeps following the ring's write slot
+      if (rst) begin next_slot <= '0; rd_slot <= '0; end   // restart keeps following the ring's write slot (D24: Reads do not move it)
       outstanding        <= 8'd0;
       started            <= 1'b0;
       cur_flush          <= 1'b0;
@@ -443,7 +448,7 @@ module nvme_write_engine
             lba_range_err <= 1'b1;              // stop: this write would run past the namespace
           end else if (want_data && !sq_blocked) begin
             cur_flush <= 1'b0;
-            cur_slot  <= next_slot;
+            cur_slot  <= act_slot;
             cur_lba   <= next_lba;
             cur_beat  <= 2'd0;
             sub_state <= SUB_WR;
@@ -467,7 +472,8 @@ module nvme_write_engine
             slot_lba[cur_slot]   <= cur_lba;
             sub_cnt              <= sub_cnt + 1'b1;
             next_lba             <= next_lba + lba_per_slot;
-            next_slot            <= (next_slot == last_slot_idx) ? '0 : next_slot + 1'b1;
+            if (read_mode) rd_slot   <= (rd_slot == last_slot_idx) ? '0 : rd_slot + 1'b1;
+            else           next_slot <= (next_slot == last_slot_idx) ? '0 : next_slot + 1'b1;
           end
           sub_state <= SUB_IDLE;
         end

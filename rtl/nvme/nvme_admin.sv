@@ -57,6 +57,20 @@
 //   poll CSTS.SHST==10b every ms (10 s timeout -> still shutdown_done, with
 //   shutdown_timeout=1).
 //
+// Get Log Page 02h (SMART / Health), RECORDER_SPEC 6.3 (all new inputs default to 0 = feature unused):
+//   log_req (pulse) is accepted only in S_IDLE with init_done_r && !in_shutdown && !shutdown_done_r &&
+//   !shn_pend && !log_dis (and no start_init / start_shutdown in the same cycle); otherwise ignored.
+//   The command reuses the SQE / doorbell / CQE sub-FSM with cmd_kind = K_GET_LOG and the flag in_log:
+//     * all four failure points (BAR0 response error, CID mismatch, CQE status != 0, timeout) set log_err
+//       and go back to S_IDLE; init_*, shutdown_*, fail_step and cmd_seq are never touched;
+//     * a CQE with a wrong CID / status is still consumed (CQ head doorbell) so the CQ stays consistent;
+//     * success: S_AC_CQDB_DONE -> S_LOG_EX (8 ident_ram beats -> log_smart) -> S_IDLE;
+//     * timeout: log_dis = 1 until the next start_init and the CID of the abandoned command is kept in
+//       stale_cid; a later CQ poll that finds a CQE with exactly that CID absorbs it (head++, CQ doorbell);
+//     * start_shutdown during a log is latched (shn_pend) and runs right after the log ends.
+//   log_smart layout: see the table in RECORDER_SPEC 6.3 (ident_ram beats 0,2,3,7,8,9,10,12).
+//   rtd3e_us: Identify Controller bytes 88..91 (beat 5, an own extraction step).
+//
 // Level outputs: init_done / init_fail / shutdown_done / shutdown_timeout stay set until the
 // next start_init / start_shutdown.  start_* are sampled in S_IDLE only (pulse is fine).  The
 // outputs drop in the very cycle in which the matching start is accepted (combinational mask
@@ -101,6 +115,17 @@ module nvme_admin
   input  logic        start_shutdown,
   output logic        shutdown_done,     // level, drops in the cycle start_shutdown is accepted
   output logic        shutdown_timeout,  // shutdown_done reached without SHST==10b (or a bus error)
+
+  // ---- Get Log Page 02h (SMART), RECORDER_SPEC 6.3 ----
+  input  logic        log_req            = 1'b0,    // pulse; ignored unless idle, initialised and not shutting down
+  output logic        log_busy,                     // a log command is in flight
+  output logic        log_done,                     // 1-cycle pulse: log_smart updated
+  output logic        log_err,                      // 1-cycle pulse: the log failed (no log_smart update)
+  output logic [SMART_W-1:0] log_smart,             // updated only on success
+  output logic [15:0] log_cnt,                      // successful logs, cleared at start_init
+  output logic [15:0] log_err_cnt,                  // failed logs, cleared at start_init
+  output logic [15:0] log_status,                   // {1'b0, DW3[31:17]} of the last log CQE
+  output logic [31:0] rtd3e_us,                     // Identify Controller bytes 88..91
 
   // ---- results of Identify / CAP ----
   output logic [3:0]  lbads,
@@ -185,6 +210,9 @@ module nvme_admin
   // Identify data: beat indices / byte offsets inside the 4 KiB buffer
   localparam logic [7:0] IDC_BEAT_MDTS = 8'd4;    // bytes 64..79   (MDTS = byte 77)
   localparam int unsigned IDC_OFS_MDTS = 13;
+  // ident_ram beats of the SMART log: bytes 0-15, 32-47, 48-63, 112-127, 128-143, 144-159, 160-175, 192-207
+  localparam logic [7:0] LOG_BEAT [0:8] = '{8'd0, 8'd2, 8'd3, 8'd7, 8'd8, 8'd9, 8'd10, 8'd12, 8'd0};
+  localparam logic [7:0] IDC_BEAT_RTD3E= 8'd5;    // bytes 80..95   (RTD3E = bytes 88..91)
   localparam logic [7:0] IDC_BEAT_QES  = 8'd32;   // bytes 512..527 (SQES 512, CQES 513, VWC 525)
   localparam int unsigned IDC_OFS_VWC  = 13;
   localparam logic [7:0] IDN_BEAT_NSZE = 8'd0;    // bytes 0..15    (NSZE = bytes 0..7)
@@ -195,15 +223,16 @@ module nvme_admin
   localparam logic [7:0] CQES_EXPECT   = 8'h44;
 
   // Admin command kinds
-  typedef enum logic [2:0] {
-    K_IDENT_CTRL = 3'd0,
-    K_IDENT_NS   = 3'd1,
-    K_SET_FEAT   = 3'd2,
-    K_CREATE_CQ  = 3'd3,
-    K_CREATE_SQ  = 3'd4,
-    K_DELETE_SQ  = 3'd5,
-    K_DELETE_CQ  = 3'd6,
-    K_FORMAT     = 3'd7
+  typedef enum logic [3:0] {
+    K_IDENT_CTRL = 4'd0,
+    K_IDENT_NS   = 4'd1,
+    K_SET_FEAT   = 4'd2,
+    K_CREATE_CQ  = 4'd3,
+    K_CREATE_SQ  = 4'd4,
+    K_DELETE_SQ  = 4'd5,
+    K_DELETE_CQ  = 4'd6,
+    K_FORMAT     = 4'd7,
+    K_GET_LOG    = 4'd8
   } cmd_kind_t;
 
   localparam int unsigned INIT_CMDS = 5;      // K_IDENT_CTRL .. K_CREATE_SQ (6 with Format NVM)
@@ -222,7 +251,8 @@ module nvme_admin
     S_CMD_START, S_AC_WR, S_AC_SQDB_DONE,
     S_AC_POLL_RD, S_AC_POLL_W1, S_AC_POLL_CHK, S_AC_CQDB_DONE,
     S_EX_RD, S_EX_W1, S_EX_CHK,
-    S_CMD_FINISH, S_SHN_WR_DONE
+    S_CMD_FINISH, S_SHN_WR_DONE,
+    S_LOG_EX
   } state_t;
 
   state_t state;
@@ -264,8 +294,18 @@ module nvme_admin
   logic             in_shutdown;
   logic             fmt_en;       // format_req latched at start_init
 
+  // Get Log Page state
+  logic             in_log;       // the command in flight is a Get Log Page
+  logic             log_bad;      // its CQE had a wrong CID / status: consume it, then report log_err
+  logic             log_dis;      // set by a log timeout, cleared by start_init
+  logic             shn_pend;     // start_shutdown seen while a log was running
+  logic             stale_v;      // an abandoned (timed-out) log CQE may still arrive
+  logic [15:0]      stale_cid;
+  logic             log_done_r, log_err_r;
+  logic [SMART_W-1:0] log_acc;    // log_smart is assembled here and copied on success
+
   // Identify extraction
-  logic [1:0]  ex_step;
+  logic [2:0]  ex_step;
   logic [7:0]  ex_addr;
   logic [3:0]  ex_fmt;
 
@@ -289,6 +329,8 @@ module nvme_admin
       K_DELETE_SQ:  begin opc = AOPC_DELETE_SQ;    cdw10 = 32'h1;                              end
       K_DELETE_CQ:  begin opc = AOPC_DELETE_CQ;    cdw10 = 32'h1;                              end
       K_FORMAT:     begin opc = AOPC_FORMAT_NVM;   nsid = 32'h1; cdw10 = {28'h0, lbaf};        end // LBAF, MSET/PI/PIL/SES = 0
+      K_GET_LOG:    begin opc = AOPC_GET_LOG_PAGE; nsid = 32'hFFFF_FFFF; prp1 = IDENT_BASE;
+                          cdw10 = {16'd127, 8'h00, LID_SMART};                                     end // NUMDL=127 (512 B), RAE=LSP=0
       default: ;
     endcase
     s = '0;
@@ -386,11 +428,17 @@ module nvme_admin
   // registered flags and their start-edge masks
   logic init_done_r, init_fail_r, shutdown_done_r, shutdown_timeout_r;
   wire  st_init_evt = (state == S_IDLE) && start_init;
-  wire  st_shn_evt  = (state == S_IDLE) && !start_init && start_shutdown;
+  wire  shn_go      = start_shutdown | shn_pend;        // a pending (latched) shutdown request counts as a start
+  wire  st_shn_evt  = (state == S_IDLE) && !start_init && shn_go;
+  wire  log_accept  = (state == S_IDLE) && log_req && init_done_r && !in_shutdown && !shutdown_done_r &&
+                      !shn_pend && !log_dis && !start_init && !start_shutdown;
   assign init_done        = init_done_r        & ~st_init_evt;
   assign init_fail        = init_fail_r        & ~st_init_evt;
   assign shutdown_done    = shutdown_done_r    & ~st_shn_evt;
   assign shutdown_timeout = shutdown_timeout_r & ~st_shn_evt;
+  assign log_busy         = in_log;
+  assign log_done         = log_done_r;
+  assign log_err          = log_err_r;
 
   // ---------------------------------------------------------------------------
   // Tasks (called only from the always_ff below)
@@ -416,7 +464,13 @@ module nvme_admin
   // A failure aborts init (init_fail + fail_step).  During shutdown a failure only
   // ends the sequence early, flagged by shutdown_timeout.
   task automatic do_fail(input logic [7:0] code);
-    if (in_shutdown) begin
+    if (in_log) begin                    // Get Log Page: report log_err only, init / shutdown state untouched
+      log_err_r   <= 1'b1;
+      log_err_cnt <= log_err_cnt + 1'b1;
+      in_log      <= 1'b0;
+      log_bad     <= 1'b0;
+      cid         <= cid + 1'b1;
+    end else if (in_shutdown) begin
       shutdown_done_r    <= 1'b1;
       shutdown_timeout_r <= 1'b1;
     end else begin
@@ -475,10 +529,27 @@ module nvme_admin
       cmd_kind         <= K_IDENT_CTRL;
       cmd_seq          <= 3'd0;
       in_shutdown      <= 1'b0;
-      ex_step          <= 2'd0;
+      ex_step          <= 3'd0;
       ex_addr          <= 8'd0;
       ex_fmt           <= 4'd0;
+      in_log           <= 1'b0;
+      log_bad          <= 1'b0;
+      log_dis          <= 1'b0;
+      shn_pend         <= 1'b0;
+      stale_v          <= 1'b0;
+      stale_cid        <= 16'd0;
+      log_done_r       <= 1'b0;
+      log_err_r        <= 1'b0;
+      log_acc          <= '0;
+      log_smart        <= '0;
+      log_cnt          <= 16'd0;
+      log_err_cnt      <= 16'd0;
+      log_status       <= 16'd0;
+      rtd3e_us         <= 32'd0;
     end else begin
+      log_done_r <= 1'b0;                 // pulses (set again below, last assignment wins)
+      log_err_r  <= 1'b0;
+      if (in_log && start_shutdown) shn_pend <= 1'b1;     // latch a shutdown request that arrives during a log
       // free-running millisecond counter; states restart it with ms_cnt <= 0
       if (tick_ms) ms_cnt <= ms_cnt + 1'b1;
 
@@ -500,8 +571,14 @@ module nvme_admin
             acq_phase        <= 1'b1;
             cid              <= 16'd0;
             cmd_seq          <= 3'd0;
+            log_dis          <= 1'b0;
+            stale_v          <= 1'b0;
+            shn_pend         <= 1'b0;
+            log_cnt          <= 16'd0;
+            log_err_cnt      <= 16'd0;
             mm_rd(NVME_CAP_LO, F_CAP_LO, S_CAP_LO_DONE);
-          end else if (start_shutdown) begin
+          end else if (shn_go) begin
+            shn_pend           <= 1'b0;
             shutdown_done_r    <= 1'b0;
             shutdown_timeout_r <= 1'b0;
             in_shutdown      <= 1'b1;
@@ -512,6 +589,12 @@ module nvme_admin
               shutdown_done_r    <= 1'b1;
               shutdown_timeout_r <= 1'b1;
             end
+          end else if (log_accept) begin            // Get Log Page: same sub-FSM, in_log routes the exits
+            in_log   <= 1'b1;
+            log_bad  <= 1'b0;
+            cmd_kind <= K_GET_LOG;
+            wr_beat  <= 2'd0;
+            state    <= S_AC_WR;
           end
         end
 
@@ -672,21 +755,40 @@ module nvme_admin
         S_AC_POLL_W1: state <= S_AC_POLL_CHK;         // RAM latency
         S_AC_POLL_CHK: begin                          // acq_rd_data valid now
           if (cqe_hit) begin
-            cqe_status_last <= {1'b0, cqe_status};
-            if (cmd_kind == K_FORMAT && !in_shutdown) format_ms <= ms_cnt;
-            acq_head        <= head_next;
-            if (acq_head == ASQ_W'(ADMIN_QSIZE-1)) acq_phase <= ~acq_phase;
-            if (acq_rd_data[111:96] != cid && !in_shutdown) begin
-              do_fail(F_CQE_CID);
-            end else if (cqe_status != 15'd0 && !in_shutdown) begin
-              if (cmd_kind == K_FORMAT) do_fail(F_FORMAT_STATUS);
-              else                      do_fail(F_CMD_STATUS | {3'b000, cid[4:0]});
+            if (stale_v && acq_rd_data[111:96] == stale_cid) begin
+              // late CQE of a log command that timed out: absorb it and keep waiting for our own CQE
+              stale_v  <= 1'b0;
+              acq_head <= head_next;
+              if (acq_head == ASQ_W'(ADMIN_QSIZE-1)) acq_phase <= ~acq_phase;
+              mm_wr(doorbell_addr(dstrd, 0, 1'b1), 32'(head_next), F_DOORBELL, S_AC_POLL_RD);
             end else begin
-              // CQ0HDBL = new head
-              mm_wr(doorbell_addr(dstrd, 0, 1'b1), 32'(head_next), F_DOORBELL, S_AC_CQDB_DONE);
+              if (in_log) log_status <= {1'b0, cqe_status};
+              else        cqe_status_last <= {1'b0, cqe_status};
+              if (cmd_kind == K_FORMAT && !in_shutdown) format_ms <= ms_cnt;
+              acq_head        <= head_next;
+              if (acq_head == ASQ_W'(ADMIN_QSIZE-1)) acq_phase <= ~acq_phase;
+              if (in_log) begin
+                // wrong CID / status: the CQE is consumed all the same, then log_err (S_AC_CQDB_DONE)
+                log_bad <= (acq_rd_data[111:96] != cid) || (cqe_status != 15'd0);
+                mm_wr(doorbell_addr(dstrd, 0, 1'b1), 32'(head_next), F_DOORBELL, S_AC_CQDB_DONE);
+              end else if (acq_rd_data[111:96] != cid && !in_shutdown) begin
+                do_fail(F_CQE_CID);
+              end else if (cqe_status != 15'd0 && !in_shutdown) begin
+                if (cmd_kind == K_FORMAT) do_fail(F_FORMAT_STATUS);
+                else                      do_fail(F_CMD_STATUS | {3'b000, cid[4:0]});
+              end else begin
+                // CQ0HDBL = new head
+                mm_wr(doorbell_addr(dstrd, 0, 1'b1), 32'(head_next), F_DOORBELL, S_AC_CQDB_DONE);
+              end
             end
           end else if (ms_cnt >= ((cmd_kind == K_FORMAT) ? FORMAT_TIMEOUT_MS : ADMIN_TIMEOUT_MS)) begin
-            if (in_shutdown)              state <= S_CMD_FINISH;   // keep shutting down regardless
+            if (in_log) begin                         // abandon the log; its CQE may still arrive later
+              stale_v   <= 1'b1;
+              stale_cid <= cid;
+              log_dis   <= 1'b1;
+              do_fail(F_NONE);                        // in_log: log_err + S_IDLE only
+            end
+            else if (in_shutdown)         state <= S_CMD_FINISH;   // keep shutting down regardless
             else if (cmd_kind == K_FORMAT) do_fail(F_FORMAT_TMO);
             else                           do_fail(F_CMD_TMO | {3'b000, cid[4:0]});
           end else begin
@@ -694,14 +796,26 @@ module nvme_admin
           end
         end
         S_AC_CQDB_DONE: begin
-          if (!in_shutdown && cmd_kind == K_FORMAT) format_done <= 1'b1;
-          if (!in_shutdown && (cmd_kind == K_IDENT_CTRL || cmd_kind == K_IDENT_NS)) begin
-            ex_step <= 2'd0;
-            ex_addr <= (cmd_kind == K_IDENT_CTRL) ? IDC_BEAT_MDTS : IDN_BEAT_NSZE;
-            state   <= S_EX_RD;
+          if (in_log) begin
+            if (log_bad) do_fail(F_NONE);             // in_log: log_err + S_IDLE
+            else         state <= S_LOG_EX;
           end else begin
-            state <= S_CMD_FINISH;
+            if (!in_shutdown && cmd_kind == K_FORMAT) format_done <= 1'b1;
+            if (!in_shutdown && (cmd_kind == K_IDENT_CTRL || cmd_kind == K_IDENT_NS)) begin
+              ex_step <= 3'd0;
+              ex_addr <= (cmd_kind == K_IDENT_CTRL) ? IDC_BEAT_MDTS : IDN_BEAT_NSZE;
+              state   <= S_EX_RD;
+            end else begin
+              state <= S_CMD_FINISH;
+            end
           end
+        end
+
+        // Get Log Page: read the 8 ident_ram beats that carry the SMART fields (S_EX_* loop below)
+        S_LOG_EX: begin
+          ex_step <= 3'd0;
+          ex_addr <= LOG_BEAT[0];
+          state   <= S_EX_RD;
         end
 
         // Identify field extraction: read a beat, wait 2 cycles, pick fields.
@@ -709,13 +823,43 @@ module nvme_admin
         S_EX_W1: state <= S_EX_CHK;
         S_EX_CHK: begin
           state <= S_EX_RD;                            // default: another beat to read
-          if (cmd_kind == K_IDENT_CTRL) begin
+          if (cmd_kind == K_GET_LOG) begin
+            // fields are collected in log_acc and published together after the last beat
             case (ex_step)
-              2'd0: begin
+              3'd0: begin
+                log_acc[31:0]  <= ident_rd_data[31:0];                  // CW, temperature, available spare
+                log_acc[39:32] <= ident_rd_data[47:40];                 // percentage used
+                log_acc[47:40] <= 8'h00;
+              end
+              3'd1: log_acc[111:48]  <= ident_rd_data[63:0];            // data units read
+              3'd2: log_acc[175:112] <= ident_rd_data[63:0];            // data units written
+              3'd3: log_acc[207:176] <= ident_rd_data[31:0];            // power cycles
+              3'd4: log_acc[239:208] <= ident_rd_data[31:0];            // power on hours
+              3'd5: log_acc[271:240] <= ident_rd_data[31:0];            // unsafe shutdowns
+              3'd6: log_acc[303:272] <= ident_rd_data[31:0];            // media errors
+              default: begin                                            // beat 12: temperature times, sensor 1
+                log_smart  <= {ident_rd_data[79:64], ident_rd_data[63:32], ident_rd_data[31:0], log_acc[303:0]};
+                log_cnt    <= log_cnt + 1'b1;
+                log_done_r <= 1'b1;
+                in_log     <= 1'b0;
+                cid        <= cid + 1'b1;
+                state      <= S_IDLE;
+              end
+            endcase
+            ex_step <= ex_step + 1'b1;
+            ex_addr <= LOG_BEAT[ex_step + 3'd1];
+          end else if (cmd_kind == K_IDENT_CTRL) begin
+            case (ex_step)
+              3'd0: begin
                 mdts    <= ident_rd_data[8*IDC_OFS_MDTS +: 8];
-                ex_addr <= IDC_BEAT_QES;
-                ex_step <= 2'd1;
+                ex_addr <= IDC_BEAT_RTD3E;
+                ex_step <= 3'd1;
                 if (mdts_too_small(ident_rd_data[8*IDC_OFS_MDTS +: 8])) do_fail(F_MDTS);
+              end
+              3'd1: begin                              // RTD3E = bytes 88..91 (beat 5, bytes 8..11)
+                rtd3e_us <= ident_rd_data[95:64];
+                ex_addr  <= IDC_BEAT_QES;
+                ex_step  <= 3'd2;
               end
               default: begin
                 vwc <= ident_rd_data[8*IDC_OFS_VWC];
@@ -726,15 +870,15 @@ module nvme_admin
             endcase
           end else begin
             case (ex_step)
-              2'd0: begin                              // NSZE = bytes 0..7
+              3'd0: begin                              // NSZE = bytes 0..7
                 nsze    <= ident_rd_data[63:0];
                 ex_addr <= IDN_BEAT_FLBAS;
-                ex_step <= 2'd1;
+                ex_step <= 3'd1;
               end
-              2'd1: begin                              // FLBAS (byte 26) -> LBAF[n] address
+              3'd1: begin                              // FLBAS (byte 26) -> LBAF[n] address
                 ex_fmt  <= ident_rd_data[8*IDN_OFS_FLBAS +: 4];
                 ex_addr <= IDN_BEAT_LBAF + 8'(ident_rd_data[8*IDN_OFS_FLBAS+2 +: 2]);
-                ex_step <= 2'd2;
+                ex_step <= 3'd2;
               end
               default: begin                           // LBAF[n]: MS [15:0], LBADS [23:16]
                 lbads <= dw_sel[19:16];

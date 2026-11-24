@@ -641,6 +641,57 @@ module tb_models;
     if (cqe[3][24:17] != 8'h01 || cqe[3][27:25] != 0) tb_err($sformatf("invalid opcode status %h", cqe[3][31:17]));
     $display("[tb_models @%0t] admin init done (admin queue wrapped: head %0d phase %0d)", $time, acq_head, acq_phase);
 
+    // ---- Get Log Page 02h (SMART): field layout, 512-byte transfer, injected status, bad LID, delay ----
+    begin
+      longint unsigned c0;
+      u_ssd.smart_cw = 8'h04;   u_ssd.smart_temp = 16'h0138; u_ssd.smart_spare = 8'd95; u_ssd.smart_used = 8'd7;
+      u_ssd.smart_dur = 64'h0123_4567_89AB_CDEF; u_ssd.smart_duw = 64'hFEDC_BA98_7654_3210;
+      u_ssd.smart_pc = 32'h1111_0001; u_ssd.smart_poh = 32'h2222_0002; u_ssd.smart_unsafe = 32'h3333_0003;
+      u_ssd.smart_media = 32'h4444_0004; u_ssd.smart_wtt = 32'h5555_0005; u_ssd.smart_ctt = 32'h6666_0006;
+      u_ssd.smart_ts1 = 16'h7777;
+      for (int i = 0; i < 4096; i++) hmem[IDENT + i] = 8'h00;
+      sqe_clear(s); s[0] = {16'h20, 8'h00, 8'h02}; s[1] = 32'hFFFF_FFFF; s[6] = IDENT; s[10] = {16'd127, 8'h00, 8'h02};
+      admin_cmd(s, cqe);
+      if (cqe[3][31:17] != 0) tb_err($sformatf("Get Log Page status %h", cqe[3][31:17]));
+      if (hrd8(IDENT+0) != 8'h04 || hrd8(IDENT+1) != 8'h38 || hrd8(IDENT+2) != 8'h01 || hrd8(IDENT+3) != 8'd95 ||
+          hrd8(IDENT+4) != 8'hA5 || hrd8(IDENT+5) != 8'd7 ||
+          hrd32(IDENT+32) != 32'h89AB_CDEF || hrd32(IDENT+36) != 32'h0123_4567 ||
+          hrd32(IDENT+48) != 32'h7654_3210 || hrd32(IDENT+52) != 32'hFEDC_BA98 ||
+          hrd32(IDENT+112) != 32'h1111_0001 || hrd32(IDENT+128) != 32'h2222_0002 || hrd32(IDENT+144) != 32'h3333_0003 ||
+          hrd32(IDENT+160) != 32'h4444_0004 || hrd32(IDENT+192) != 32'h5555_0005 || hrd32(IDENT+196) != 32'h6666_0006 ||
+          hrd8(IDENT+200) != 8'h77 || hrd8(IDENT+201) != 8'h77 || hrd8(IDENT+511) != 8'hA5)
+        tb_err("Get Log Page SMART data wrong");
+      if (hrd8(IDENT+512) != 8'h00) tb_err("Get Log Page wrote more than 512 bytes");
+      if (u_ssd.n_log != 1) tb_err("n_log");
+      // shorter transfer: NUMDL = 15 -> 64 bytes only
+      for (int i = 0; i < 4096; i++) hmem[IDENT + i] = 8'h00;
+      sqe_clear(s); s[0] = {16'h21, 8'h00, 8'h02}; s[1] = 32'hFFFF_FFFF; s[6] = IDENT; s[10] = {16'd15, 8'h00, 8'h02};
+      admin_cmd(s, cqe);
+      if (cqe[3][31:17] != 0 || hrd8(IDENT+63) != 8'hA5 || hrd8(IDENT+64) != 8'h00 || hrd8(IDENT+3) != 8'd95)
+        tb_err("Get Log Page NUMDL=15 transfer length");
+      // injected status: no data, CQE carries the status (negative control of the status path)
+      for (int i = 0; i < 4096; i++) hmem[IDENT + i] = 8'h00;
+      u_ssd.log_status = 15'h0006;
+      sqe_clear(s); s[0] = {16'h22, 8'h00, 8'h02}; s[1] = 32'hFFFF_FFFF; s[6] = IDENT; s[10] = {16'd127, 8'h00, 8'h02};
+      admin_cmd(s, cqe);
+      if (cqe[3][31:17] != 15'h0006) tb_err($sformatf("log_status not reported: CQE status %h", cqe[3][31:17]));
+      if (hrd8(IDENT+3) != 8'h00) tb_err("data transferred despite log_status != 0");
+      u_ssd.log_status = 15'h0;
+      // unknown LID -> Invalid Field
+      sqe_clear(s); s[0] = {16'h23, 8'h00, 8'h02}; s[1] = 32'hFFFF_FFFF; s[6] = IDENT; s[10] = {16'd127, 8'h00, 8'h03};
+      admin_cmd(s, cqe);
+      if (cqe[3][24:17] != 8'h02 || cqe[3][27:25] != 0) tb_err($sformatf("LID 03h status %h", cqe[3][31:17]));
+      // CQE delay knob
+      u_ssd.log_delay_cycles = 3000;
+      c0 = u_ssd.cyc;
+      sqe_clear(s); s[0] = {16'h24, 8'h00, 8'h02}; s[1] = 32'hFFFF_FFFF; s[6] = IDENT; s[10] = {16'd127, 8'h00, 8'h02};
+      admin_cmd(s, cqe);
+      if (u_ssd.cyc - c0 < 3000) tb_err($sformatf("log_delay_cycles ignored (%0d cycles)", u_ssd.cyc - c0));
+      if (cqe[3][31:17] != 0 || hrd8(IDENT+3) != 8'd95) tb_err("Get Log Page after the delay");
+      u_ssd.log_delay_cycles = 0;
+      $display("[tb_models @%0t] Get Log Page 02h OK (layout, NUMDL, log_status, bad LID, delay)", $time);
+    end
+
     // ---- I/O: Write A, 8 KiB, PRP2 = second page ----
     fill_data(64'h4000_0000, 8192, 8'h11, refA);
     mk_write(s, 16'd10, 64'd16, 16, 64'h4000_0000, 64'h4000_1000);
@@ -699,6 +750,30 @@ module tb_models;
       for (int i = 0; i < 12; i++) check_lba(4000 + 8*i, refs[i]);
     end
     $display("[tb_models @%0t] 12 x 4 KiB writes OK (I/O CQ wrapped, phase now %0d)", $time, iocq_phase);
+
+    // ---- stall knob: the SSD pauses at I/O data command #stall_at_cmd for stall_cycles ----
+    begin
+      byte unsigned refS[$];
+      longint unsigned c0, d_free, d_stall;
+      fill_data(64'h4200_0000, 4096, 8'h5A, refS);
+      mk_write(s, 16'd40, 64'd6000, 8, 64'h4200_0000, 0);
+      io_submit(s); mmio_wr(16'h1008, iosq_tail);
+      c0 = u_ssd.cyc; io_reap(cqe); d_free = u_ssd.cyc - c0;
+      if (cqe[3][31:17] != 0) tb_err("pre-stall write status");
+      u_ssd.stall_at_cmd = u_ssd.io_cmd_cnt;   // the next I/O data command
+      u_ssd.stall_cycles = 6000;
+      refS.delete();
+      fill_data(64'h4210_0000, 4096, 8'hA5, refS);
+      mk_write(s, 16'd41, 64'd6008, 8, 64'h4210_0000, 0);
+      io_submit(s); mmio_wr(16'h1008, iosq_tail);
+      c0 = u_ssd.cyc; io_reap(cqe); d_stall = u_ssd.cyc - c0;
+      if (cqe[3][31:17] != 0) tb_err("stalled write status");
+      check_lba(6008, refS);
+      if (d_stall < 6000)   tb_err($sformatf("stall knob: write took only %0d cycles", d_stall));
+      if (d_free  >= 6000)  tb_err($sformatf("unstalled write took %0d cycles", d_free));
+      u_ssd.stall_at_cmd = -1;
+      $display("[tb_models @%0t] stall knob OK (%0d cycles vs %0d)", $time, d_stall, d_free);
+    end
 
     // ---- Flush ----
     sqe_clear(s); s[0] = {16'd99, 8'h00, 8'h00}; s[1] = 1;

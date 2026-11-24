@@ -70,6 +70,17 @@
 //   verbose              1 = print every TLP / command                               [0]
 //   format_delay_cycles  Format NVM (admin opcode 80h) completion delay                   [2000]
 //   format_status        status written for a Format NVM instead of success (data kept)   [0 = ok]
+//   smart_*              content of the SMART / Health log (Get Log Page, LID 02h, bytes per NVMe 1.4 fig. 207):
+//                        smart_cw (byte 0), smart_temp (K, bytes 1-2), smart_spare (3), smart_used (5),
+//                        smart_dur / smart_duw (64-bit data units read / written, bytes 32 / 48),
+//                        smart_pc (power cycles, 112), smart_poh (128), smart_unsafe (144), smart_media (160),
+//                        smart_wtt / smart_ctt (warning / critical temperature time, 192 / 196), smart_ts1 (200);
+//                        all other bytes of the log are 0xA5 (so a wrong field layout is visible)
+//   log_status           status written for a Get Log Page instead of success (no data transferred)   [0 = ok]
+//   log_delay_cycles     extra delay (cycles) before the Get Log Page CQE is posted (data already written)   [0]
+//   stall_at_cmd         0-based index of the I/O data command (Write / Read) at which the SSD stops:  [-1 = off]
+//                        no new SQE is fetched and no command proceeds for stall_cycles cycles (ATP-like pause)
+//   stall_cycles         length of that pause in cycles                                      [0]
 //                        A successful Format deletes lba_mem (all LBAs read as zero), n_format++;
 //                        NSID must be 1 / FFFFFFFFh, LBAF 0, MSET/PI/PIL 0, SES <= 1.
 //
@@ -147,6 +158,27 @@ module nvme_ssd_model
   bit          verbose              = 0;
   int          format_delay_cycles  = 2000;      // Format NVM (admin 80h) completion delay
   logic [14:0] format_status        = 15'h0;     // != 0: Format NVM completes with this status (data kept)
+  // Get Log Page 02h (SMART / Health) content and fault knobs
+  logic [7:0]  smart_cw             = 8'h00;
+  logic [15:0] smart_temp           = 16'd310;
+  logic [7:0]  smart_spare          = 8'd100;
+  logic [7:0]  smart_used           = 8'd1;
+  logic [63:0] smart_dur            = 64'd1000;
+  logic [63:0] smart_duw            = 64'd2000;
+  logic [31:0] smart_pc             = 32'd7;
+  logic [31:0] smart_poh            = 32'd123;
+  logic [31:0] smart_unsafe         = 32'd2;
+  logic [31:0] smart_media          = 32'd0;
+  logic [31:0] smart_wtt            = 32'd0;
+  logic [31:0] smart_ctt            = 32'd0;
+  logic [15:0] smart_ts1            = 16'd305;
+  logic [14:0] log_status           = 15'h0;     // != 0: Get Log Page completes with this status (no data)
+  int          log_delay_cycles     = 0;         // extra delay before the Get Log Page CQE
+  int          stall_at_cmd         = -1;        // I/O data command index that starts a global pause
+  int          stall_cycles         = 0;
+  longint      stall_until          = 0;         // cycle until which the I/O engine is paused
+  int          io_cmd_cnt           = 0;         // I/O data commands started (Write / Read)
+  int          n_log                = 0;         // Get Log Page commands completed OK
 
   // Identify data constants
   localparam byte unsigned MDTS  = 8'd5;
@@ -432,7 +464,7 @@ module nvme_ssd_model
     nv  = nv & CC_WMASK;
     if (old[0] && nv[0] && (old[13:4] != nv[13:4]))
       err($sformatf("N-2: CC.MPS/CSS/AMS changed while EN=1 (%08h -> %08h)", old, nv));
-    if ((sqs[1].exists || cqs[1].exists) && (old[23:16] != nv[23:16]))
+    if ((sqs[1].exists || cqs[1].exists) && nv[0] && (old[23:16] != nv[23:16]))   // WP8: a write with EN=0 is a controller reset (host restart after ABORT)
       err("N-3: CC.IOSQES/IOCQES changed while I/O queues exist");
     if (nv[15:14] == 2'b11) err("N-10: CC.SHN = 11b (reserved)");
     cc = nv;
@@ -939,6 +971,25 @@ module nvme_ssd_model
     put_le(b, 2048, 2500, 2);                       // PSD0 MP (0.01 W units)
   endfunction
 
+  // SMART / Health Information log (512 bytes)
+  function automatic void build_smart(ref byte unsigned b[$]);
+    b.delete();
+    repeat (512) b.push_back(8'hA5);
+    put_le(b, 0,   smart_cw, 1);
+    put_le(b, 1,   smart_temp, 2);
+    put_le(b, 3,   smart_spare, 1);
+    put_le(b, 5,   smart_used, 1);
+    put_le(b, 32,  smart_dur, 8);
+    put_le(b, 48,  smart_duw, 8);
+    put_le(b, 112, smart_pc, 4);
+    put_le(b, 128, smart_poh, 4);
+    put_le(b, 144, smart_unsafe, 4);
+    put_le(b, 160, smart_media, 4);
+    put_le(b, 192, smart_wtt, 4);
+    put_le(b, 196, smart_ctt, 4);
+    put_le(b, 200, smart_ts1, 2);
+  endfunction
+
   function automatic void build_id_ns(ref byte unsigned b[$]);
     b.delete();
     repeat (4096) b.push_back(8'h00);
@@ -962,6 +1013,21 @@ module nvme_ssd_model
       dma_write(prp1, p);
       p.delete();
       for (int i = first; i < 4096; i++) p.push_back(d[i]);
+      dma_write(prp2, p);
+    end
+  endtask
+
+  // Write a short buffer (<= 4 KiB) to PRP1, continuing in PRP2 when it crosses the page boundary
+  task automatic write_prp_n(input logic [63:0] prp1, input logic [63:0] prp2, input byte unsigned d[$]);
+    int unsigned  first;
+    byte unsigned p[$];
+    first = 4096 - (prp1 & 64'hFFF);
+    if (first >= d.size()) dma_write(prp1, d);
+    else begin
+      for (int i = 0; i < first; i++) p.push_back(d[i]);
+      dma_write(prp1, p);
+      p.delete();
+      for (int i = first; i < d.size(); i++) p.push_back(d[i]);
       dma_write(prp2, p);
     end
   endtask
@@ -994,6 +1060,23 @@ module nvme_ssd_model
           end
           default: st = mk_status(0, 8'h02);
         endcase
+      end
+      8'h02: begin  // Get Log Page (only LID 02h SMART / Health, one 512-byte read at offset 0)
+        // CDW10: LID [7:0], LSP [12:8], RAE [15], NUMDL [31:16];  CDW11: NUMDU / LIDSP;  CDW12/13: LPOL / LPOU
+        if (nsid != 0 && nsid != 1 && nsid != 32'hFFFF_FFFF)  st = mk_status(0, 8'h0B);   // Invalid Namespace
+        else if (cdw10[7:0] != 8'h02)                         st = mk_status(0, 8'h02);   // Invalid Field (LID)
+        else if (s[12] != 0 || s[13] != 0)                    st = mk_status(0, 8'h02);   // log page offset not modelled
+        else if (log_status != 0)                             st = log_status;            // injected fault, no data
+        else begin
+          int unsigned nbytes;
+          nbytes = 4 * ({16'h0, cdw10[31:16]} + 1);
+          if (nbytes > 512) nbytes = 512;                     // the log is 512 bytes
+          build_smart(b);
+          while (b.size() > nbytes) void'(b.pop_back());
+          write_prp_n(prp1, prp2, b);
+          n_log++;
+        end
+        repeat (log_delay_cycles) @(posedge clk);
       end
       8'h09: begin  // Set Features
         case (cdw10[7:0])
@@ -1261,7 +1344,12 @@ module nvme_ssd_model
     logic [14:0] st;
     opc = s[0][7:0]; cid = s[0][31:16];
     st  = 0;
+    if (opc == 8'h01 || opc == 8'h02) begin
+      if (io_cmd_cnt == stall_at_cmd) stall_until = cyc + stall_cycles;   // the whole SSD pauses (ATP-like)
+      io_cmd_cnt++;
+    end
     repeat ($urandom_range(cmd_latency_min, cmd_latency_max)) @(posedge clk);
+    while (cyc < stall_until) @(posedge clk);
     if (s[0][15:14] != 0 || s[0][9:8] != 0) st = mk_status(0, 8'h02);
     else case (opc)
       8'h01: begin
@@ -1297,6 +1385,7 @@ module nvme_ssd_model
       if (!csts_rdy || !sqs[1].exists || csts_shst != 0) continue;
       if (sqs[1].head == sqs[1].tail) continue;
       if (active_cmds >= concurrent_cmds) continue;
+      if (cyc < stall_until) continue;                  // stall knob: no SQE fetch during the pause
       repeat (fetch_delay_cycles) @(posedge clk);
       if (!sqs[1].exists) continue;
       avail  = (sqs[1].tail + sqs[1].size - sqs[1].head) % sqs[1].size;

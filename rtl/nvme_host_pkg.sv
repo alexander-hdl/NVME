@@ -66,6 +66,10 @@ package nvme_host_pkg;
   localparam logic [7:0] AOPC_DELETE_SQ = 8'h00, AOPC_CREATE_SQ = 8'h01, AOPC_DELETE_CQ = 8'h04,
                          AOPC_CREATE_CQ = 8'h05, AOPC_IDENTIFY = 8'h06, AOPC_SET_FEATURES = 8'h09,
                          AOPC_FORMAT_NVM = 8'h80;
+  // Get Log Page (recorder, RECORDER_SPEC 6): opcode, SMART / Health log id, width of the exported field vector
+  localparam logic [7:0] AOPC_GET_LOG_PAGE = 8'h02;
+  localparam logic [7:0] LID_SMART         = 8'h02;
+  localparam int unsigned SMART_W          = 384;
   // NVM command set opcodes
   localparam logic [7:0] NOPC_FLUSH = 8'h00, NOPC_WRITE = 8'h01, NOPC_READ = 8'h02;
 

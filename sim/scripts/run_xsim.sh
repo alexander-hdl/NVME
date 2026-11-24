@@ -51,15 +51,24 @@ run_one() {
   fi
   srcs+=("$ROOT_W/sim/tb/tb_${name}.sv")
 
+  if [ -f "$flist" ] && grep -qi '^# *unisim' "$flist"; then
+    srcs+=("$(to_win "$VIVADO_BIN/../data/verilog/src/glbl.v")")   # glbl for UNISIM models
+  fi
+
   echo "[$name] xvlog ..."
-  "$XVLOG" -sv -L work -i "$ROOT_W/rtl" "${srcs[@]}" > "$log" 2>&1
+  "$XVLOG" -sv -L work -i "$ROOT_W/rtl" -i "$ROOT_W/sim/tb" "${srcs[@]}" > "$log" 2>&1
   local rc=$?
   if [ $rc -ne 0 ] || grep -q "^ERROR" "$log"; then
     echo "[$name] COMPILE FAILED (see $log)"; grep -E "ERROR" "$log" | head -20; return 1
   fi
 
+  # A "# UNISIM" line in the .f list links the precompiled unisims_ver library + glbl.
+  local uni=()
+  if [ -f "$flist" ] && grep -qi '^# *unisim' "$flist"; then
+    uni=(glbl -L unisims_ver)
+  fi
   echo "[$name] xelab ..."
-  "$XELAB" -debug typical -timescale 1ns/1ps -L work "tb_${name}" -s "tb_${name}_sim" >> "$log" 2>&1
+  "$XELAB" -debug typical -timescale 1ns/1ps -L work "tb_${name}" "${uni[@]}" -s "tb_${name}_sim" >> "$log" 2>&1
   rc=$?
   if [ $rc -ne 0 ] || grep -q "^ERROR" "$log"; then
     echo "[$name] ELABORATION FAILED (see $log)"; grep -E "ERROR" "$log" | head -20; return 1

@@ -15,6 +15,9 @@
 #                ax7a200b (ALINX AX7A200B, XC7A200T-2FBG484I, project fpga/build/nvme_host_ax7a200b,
 #                IP fpga/ip/pcie_7x_0_a7/, top ax7a200b_top, constraints ax7a200b_*.xdc;
 #                see STAND/AX7A200B_ARCHITECTURE.md).  The IP keeps the module name pcie_7x_0.
+#                ax7a200b_rec (recorder prototype STAND/RECORDER_SPEC.md, WP8): project fpga/build/rec/nvme_host_rec,
+#                top ax7a200b_rec_top, file list rtl/filelist_rec.f, constraints ax7a200b_rec*.xdc, IPs pcie_7x_0 +
+#                vio_status + ila_pcie + mig_ddr3 (source fpga/scripts/mig_ip.tcl).  Everything below fpga/build/rec/.
 #   top=<name> : project top module.  Default kc705_top (board top, rtl/board/kc705_top.sv, all pins in
 #                kc705_board.xdc).  top=nvme_host_top builds the bare host (no pins for the user-side
 #                ports, only a bitstream with `loose_io`): only kc705_fmc_m2*.xdc are used plus a
@@ -70,7 +73,17 @@ switch -- $board {
         if {$top_name eq ""} { set top_name ax7a200b_top }
         if {$top_name ne "ax7a200b_top"} { error "board=ax7a200b supports only top=ax7a200b_top" }
     }
-    default { error "board=$board : must be kc705 or ax7a200b" }
+    ax7a200b_rec {
+        set proj_name nvme_host_rec
+        set part      xc7a200tfbg484-2
+        set xci_repo  [file join $repo_root fpga ip pcie_7x_0_a7 pcie_7x_0.xci]
+        # recorder build tree: fpga/build/rec (does not touch fpga/build/ax7a200b_top.*)
+        set build_dir [file join $build_dir rec]
+        set ip_dir    [file join $build_dir ip]
+        if {$top_name eq ""} { set top_name ax7a200b_rec_top }
+        if {$top_name ne "ax7a200b_rec_top"} { error "board=ax7a200b_rec supports only top=ax7a200b_rec_top" }
+    }
+    default { error "board=$board : must be kc705, ax7a200b or ax7a200b_rec" }
 }
 set proj_dir [file join $build_dir $proj_name]
 
@@ -81,7 +94,8 @@ set_property target_language Verilog [current_project]
 # ---------------------------------------------------------------------------
 # 1. RTL from rtl/filelist.f  (paths relative to the repo root, '#' comments)
 # ---------------------------------------------------------------------------
-set fh [open [file join $repo_root rtl filelist.f] r]
+set filelist_name [expr {$board eq "ax7a200b_rec" ? "filelist_rec.f" : "filelist.f"}]
+set fh [open [file join $repo_root rtl $filelist_name] r]
 set rtl_files {}
 while {[gets $fh line] >= 0} {
     set line [string trim [lindex [split $line "#"] 0]]
@@ -161,9 +175,9 @@ if {!$regen_ip && [file exists $xci_repo]} {
 }
 
 # ---------------------------------------------------------------------------
-# 2b. ax7a200b only: VIO for JTAG status / remote START-STOP (rtl/board/ax7a200b_top.sv, u_vio)
+# 2b. ax7a200b / ax7a200b_rec: VIO for JTAG status / remote START-STOP (rtl/board/ax7a200b_top.sv, rec_top: u_vio)
 # ---------------------------------------------------------------------------
-if {$board eq "ax7a200b"} {
+if {$board in {ax7a200b ax7a200b_rec}} {
     set vio_xci [file join $repo_root fpga ip vio_status_a7 vio_status.xci]
     if {!$regen_ip && [file exists $vio_xci]} {
         import_ip $vio_xci
@@ -176,18 +190,29 @@ if {$board eq "ax7a200b"} {
     generate_target all [get_ips vio_status]
     catch { create_ip_run [get_ips vio_status] }
 
-    # ILA on user_clk (u_ila): 304-bit debug bus of nvme_host_top, 4096 samples
-    set ila_xci [file join $repo_root fpga ip ila_pcie_a7 ila_pcie.xci]
-    if {!$regen_ip && [file exists $ila_xci]} {
-        import_ip $ila_xci
-    } else {
-        create_ip -name ila -vendor xilinx.com -library ip -module_name ila_pcie -dir $ip_dir
-        set_property -dict [list CONFIG.C_NUM_OF_PROBES 1 CONFIG.C_PROBE0_WIDTH 304 CONFIG.C_DATA_DEPTH 4096 CONFIG.C_TRIGIN_EN false CONFIG.C_ADV_TRIGGER false] [get_ips ila_pcie]
-        file mkdir [file dirname $ila_xci]
-        file copy -force [get_property IP_FILE [get_ips ila_pcie]] $ila_xci
+    # ILA on user_clk (u_ila): 304-bit debug bus of nvme_host_top, 4096 samples.  Only for board=ax7a200b: ax7a200b_rec_top has
+    # ILA_EN = 0 (no ILA IP in the recorder project; for ILA_EN = 1 extend this condition).
+    if {$board eq "ax7a200b"} {
+        set ila_xci [file join $repo_root fpga ip ila_pcie_a7 ila_pcie.xci]
+        if {!$regen_ip && [file exists $ila_xci]} {
+            import_ip $ila_xci
+        } else {
+            create_ip -name ila -vendor xilinx.com -library ip -module_name ila_pcie -dir $ip_dir
+            set_property -dict [list CONFIG.C_NUM_OF_PROBES 1 CONFIG.C_PROBE0_WIDTH 304 CONFIG.C_DATA_DEPTH 4096 CONFIG.C_TRIGIN_EN false CONFIG.C_ADV_TRIGGER false] [get_ips ila_pcie]
+            file mkdir [file dirname $ila_xci]
+            file copy -force [get_property IP_FILE [get_ips ila_pcie]] $ila_xci
+        }
+        generate_target all [get_ips ila_pcie]
+        catch { create_ip_run [get_ips ila_pcie] }
     }
-    generate_target all [get_ips ila_pcie]
-    catch { create_ip_run [get_ips ila_pcie] }
+}
+
+# ---------------------------------------------------------------------------
+# 2c. ax7a200b_rec only: MIG 7-series IP mig_ddr3 (DDR3 x32, 1 GiB), reproducible, checked (WP4)
+# ---------------------------------------------------------------------------
+if {$board eq "ax7a200b_rec"} {
+    source [file join $script_dir mig_ip.tcl]
+    catch { create_ip_run [get_ips mig_ddr3] }
 }
 
 # generate everything (synthesis sources, instantiation template, simulation, constraints) and
@@ -205,7 +230,11 @@ if {$regen_ip || ![file exists $xci_repo]} {
 # ---------------------------------------------------------------------------
 # 3. Constraints and top
 # ---------------------------------------------------------------------------
-if {$board eq "ax7a200b"} {
+if {$board eq "ax7a200b_rec"} {
+    add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints ax7a200b_rec.xdc]
+    add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints ax7a200b_rec_cdc.xdc]
+    set_property USED_IN {implementation} [get_files ax7a200b_rec_cdc.xdc]
+} elseif {$board eq "ax7a200b"} {
     add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints ax7a200b_board.xdc]
     add_files -fileset constrs_1 -norecurse [file join $repo_root fpga constraints ax7a200b_cdc.xdc]
     set_property USED_IN {implementation} [get_files ax7a200b_cdc.xdc]

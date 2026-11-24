@@ -71,11 +71,11 @@ module hostmem_writer
 
   function automatic logic fits(input logic [31:0] addr, input logic [31:0] base,
                                 input logic [31:0] size, input logic [12:0] nbytes);
-    logic [32:0] off;
-    logic [33:0] fin;
-    off = {1'b0, addr} - {1'b0, base};
-    fin = {1'b0, off} + {21'b0, nbytes};
-    return (!off[32]) && (fin <= {2'b00, size});
+    // addr >= base && (addr - base) + nbytes <= size, written as two compares against constants (one adder less)
+    logic [34:0] fin, lim;
+    fin = {2'b00, addr} + {22'b0, nbytes};
+    lim = {2'b00, base} + {2'b00, size};
+    return (addr >= base) && (fin <= lim);
   endfunction
 
   // ---------------------------------------------------------------------------
